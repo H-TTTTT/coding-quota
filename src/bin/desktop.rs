@@ -10,6 +10,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const QUOTA_VALUE_WIDTH: f32 = 86.0;
 
 enum Cmd {
     Refresh,
@@ -504,24 +505,30 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                         }
                     });
                 });
-                let extra = match (window.used, window.limit) {
-                    (Some(used), Some(limit)) => {
-                        format!("剩余 {:.0}/{limit:.0}", (limit - used).max(0.0))
+                let extra = if report.provider == ProviderId::Kimi {
+                    format!("剩余 {:.0}%", remaining * 100.0)
+                } else {
+                    match (window.used, window.limit) {
+                        (Some(used), Some(limit)) => {
+                            format!("剩余 {:.0}/{limit:.0}", (limit - used).max(0.0))
+                        }
+                        _ => format!("剩余 {:.0}%", remaining * 100.0),
                     }
-                    _ => format!("剩余 {:.0}%", remaining * 100.0),
                 };
                 ui.horizontal(|ui| {
-                    let bar_width = (ui.available_width() - 86.0).max(80.0);
+                    let bar_width = (ui.available_width() - QUOTA_VALUE_WIDTH).max(80.0);
                     let bar = egui::ProgressBar::new(remaining)
                         .desired_width(bar_width)
                         .desired_height(13.0)
                         .fill(remaining_color(remaining));
                     ui.add(bar);
-                    ui.label(
-                        egui::RichText::new(extra)
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(242, 242, 242)),
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(extra)
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(242, 242, 242)),
+                        );
+                    });
                 });
                 ui.add_space(2.0);
             }

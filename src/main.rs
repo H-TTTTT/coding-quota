@@ -55,11 +55,11 @@ fn launch_focused_tui() -> bool {
     };
 
     std::env::set_var(HOSTED, "1");
+    let size = format!("{},{}", tui::TUI_COLUMNS, tui::TUI_ROWS);
     let launched = std::process::Command::new("wt.exe")
+        .args(["--focus", "--size"])
+        .arg(size)
         .args([
-            "--focus",
-            "--size",
-            "44,31",
             "--window",
             "new",
             "new-tab",

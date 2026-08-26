@@ -13,3 +13,5 @@
 .env
 .env.*
 !.env.example
+/启动桌面额度.cmd
+/启动终端额度.lnk

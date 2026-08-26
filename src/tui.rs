@@ -78,6 +78,7 @@ mod native_drag {
             flags: u32,
         ) -> i32;
         fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, value: isize) -> isize;
+        fn SetThreadDpiAwarenessContext(context: *mut c_void) -> *mut c_void;
         fn SetWindowRgn(hwnd: *mut c_void, region: *mut c_void, redraw: i32) -> i32;
     }
 
@@ -120,6 +121,12 @@ mod native_drag {
     }
 
     fn watch_drag(stop: Arc<AtomicBool>) {
+        unsafe {
+            const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+            SetThreadDpiAwarenessContext(
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 as *mut c_void,
+            );
+        }
         let Some(hwnd) = find_terminal_window(&stop) else {
             return;
         };

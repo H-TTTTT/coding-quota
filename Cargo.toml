@@ -2,6 +2,8 @@
 name = "coding-quota"
 version = "0.1.0"
 edition = "2021"
+autobins = false
+default-run = "coding-quota"
 description = "Unified coding-plan quota viewer for Codex, Grok, GLM, Kimi, and Cursor"
 license = "MIT"
 
@@ -23,6 +25,14 @@ raw-window-handle = { version = "0.6", optional = true }
 
 [features]
 gui = ["dep:eframe", "dep:raw-window-handle"]
+
+[[bin]]
+name = "coding-quota"
+path = "src/bin/launcher.rs"
+
+[[bin]]
+name = "coding-quota-console"
+path = "src/main.rs"
 
 [[bin]]
 name = "coding-quota-desktop"

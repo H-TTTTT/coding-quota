@@ -45,15 +45,28 @@ fn enable_windows_console() {
 }
 
 #[cfg(windows)]
-fn ensure_terminal_profile() -> bool {
-    const PROFILE: &str = r#"{
+mod terminal_profile {
+    use std::path::{Path, PathBuf};
+
+    const GUID: &str = "{d0ac4c18-765a-43fd-b12d-4005d099cd6f}";
+    pub const NAME: &str = "Coding Quota TUI";
+    const ENTRY: &str = r#"            {
+                "closeOnExit": "graceful",
+                "commandline": "cmd.exe",
+                "guid": "{d0ac4c18-765a-43fd-b12d-4005d099cd6f}",
+                "historySize": 0,
+                "name": "Coding Quota TUI",
+                "padding": "0",
+                "scrollbarState": "hidden"
+            }"#;
+    const FRAGMENT: &str = r#"{
   "profiles": [
     {
-      "guid": "{d0ac4c18-765a-43fd-b12d-4005d099cd6f}",
-      "name": "Coding Quota TUI",
-      "commandline": "cmd.exe",
       "closeOnExit": "graceful",
+      "commandline": "cmd.exe",
+      "guid": "{d0ac4c18-765a-43fd-b12d-4005d099cd6f}",
       "historySize": 0,
+      "name": "Coding Quota TUI",
       "padding": "0",
       "scrollbarState": "hidden"
     }
@@ -61,23 +74,129 @@ fn ensure_terminal_profile() -> bool {
 }
 "#;
 
-    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
-        return false;
-    };
-    let directory = std::path::PathBuf::from(local_app_data)
-        .join("Microsoft")
-        .join("Windows Terminal")
-        .join("Fragments")
-        .join("CodingQuota");
-    let path = directory.join("profile.json");
-    let changed = std::fs::read_to_string(&path).ok().as_deref() != Some(PROFILE);
-    if changed {
-        if std::fs::create_dir_all(&directory).is_err() || std::fs::write(&path, PROFILE).is_err() {
+    pub fn ensure() -> bool {
+        let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
             return false;
+        };
+        let local_app_data = PathBuf::from(local_app_data);
+        let fragment = local_app_data
+            .join("Microsoft")
+            .join("Windows Terminal")
+            .join("Fragments")
+            .join("CodingQuota")
+            .join("profile.json");
+
+        if let Some((installed, changed)) = install_active_settings(&local_app_data) {
+            if installed {
+                let _ = std::fs::remove_file(fragment);
+                if changed {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+            }
+            return installed;
         }
-        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let Some(directory) = fragment.parent() else {
+            return false;
+        };
+        std::fs::create_dir_all(directory).is_ok()
+            && std::fs::write(fragment, FRAGMENT).is_ok()
     }
-    true
+
+    fn install_active_settings(local_app_data: &Path) -> Option<(bool, bool)> {
+        let candidates = [
+            local_app_data
+                .join("Packages")
+                .join("Microsoft.WindowsTerminal_8wekyb3d8bbwe")
+                .join("LocalState")
+                .join("settings.json"),
+            local_app_data
+                .join("Packages")
+                .join("Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe")
+                .join("LocalState")
+                .join("settings.json"),
+            local_app_data
+                .join("Microsoft")
+                .join("Windows Terminal")
+                .join("settings.json"),
+        ];
+        candidates
+            .into_iter()
+            .find(|path| path.is_file())
+            .map(|path| patch_settings(&path))
+    }
+
+    fn patch_settings(path: &Path) -> (bool, bool) {
+        let Ok(settings) = std::fs::read_to_string(path) else {
+            return (false, false);
+        };
+        if settings.contains(GUID) {
+            return (true, false);
+        }
+        let Some(profiles) = settings.find("\"profiles\"") else {
+            return (false, false);
+        };
+        let Some(list) = settings[profiles..].find("\"list\"").map(|index| profiles + index)
+        else {
+            return (false, false);
+        };
+        let Some(open) = settings[list..].find('[').map(|index| list + index) else {
+            return (false, false);
+        };
+        let Some(close) = array_end(&settings, open) else {
+            return (false, false);
+        };
+
+        let comma = if settings[open + 1..close].trim().is_empty() {
+            ""
+        } else {
+            ","
+        };
+        let mut updated = String::with_capacity(settings.len() + ENTRY.len() + 16);
+        updated.push_str(&settings[..close]);
+        updated.push_str(comma);
+        updated.push('\n');
+        updated.push_str(ENTRY);
+        updated.push('\n');
+        updated.push_str("        ");
+        updated.push_str(&settings[close..]);
+
+        let backup = path.with_file_name("settings.json.coding-quota-backup");
+        if !backup.exists() && std::fs::copy(path, &backup).is_err() {
+            return (false, false);
+        }
+        (std::fs::write(path, updated).is_ok(), true)
+    }
+
+    fn array_end(text: &str, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut quoted = false;
+        let mut escaped = false;
+        for (offset, character) in text[open..].char_indices() {
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    quoted = false;
+                }
+                continue;
+            }
+            match character {
+                '"' => quoted = true,
+                '[' => depth += 1,
+                ']' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(open + offset);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -97,8 +216,8 @@ fn launch_focused_tui() -> bool {
         .args(["--focus", "--size"])
         .arg(size)
         .args(["--window", "new", "new-tab"]);
-    if ensure_terminal_profile() {
-        command.args(["--profile", "Coding Quota TUI"]);
+    if terminal_profile::ensure() {
+        command.args(["--profile", terminal_profile::NAME]);
     }
     let launched = command
         .args([

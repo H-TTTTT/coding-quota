@@ -1,0 +1,15 @@
+/target/
+/dist/
+*.exe
+*.pdb
+*.log
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example

@@ -56,7 +56,7 @@ mod terminal_profile {
                 "guid": "{d0ac4c18-765a-43fd-b12d-4005d099cd6f}",
                 "historySize": 0,
                 "name": "Coding Quota TUI",
-                "padding": "0",
+                "padding": "0, 2",
                 "scrollbarState": "hidden"
             }"#;
     const FRAGMENT: &str = r#"{
@@ -67,7 +67,7 @@ mod terminal_profile {
       "guid": "{d0ac4c18-765a-43fd-b12d-4005d099cd6f}",
       "historySize": 0,
       "name": "Coding Quota TUI",
-      "padding": "0",
+      "padding": "0, 2",
       "scrollbarState": "hidden"
     }
   ]
@@ -131,6 +131,20 @@ mod terminal_profile {
             return (false, false);
         };
         if settings.contains(GUID) {
+            let needs_padding = !settings.contains(r#""padding": "0, 2""#);
+            if needs_padding {
+                let start = settings.find(GUID).unwrap_or(0);
+                let legacy = settings[start..].find(r#""padding": "0""#).map(|i| start + i);
+                if let Some(index) = legacy {
+                    let backup = path.with_file_name("settings.json.coding-quota-backup");
+                    if !backup.exists() && std::fs::copy(path, &backup).is_err() {
+                        return (false, false);
+                    }
+                    let mut updated = settings;
+                    updated.replace_range(index..index + r#""padding": "0""#.len(), r#""padding": "0, 2""#);
+                    return (std::fs::write(path, updated).is_ok(), true);
+                }
+            }
             return (true, false);
         }
         let Some(profiles) = settings.find("\"profiles\"") else {

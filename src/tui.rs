@@ -24,7 +24,8 @@ use unicode_width::UnicodeWidthStr;
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 const BAR_WIDTH: usize = 22;
 pub const TUI_COLUMNS: u16 = 48;
-pub const TUI_ROWS: u16 = 33;
+pub const TUI_LEFT_GUTTER: usize = 2;
+pub const TUI_ROWS: u16 = 34;
 
 #[cfg(windows)]
 mod native_drag {
@@ -113,6 +114,7 @@ mod native_drag {
         let Some(hwnd) = find_terminal_window(&stop) else {
             return;
         };
+        thread::sleep(Duration::from_millis(300));
         lock_window_size(hwnd);
         let (fixed_width, fixed_height) = unsafe {
             let mut rect = Rect::default();
@@ -194,8 +196,8 @@ mod native_drag {
                 style & !(WS_THICKFRAME | WS_MAXIMIZEBOX),
             );
             const DWMWA_BORDER_COLOR: u32 = 34;
-            const WHITE: u32 = 0x00FF_FFFF;
-            DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &WHITE, 4);
+            const NO_BORDER: u32 = 0xFFFF_FFFE;
+            DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &NO_BORDER, 4);
             const SWP_NOSIZE: u32 = 0x0001;
             const SWP_NOMOVE: u32 = 0x0002;
             const SWP_NOZORDER: u32 = 0x0004;
@@ -309,6 +311,7 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, loading: bool) {
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -322,13 +325,13 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, loading: bool) {
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            title,
+            format!("{}{}", " ".repeat(TUI_LEFT_GUTTER), title),
             Style::default().add_modifier(Modifier::BOLD),
         ))),
-        chunks[0],
+        chunks[1],
     );
 
-    let width = chunks[2].width as usize;
+    let width = chunks[3].width as usize;
     let mut lines = Vec::new();
     for (index, report) in snapshot.reports.iter().enumerate() {
         if index > 0 {
@@ -338,15 +341,15 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, loading: bool) {
     }
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
-        chunks[2],
+        chunks[3],
     );
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "[Q] 关闭  [R] 刷新  每 2 分钟自动刷新",
+            format!("{}[Q] 关闭  [R] 刷新  每 2 分钟自动刷新", " ".repeat(TUI_LEFT_GUTTER)),
             Style::default().add_modifier(Modifier::DIM),
         ))),
-        chunks[4],
+        chunks[5],
     );
 }
 
@@ -363,19 +366,19 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
 
     if let Some(error) = &report.error {
         lines.push(Line::from(Span::styled(
-            format!("  错误：{}", error_cn(error)),
+            format!("{}错误：{}", " ".repeat(TUI_LEFT_GUTTER), error_cn(error)),
             Style::default().fg(ratatui::style::Color::Red),
         )));
         return lines;
     }
     if report.windows.is_empty() {
-        lines.push(Line::from("  暂无额度数据"));
+        lines.push(Line::from(format!("{}暂无额度数据", " ".repeat(TUI_LEFT_GUTTER))));
         return lines;
     }
 
     for window in &report.windows {
         let label = label_cn(&window.label);
-        lines.push(Line::from(Span::raw(format!("  {label}"))));
+        lines.push(Line::from(Span::raw(format!("{}{label}", " ".repeat(TUI_LEFT_GUTTER)))));
 
         let remaining = (1.0 - window.used_fraction).clamp(0.0, 1.0);
         let extra = match (window.used, window.limit) {
@@ -385,14 +388,14 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
             _ => format!("剩余 {:.0}%", (remaining * 100.0).round()),
         };
         let reset = window.reset_at.map(compact_until_cn).unwrap_or_default();
-        let used_width = 2
+        let used_width = TUI_LEFT_GUTTER
             + BAR_WIDTH
             + 2
             + display_width(&extra)
             + display_width(&reset);
         let pad = width.saturating_sub(used_width);
         lines.push(Line::from(vec![
-            Span::raw("  "),
+            Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
             Span::styled(
                 bar(remaining, BAR_WIDTH),
                 Style::default().fg(status_color(window.used_fraction)),

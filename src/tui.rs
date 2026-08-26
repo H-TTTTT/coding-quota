@@ -61,6 +61,8 @@ mod native_drag {
     #[link(name = "user32")]
     extern "system" {
         fn GetAsyncKeyState(key: i32) -> i16;
+        fn ClientToScreen(hwnd: *mut c_void, point: *mut Point) -> i32;
+        fn GetClientRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
         fn GetClassNameW(hwnd: *mut c_void, class: *mut u16, max: i32) -> i32;
         fn GetCursorPos(point: *mut Point) -> i32;
         fn GetWindowLongPtrW(hwnd: *mut c_void, index: i32) -> isize;
@@ -76,6 +78,7 @@ mod native_drag {
             flags: u32,
         ) -> i32;
         fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, value: isize) -> isize;
+        fn SetWindowRgn(hwnd: *mut c_void, region: *mut c_void, redraw: i32) -> i32;
     }
 
     #[link(name = "dwmapi")]
@@ -86,6 +89,12 @@ mod native_drag {
             value: *const u32,
             size: u32,
         ) -> i32;
+    }
+
+    #[link(name = "gdi32")]
+    extern "system" {
+        fn CreateRectRgn(left: i32, top: i32, right: i32, bottom: i32) -> *mut c_void;
+        fn DeleteObject(object: *mut c_void) -> i32;
     }
 
     impl Watcher {
@@ -189,6 +198,14 @@ mod native_drag {
             const GWL_STYLE: i32 = -16;
             const WS_THICKFRAME: isize = 0x0004_0000;
             const WS_MAXIMIZEBOX: isize = 0x0001_0000;
+            const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+            const DWMWCP_DONOTROUND: u32 = 1;
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &DWMWCP_DONOTROUND,
+                4,
+            );
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
             SetWindowLongPtrW(
                 hwnd,
@@ -216,6 +233,34 @@ mod native_drag {
                     | SWP_NOACTIVATE
                     | SWP_FRAMECHANGED,
             );
+            thread::sleep(Duration::from_millis(50));
+            clip_to_client(hwnd);
+        }
+    }
+
+    unsafe fn clip_to_client(hwnd: *mut c_void) {
+        let mut window = Rect::default();
+        let mut client = Rect::default();
+        let mut origin = Point::default();
+        if GetWindowRect(hwnd, &mut window) == 0
+            || GetClientRect(hwnd, &mut client) == 0
+            || ClientToScreen(hwnd, &mut origin) == 0
+        {
+            return;
+        }
+        let left = origin.x - window.left;
+        let top = origin.y - window.top;
+        let region = CreateRectRgn(
+            left,
+            top,
+            left + client.right - client.left,
+            top + client.bottom - client.top,
+        );
+        if region.is_null() {
+            return;
+        }
+        if SetWindowRgn(hwnd, region, 1) == 0 {
+            DeleteObject(region);
         }
     }
 
@@ -331,7 +376,7 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, loading: bool) {
         chunks[1],
     );
 
-    let width = chunks[3].width as usize;
+    let width = (chunks[3].width as usize).saturating_sub(TUI_LEFT_GUTTER);
     let mut lines = Vec::new();
     for (index, report) in snapshot.reports.iter().enumerate() {
         if index > 0 {
@@ -357,8 +402,11 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
     let title = report_title(report);
     let identity = report.identity.clone().unwrap_or_default();
     let gap = usize::from(!identity.is_empty()) * 2;
-    let pad = width.saturating_sub(display_width(&title) + display_width(&identity) + gap);
+    let pad = width.saturating_sub(
+        TUI_LEFT_GUTTER + display_width(&title) + display_width(&identity) + gap,
+    );
     let mut lines = vec![Line::from(vec![
+        Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
         Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" ".repeat(pad + gap)),
         Span::styled(identity, Style::default().add_modifier(Modifier::DIM)),
@@ -381,11 +429,15 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(Span::raw(format!("{}{label}", " ".repeat(TUI_LEFT_GUTTER)))));
 
         let remaining = (1.0 - window.used_fraction).clamp(0.0, 1.0);
-        let extra = match (window.used, window.limit) {
-            (Some(used), Some(limit)) => {
-                format!("剩余 {:.0}/{limit:.0}", (limit - used).max(0.0))
+        let extra = if report.provider == ProviderId::Kimi {
+            format!("剩余 {:.0}%", (remaining * 100.0).round())
+        } else {
+            match (window.used, window.limit) {
+                (Some(used), Some(limit)) => {
+                    format!("剩余 {:.0}/{limit:.0}", (limit - used).max(0.0))
+                }
+                _ => format!("剩余 {:.0}%", (remaining * 100.0).round()),
             }
-            _ => format!("剩余 {:.0}%", (remaining * 100.0).round()),
         };
         let reset = window.reset_at.map(compact_until_cn).unwrap_or_default();
         let used_width = TUI_LEFT_GUTTER

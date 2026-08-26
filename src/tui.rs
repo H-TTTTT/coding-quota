@@ -23,7 +23,8 @@ use unicode_width::UnicodeWidthStr;
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 const BAR_WIDTH: usize = 22;
-const MIN_COLUMNS: usize = 44;
+pub const TUI_COLUMNS: u16 = 48;
+pub const TUI_ROWS: u16 = 31;
 
 #[cfg(windows)]
 mod native_drag {
@@ -61,6 +62,7 @@ mod native_drag {
         fn GetAsyncKeyState(key: i32) -> i16;
         fn GetClassNameW(hwnd: *mut c_void, class: *mut u16, max: i32) -> i32;
         fn GetCursorPos(point: *mut Point) -> i32;
+        fn GetWindowLongPtrW(hwnd: *mut c_void, index: i32) -> isize;
         fn GetForegroundWindow() -> *mut c_void;
         fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
         fn SetWindowPos(
@@ -72,17 +74,19 @@ mod native_drag {
             cy: i32,
             flags: u32,
         ) -> i32;
+        fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, value: isize) -> isize;
     }
 
     impl Watcher {
         pub fn start() -> Self {
             let stop = Arc::new(AtomicBool::new(false));
-            let thread_stop = Arc::clone(&stop);
-            let thread = thread::spawn(move || watch_drag(thread_stop));
-            Self {
-                stop,
-                thread: Some(thread),
-            }
+            let thread = if std::env::var_os("CODING_QUOTA_TUI_HOSTED").is_some() {
+                let thread_stop = Arc::clone(&stop);
+                Some(thread::spawn(move || watch_drag(thread_stop)))
+            } else {
+                None
+            };
+            Self { stop, thread }
         }
     }
 
@@ -99,6 +103,14 @@ mod native_drag {
         let Some(hwnd) = find_terminal_window(&stop) else {
             return;
         };
+        lock_window_size(hwnd);
+        let (fixed_width, fixed_height) = unsafe {
+            let mut rect = Rect::default();
+            if GetWindowRect(hwnd, &mut rect) == 0 {
+                return;
+            }
+            (rect.right - rect.left, rect.bottom - rect.top)
+        };
         let mut was_down = false;
         let mut offset: Option<(i32, i32)> = None;
 
@@ -108,6 +120,23 @@ mod native_drag {
                 let mut cursor = Point::default();
                 let mut rect = Rect::default();
                 if GetCursorPos(&mut cursor) != 0 && GetWindowRect(hwnd, &mut rect) != 0 {
+                    let width = rect.right - rect.left;
+                    let height = rect.bottom - rect.top;
+                    if width != fixed_width || height != fixed_height {
+                        const SWP_NOZORDER: u32 = 0x0004;
+                        const SWP_NOACTIVATE: u32 = 0x0010;
+                        SetWindowPos(
+                            hwnd,
+                            0,
+                            rect.left,
+                            rect.top,
+                            fixed_width,
+                            fixed_height,
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                        rect.right = rect.left + fixed_width;
+                        rect.bottom = rect.top + fixed_height;
+                    }
                     if down && !was_down {
                         let foreground = GetForegroundWindow();
                         let in_header = cursor.x >= rect.left
@@ -140,6 +169,38 @@ mod native_drag {
                 was_down = down;
             }
             thread::sleep(Duration::from_millis(8));
+        }
+    }
+
+    fn lock_window_size(hwnd: *mut c_void) {
+        unsafe {
+            const GWL_STYLE: i32 = -16;
+            const WS_THICKFRAME: isize = 0x0004_0000;
+            const WS_MAXIMIZEBOX: isize = 0x0001_0000;
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            SetWindowLongPtrW(
+                hwnd,
+                GWL_STYLE,
+                style & !(WS_THICKFRAME | WS_MAXIMIZEBOX),
+            );
+            const SWP_NOSIZE: u32 = 0x0001;
+            const SWP_NOMOVE: u32 = 0x0002;
+            const SWP_NOZORDER: u32 = 0x0004;
+            const SWP_NOACTIVATE: u32 = 0x0010;
+            const SWP_FRAMECHANGED: u32 = 0x0020;
+            SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOSIZE
+                    | SWP_NOMOVE
+                    | SWP_NOZORDER
+                    | SWP_NOACTIVATE
+                    | SWP_FRAMECHANGED,
+            );
         }
     }
 
@@ -182,10 +243,10 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
     let mut stdout = stdout();
     execute!(stdout, SetTitle("编程额度"), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let _drag_watcher = native_drag::Watcher::start();
 
     let mut snapshot = fetch::fetch_all(&creds, only).await;
-    resize_terminal(&mut terminal, &snapshot);
+    resize_terminal(&mut terminal);
+    let _drag_watcher = native_drag::Watcher::start();
     let mut last_refresh = Instant::now();
     let auto = Duration::from_secs(120);
     let mut loading = false;
@@ -200,12 +261,13 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
                         loading = true;
                         terminal.draw(|frame| draw(frame, &snapshot, loading))?;
                         snapshot = fetch::fetch_all(&creds, only).await;
-                        resize_terminal(&mut terminal, &snapshot);
+                        resize_terminal(&mut terminal);
                         last_refresh = Instant::now();
                         loading = false;
                     }
                     _ => {}
                 },
+                Event::Resize(_, _) => resize_terminal(&mut terminal),
                 _ => {}
             }
         }
@@ -213,7 +275,7 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
             loading = true;
             terminal.draw(|frame| draw(frame, &snapshot, loading))?;
             snapshot = fetch::fetch_all(&creds, only).await;
-            resize_terminal(&mut terminal, &snapshot);
+            resize_terminal(&mut terminal);
             last_refresh = Instant::now();
             loading = false;
         }
@@ -298,13 +360,7 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
 
     for window in &report.windows {
         let label = label_cn(&window.label);
-        let reset = window.reset_at.map(compact_until_cn).unwrap_or_default();
-        let pad = width.saturating_sub(display_width(&label) + display_width(&reset) + 2);
-        lines.push(Line::from(vec![
-            Span::raw(format!("  {label}")),
-            Span::raw(" ".repeat(pad)),
-            Span::styled(reset, Style::default().add_modifier(Modifier::DIM)),
-        ]));
+        lines.push(Line::from(Span::raw(format!("  {label}"))));
 
         let remaining = (1.0 - window.used_fraction).clamp(0.0, 1.0);
         let extra = match (window.used, window.limit) {
@@ -313,6 +369,13 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
             }
             _ => format!("剩余 {:.0}%", (remaining * 100.0).round()),
         };
+        let reset = window.reset_at.map(compact_until_cn).unwrap_or_default();
+        let used_width = 2
+            + BAR_WIDTH
+            + 2
+            + display_width(&extra)
+            + display_width(&reset);
+        let pad = width.saturating_sub(used_width);
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
@@ -321,6 +384,8 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
             ),
             Span::raw("  "),
             Span::styled(extra, Style::default().add_modifier(Modifier::DIM)),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(reset, Style::default().add_modifier(Modifier::DIM)),
         ]));
     }
     lines
@@ -351,37 +416,14 @@ fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
-fn report_height(report: &ProviderReport) -> usize {
-    1 + if report.error.is_some() || report.windows.is_empty() {
-        1
-    } else {
-        report.windows.len() * 2
-    }
-}
 
-fn required_terminal_size(snapshot: &Snapshot) -> (u16, u16) {
-    let mut columns = MIN_COLUMNS;
-    for report in &snapshot.reports {
-        let title = report_title(report);
-        let identity = report.identity.as_deref().unwrap_or_default();
-        let gap = usize::from(!identity.is_empty()) * 2;
-        columns = columns.max(display_width(&title) + display_width(identity) + gap);
-        for window in &report.windows {
-            let label = label_cn(&window.label);
-            let reset = window.reset_at.map(compact_until_cn).unwrap_or_default();
-            columns = columns.max(display_width(&label) + display_width(&reset) + 2);
-        }
-    }
-
-    let report_rows: usize = snapshot.reports.iter().map(report_height).sum();
-    let gaps = snapshot.reports.len().saturating_sub(1);
-    let rows = (report_rows + gaps + 2).max(8);
-    (columns.min(u16::MAX as usize) as u16, rows.min(u16::MAX as usize) as u16)
-}
-
-fn resize_terminal(terminal: &mut AppTerminal, snapshot: &Snapshot) {
-    let (columns, rows) = required_terminal_size(snapshot);
-    if execute!(terminal.backend_mut(), SetSize(columns, rows)).is_ok() {
+fn resize_terminal(terminal: &mut AppTerminal) {
+    if execute!(
+        terminal.backend_mut(),
+        SetSize(TUI_COLUMNS, TUI_ROWS)
+    )
+    .is_ok()
+    {
         std::thread::sleep(Duration::from_millis(120));
         let _ = terminal.autoresize();
         let _ = terminal.clear();

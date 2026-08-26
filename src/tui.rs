@@ -115,7 +115,7 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, loading: bool) {
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "[Q] 退出  [R] 刷新  每 2 分钟自动刷新",
+            "[Q] 关闭  [R] 刷新  每 2 分钟自动刷新",
             Style::default().add_modifier(Modifier::DIM),
         ))),
         chunks[2],

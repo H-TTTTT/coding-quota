@@ -44,6 +44,44 @@ fn enable_windows_console() {
     }
 }
 
+#[cfg(windows)]
+fn launch_focused_tui() -> bool {
+    const HOSTED: &str = "CODING_QUOTA_TUI_HOSTED";
+    if std::env::var_os(HOSTED).is_some() {
+        return false;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+
+    std::env::set_var(HOSTED, "1");
+    let launched = std::process::Command::new("wt.exe")
+        .args([
+            "--focus",
+            "--size",
+            "44,31",
+            "--window",
+            "new",
+            "new-tab",
+            "--suppressApplicationTitle",
+            "--title",
+            "编程额度",
+        ])
+        .arg(executable)
+        .args(std::env::args_os().skip(1))
+        .spawn()
+        .is_ok();
+    if !launched {
+        std::env::remove_var(HOSTED);
+    }
+    launched
+}
+
+#[cfg(not(windows))]
+fn launch_focused_tui() -> bool {
+    false
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     enable_windows_console();
@@ -55,15 +93,19 @@ async fn main() -> Result<()> {
         ),
         None => None,
     };
-    let creds = credentials::load()?;
+    let want_tui =
+        !cli.json && !cli.snapshot && cli.watch.is_none() && std::io::stdout().is_terminal();
+    if want_tui && launch_focused_tui() {
+        return Ok(());
+    }
 
+    let creds = credentials::load()?;
     if cli.json {
         let snapshot = fetch::fetch_all(&creds, only).await;
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
 
-    let want_tui = !cli.snapshot && cli.watch.is_none() && std::io::stdout().is_terminal();
     if want_tui {
         return tui::run(creds, only).await;
     }

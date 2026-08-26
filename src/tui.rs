@@ -324,13 +324,11 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
                         loading = true;
                         terminal.draw(|frame| draw(frame, &snapshot, loading))?;
                         snapshot = fetch::fetch_all(&creds, only).await;
-                        resize_terminal(&mut terminal);
                         last_refresh = Instant::now();
                         loading = false;
                     }
                     _ => {}
                 },
-                Event::Resize(_, _) => resize_terminal(&mut terminal),
                 _ => {}
             }
         }
@@ -338,7 +336,6 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
             loading = true;
             terminal.draw(|frame| draw(frame, &snapshot, loading))?;
             snapshot = fetch::fetch_all(&creds, only).await;
-            resize_terminal(&mut terminal);
             last_refresh = Instant::now();
             loading = false;
         }

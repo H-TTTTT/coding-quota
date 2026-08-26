@@ -45,6 +45,42 @@ fn enable_windows_console() {
 }
 
 #[cfg(windows)]
+fn ensure_terminal_profile() -> bool {
+    const PROFILE: &str = r#"{
+  "profiles": [
+    {
+      "guid": "{d0ac4c18-765a-43fd-b12d-4005d099cd6f}",
+      "name": "Coding Quota TUI",
+      "commandline": "cmd.exe",
+      "closeOnExit": "graceful",
+      "historySize": 0,
+      "padding": "0",
+      "scrollbarState": "hidden"
+    }
+  ]
+}
+"#;
+
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return false;
+    };
+    let directory = std::path::PathBuf::from(local_app_data)
+        .join("Microsoft")
+        .join("Windows Terminal")
+        .join("Fragments")
+        .join("CodingQuota");
+    let path = directory.join("profile.json");
+    let changed = std::fs::read_to_string(&path).ok().as_deref() != Some(PROFILE);
+    if changed {
+        if std::fs::create_dir_all(&directory).is_err() || std::fs::write(&path, PROFILE).is_err() {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+    true
+}
+
+#[cfg(windows)]
 fn launch_focused_tui() -> bool {
     const HOSTED: &str = "CODING_QUOTA_TUI_HOSTED";
     if std::env::var_os(HOSTED).is_some() {
@@ -56,13 +92,16 @@ fn launch_focused_tui() -> bool {
 
     std::env::set_var(HOSTED, "1");
     let size = format!("{},{}", tui::TUI_COLUMNS, tui::TUI_ROWS);
-    let launched = std::process::Command::new("wt.exe")
+    let mut command = std::process::Command::new("wt.exe");
+    command
         .args(["--focus", "--size"])
         .arg(size)
+        .args(["--window", "new", "new-tab"]);
+    if ensure_terminal_profile() {
+        command.args(["--profile", "Coding Quota TUI"]);
+    }
+    let launched = command
         .args([
-            "--window",
-            "new",
-            "new-tab",
             "--suppressApplicationTitle",
             "--title",
             "编程额度",

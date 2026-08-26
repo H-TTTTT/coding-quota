@@ -24,7 +24,7 @@ use unicode_width::UnicodeWidthStr;
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 const BAR_WIDTH: usize = 22;
 pub const TUI_COLUMNS: u16 = 48;
-pub const TUI_ROWS: u16 = 31;
+pub const TUI_ROWS: u16 = 33;
 
 #[cfg(windows)]
 mod native_drag {
@@ -75,6 +75,16 @@ mod native_drag {
             flags: u32,
         ) -> i32;
         fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, value: isize) -> isize;
+    }
+
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: *mut c_void,
+            attribute: u32,
+            value: *const u32,
+            size: u32,
+        ) -> i32;
     }
 
     impl Watcher {
@@ -183,6 +193,9 @@ mod native_drag {
                 GWL_STYLE,
                 style & !(WS_THICKFRAME | WS_MAXIMIZEBOX),
             );
+            const DWMWA_BORDER_COLOR: u32 = 34;
+            const WHITE: u32 = 0x00FF_FFFF;
+            DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &WHITE, 4);
             const SWP_NOSIZE: u32 = 0x0001;
             const SWP_NOMOVE: u32 = 0x0002;
             const SWP_NOZORDER: u32 = 0x0004;
@@ -295,7 +308,9 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, loading: bool) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(frame.area());
@@ -313,7 +328,7 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, loading: bool) {
         chunks[0],
     );
 
-    let width = chunks[1].width as usize;
+    let width = chunks[2].width as usize;
     let mut lines = Vec::new();
     for (index, report) in snapshot.reports.iter().enumerate() {
         if index > 0 {
@@ -323,7 +338,7 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, loading: bool) {
     }
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
-        chunks[1],
+        chunks[2],
     );
 
     frame.render_widget(
@@ -331,7 +346,7 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, loading: bool) {
             "[Q] 关闭  [R] 刷新  每 2 分钟自动刷新",
             Style::default().add_modifier(Modifier::DIM),
         ))),
-        chunks[2],
+        chunks[4],
     );
 }
 

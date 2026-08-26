@@ -196,8 +196,7 @@ mod native_drag {
     fn lock_window_size(hwnd: *mut c_void) {
         unsafe {
             const GWL_STYLE: i32 = -16;
-            const WS_THICKFRAME: isize = 0x0004_0000;
-            const WS_MAXIMIZEBOX: isize = 0x0001_0000;
+            const WS_OVERLAPPEDWINDOW: isize = 0x00CF_0000;
             const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
             const DWMWCP_DONOTROUND: u32 = 1;
             DwmSetWindowAttribute(
@@ -207,10 +206,14 @@ mod native_drag {
                 4,
             );
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-            SetWindowLongPtrW(
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style & !WS_OVERLAPPEDWINDOW);
+            const DWMWA_NCRENDERING_POLICY: u32 = 2;
+            const DWMNCRP_DISABLED: u32 = 1;
+            DwmSetWindowAttribute(
                 hwnd,
-                GWL_STYLE,
-                style & !(WS_THICKFRAME | WS_MAXIMIZEBOX),
+                DWMWA_NCRENDERING_POLICY,
+                &DWMNCRP_DISABLED,
+                4,
             );
             const DWMWA_BORDER_COLOR: u32 = 34;
             const NO_BORDER: u32 = 0xFFFF_FFFE;

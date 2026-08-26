@@ -265,8 +265,10 @@ async fn main() -> Result<()> {
         ),
         None => None,
     };
+    let interactive = !cli.json && !cli.snapshot && cli.watch.is_none();
+    let launch_requested = std::env::var_os("CODING_QUOTA_LAUNCH_REQUEST").is_some();
     let want_tui =
-        !cli.json && !cli.snapshot && cli.watch.is_none() && std::io::stdout().is_terminal();
+        interactive && (launch_requested || std::io::stdout().is_terminal());
     if want_tui && launch_focused_tui() {
         return Ok(());
     }

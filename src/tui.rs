@@ -25,12 +25,164 @@ type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 const BAR_WIDTH: usize = 22;
 const MIN_COLUMNS: usize = 44;
 
+#[cfg(windows)]
+mod native_drag {
+    use core::ffi::c_void;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    pub struct Watcher {
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(key: i32) -> i16;
+        fn GetClassNameW(hwnd: *mut c_void, class: *mut u16, max: i32) -> i32;
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn GetForegroundWindow() -> *mut c_void;
+        fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
+        fn SetWindowPos(
+            hwnd: *mut c_void,
+            after: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
+    }
+
+    impl Watcher {
+        pub fn start() -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let thread = thread::spawn(move || watch_drag(thread_stop));
+            Self {
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for Watcher {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn watch_drag(stop: Arc<AtomicBool>) {
+        let Some(hwnd) = find_terminal_window(&stop) else {
+            return;
+        };
+        let mut was_down = false;
+        let mut offset: Option<(i32, i32)> = None;
+
+        while !stop.load(Ordering::Relaxed) {
+            unsafe {
+                let down = GetAsyncKeyState(0x01) < 0;
+                let mut cursor = Point::default();
+                let mut rect = Rect::default();
+                if GetCursorPos(&mut cursor) != 0 && GetWindowRect(hwnd, &mut rect) != 0 {
+                    if down && !was_down {
+                        let foreground = GetForegroundWindow();
+                        let in_header = cursor.x >= rect.left
+                            && cursor.x < rect.right
+                            && cursor.y >= rect.top
+                            && cursor.y < rect.top + 32;
+                        if foreground == hwnd && in_header {
+                            offset = Some((cursor.x - rect.left, cursor.y - rect.top));
+                        }
+                    }
+                    if down {
+                        if let Some((offset_x, offset_y)) = offset {
+                            const SWP_NOSIZE: u32 = 0x0001;
+                            const SWP_NOZORDER: u32 = 0x0004;
+                            const SWP_NOACTIVATE: u32 = 0x0010;
+                            SetWindowPos(
+                                hwnd,
+                                0,
+                                cursor.x - offset_x,
+                                cursor.y - offset_y,
+                                0,
+                                0,
+                                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                            );
+                        }
+                    } else {
+                        offset = None;
+                    }
+                }
+                was_down = down;
+            }
+            thread::sleep(Duration::from_millis(8));
+        }
+    }
+
+    fn find_terminal_window(stop: &AtomicBool) -> Option<*mut c_void> {
+        for _ in 0..100 {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            unsafe {
+                let hwnd = GetForegroundWindow();
+                let mut class = [0u16; 128];
+                let len = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+                if len > 0 {
+                    let class = String::from_utf16_lossy(&class[..len as usize]);
+                    if class.contains("CASCADIA") {
+                        return Some(hwnd);
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+}
+
+#[cfg(not(windows))]
+mod native_drag {
+    pub struct Watcher;
+
+    impl Watcher {
+        pub fn start() -> Self {
+            Self
+        }
+    }
+}
+
 pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
     let original_size = crossterm::terminal::size().ok();
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, SetTitle("编程额度"), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    let _drag_watcher = native_drag::Watcher::start();
 
     let mut snapshot = fetch::fetch_all(&creds, only).await;
     resize_terminal(&mut terminal, &snapshot);
@@ -41,11 +193,8 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
     let result = loop {
         terminal.draw(|frame| draw(frame, &snapshot, loading))?;
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                     KeyCode::Char('r') => {
                         loading = true;
@@ -56,7 +205,8 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
                         loading = false;
                     }
                     _ => {}
-                }
+                },
+                _ => {}
             }
         }
         if last_refresh.elapsed() >= auto {
@@ -68,6 +218,7 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
             loading = false;
         }
     };
+    drop(_drag_watcher);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;

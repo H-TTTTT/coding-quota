@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod tui;
 
 use anyhow::Result;
@@ -34,10 +36,13 @@ fn enable_windows_console() {
     {
         #[link(name = "kernel32")]
         extern "system" {
+            fn AttachConsole(process_id: u32) -> i32;
             fn SetConsoleOutputCP(code_page: u32) -> i32;
             fn SetConsoleCP(code_page: u32) -> i32;
         }
         unsafe {
+            const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+            AttachConsole(ATTACH_PARENT_PROCESS);
             SetConsoleOutputCP(65001);
             SetConsoleCP(65001);
         }
@@ -214,6 +219,89 @@ mod terminal_profile {
 }
 
 #[cfg(windows)]
+fn console_host_executable(executable: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::io::Write;
+
+    const PE_POINTER_OFFSET: usize = 0x3c;
+    const OPTIONAL_HEADER_OFFSET: usize = 24;
+    const CHECKSUM_OFFSET: usize = 64;
+    const SUBSYSTEM_OFFSET: usize = 68;
+    const WINDOWS_GUI: u16 = 2;
+    const WINDOWS_CUI: u16 = 3;
+
+    let mut image = std::fs::read(executable).ok()?;
+    let pe_pointer = image.get(PE_POINTER_OFFSET..PE_POINTER_OFFSET + 4)?;
+    let pe_offset = u32::from_le_bytes(pe_pointer.try_into().ok()?) as usize;
+    if image.get(pe_offset..pe_offset + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let optional_header = pe_offset.checked_add(OPTIONAL_HEADER_OFFSET)?;
+    let checksum = optional_header.checked_add(CHECKSUM_OFFSET)?;
+    let subsystem = optional_header.checked_add(SUBSYSTEM_OFFSET)?;
+    let current = u16::from_le_bytes(image.get(subsystem..subsystem + 2)?.try_into().ok()?);
+    if current == WINDOWS_CUI {
+        return Some(executable.to_path_buf());
+    }
+    if current != WINDOWS_GUI {
+        return None;
+    }
+    image.get_mut(checksum..checksum + 4)?.fill(0);
+    image
+        .get_mut(subsystem..subsystem + 2)?
+        .copy_from_slice(&WINDOWS_CUI.to_le_bytes());
+
+    fn cache_file(path: &std::path::Path, content: &[u8]) -> Option<()> {
+        if std::fs::read(path).ok().as_deref() == Some(content) {
+            return Some(());
+        }
+        let pending = path.with_extension(format!("{}.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&pending);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pending)
+            .ok()?;
+        if file.write_all(content).is_err() || file.sync_all().is_err() {
+            let _ = std::fs::remove_file(&pending);
+            return None;
+        }
+        drop(file);
+        if std::fs::rename(&pending, path).is_err() {
+            let _ = std::fs::remove_file(&pending);
+            if std::fs::read(path).ok().as_deref() != Some(content) {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    let executable_dir = executable.parent()?;
+    let dependencies = ["libgcc_s_seh-1.dll", "libwinpthread-1.dll"]
+        .into_iter()
+        .map(|name| Some((name, std::fs::read(executable_dir.join(name)).ok()?)))
+        .collect::<Option<Vec<_>>>()?;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for content in std::iter::once(image.as_slice())
+        .chain(dependencies.iter().map(|(_, content)| content.as_slice()))
+    {
+        for byte in content {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    let directory = std::env::temp_dir()
+        .join("CodingQuota")
+        .join(format!("{hash:016x}"));
+    std::fs::create_dir_all(&directory).ok()?;
+    let runtime = directory.join("coding-quota.exe");
+    cache_file(&runtime, &image)?;
+    for (name, content) in dependencies {
+        cache_file(&directory.join(name), &content)?;
+    }
+    Some(runtime)
+}
+
+#[cfg(windows)]
 fn launch_focused_tui() -> bool {
     const HOSTED: &str = "CODING_QUOTA_TUI_HOSTED";
     if std::env::var_os(HOSTED).is_some() {
@@ -222,6 +310,10 @@ fn launch_focused_tui() -> bool {
     let Ok(executable) = std::env::current_exe() else {
         return false;
     };
+    let Some(executable) = console_host_executable(&executable) else {
+        return false;
+    };
+
 
     std::env::set_var(HOSTED, "1");
     let size = format!("{},{}", tui::TUI_COLUMNS, tui::TUI_ROWS);
@@ -266,12 +358,11 @@ async fn main() -> Result<()> {
         None => None,
     };
     let interactive = !cli.json && !cli.snapshot && cli.watch.is_none();
-    let launch_requested = std::env::var_os("CODING_QUOTA_LAUNCH_REQUEST").is_some();
-    let want_tui =
-        interactive && (launch_requested || std::io::stdout().is_terminal());
-    if want_tui && launch_focused_tui() {
+    let hosted = std::env::var_os("CODING_QUOTA_TUI_HOSTED").is_some();
+    if interactive && launch_focused_tui() {
         return Ok(());
     }
+    let want_tui = interactive && (hosted || std::io::stdout().is_terminal());
 
     let creds = credentials::load()?;
     if cli.json {

@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use coding_quota::model::{ProviderId, ProviderReport, Snapshot};
-use coding_quota::render::compact_until;
+use coding_quota::render::{ago_cn, compact_until_cn, label_cn, title_cn};
 use coding_quota::{credentials, fetch};
 use eframe::egui;
 #[cfg(windows)]
@@ -496,7 +496,7 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some(reset) = window.reset_at {
                             ui.label(
-                                egui::RichText::new(compact_until(reset))
+                                egui::RichText::new(compact_until_cn(reset))
                                     .small()
                                     .monospace()
                                     .color(egui::Color32::from_rgb(218, 218, 218)),
@@ -528,57 +528,6 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
         });
 }
 
-fn title_cn(title: &str) -> &str {
-    match title {
-        "Zhipu Coding Plan" => "智谱 Coding Plan",
-        other => other,
-    }
-}
-
-fn label_cn(label: &str) -> String {
-    match label {
-        "Weekly credits" => "每周额度".into(),
-        "Monthly credits" => "每月额度".into(),
-        "Period credits" => "周期额度".into(),
-        "Weekly" => "每周额度".into(),
-        "MCP / tools" => "MCP / 工具".into(),
-        "Total quota" => "总额度".into(),
-        "API / named models" => "API / 指定模型".into(),
-        "Auto models" => "Auto 模型".into(),
-        "Included total" => "套餐内总量".into(),
-        "5h window" => "5 小时窗口".into(),
-        "5h limit" => "5 小时限额".into(),
-        other => {
-            if let Some(days) = other.strip_suffix(" days") {
-                format!("{days} 天窗口")
-            } else if let Some(hours) = other.strip_suffix(" hours") {
-                format!("{hours} 小时窗口")
-            } else if let Some(h) = other.strip_suffix("h limit") {
-                format!("{h} 小时限额")
-            } else if let Some(d) = other.strip_suffix("d limit") {
-                format!("{d} 天限额")
-            } else {
-                other.to_string()
-            }
-        }
-    }
-}
-
-fn ago_cn(when: chrono::DateTime<chrono::Utc>) -> String {
-    let secs = chrono::Utc::now()
-        .signed_duration_since(when)
-        .num_seconds()
-        .max(0);
-    if secs < 5 {
-        "刚刚".into()
-    } else if secs < 60 {
-        format!("{secs} 秒前")
-    } else if secs < 3600 {
-        format!("{} 分钟前", secs / 60)
-    } else {
-        format!("{} 小时前", secs / 3600)
-    }
-}
 
 fn remaining_color(remaining: f32) -> egui::Color32 {
     if remaining <= 0.10 {

@@ -95,6 +95,72 @@ pub fn ago(when: DateTime<Utc>) -> String {
     }
 }
 
+pub fn title_cn(title: &str) -> &str {
+    match title {
+        "Zhipu Coding Plan" => "智谱 Coding Plan",
+        other => other,
+    }
+}
+
+pub fn label_cn(label: &str) -> String {
+    match label {
+        "Weekly credits" | "Weekly" => "每周额度".into(),
+        "Monthly credits" => "每月额度".into(),
+        "Period credits" => "周期额度".into(),
+        "MCP / tools" => "MCP / 工具".into(),
+        "Total quota" => "总额度".into(),
+        "API / named models" => "API / 指定模型".into(),
+        "Auto models" => "Auto 模型".into(),
+        "Included total" => "套餐内总量".into(),
+        "5h window" => "5 小时窗口".into(),
+        "5h limit" => "5 小时限额".into(),
+        other => {
+            if let Some(days) = other.strip_suffix(" days") {
+                format!("{days} 天窗口")
+            } else if let Some(hours) = other.strip_suffix(" hours") {
+                format!("{hours} 小时窗口")
+            } else if let Some(hours) = other.strip_suffix("h limit") {
+                format!("{hours} 小时限额")
+            } else if let Some(days) = other.strip_suffix("d limit") {
+                format!("{days} 天限额")
+            } else {
+                other.to_string()
+            }
+        }
+    }
+}
+
+pub fn compact_until_cn(when: DateTime<Utc>) -> String {
+    let mins = when.signed_duration_since(Utc::now()).num_minutes();
+    if mins <= 0 {
+        "现在".into()
+    } else if mins >= 60 * 24 {
+        format!("{}天", mins / (60 * 24))
+    } else if mins >= 60 {
+        let hours = (mins as f64 / 30.0).round() / 2.0;
+        if hours.fract() == 0.0 {
+            format!("{}小时", hours as i64)
+        } else {
+            format!("{hours:.1}小时")
+        }
+    } else {
+        format!("{mins}分钟")
+    }
+}
+
+pub fn ago_cn(when: DateTime<Utc>) -> String {
+    let secs = Utc::now().signed_duration_since(when).num_seconds().max(0);
+    if secs < 5 {
+        "刚刚".into()
+    } else if secs < 60 {
+        format!("{secs} 秒前")
+    } else if secs < 3600 {
+        format!("{} 分钟前", secs / 60)
+    } else {
+        format!("{} 小时前", secs / 3600)
+    }
+}
+
 pub fn status_color(fraction: f64) -> ratatui::style::Color {
     use ratatui::style::Color;
     if fraction >= 0.90 {

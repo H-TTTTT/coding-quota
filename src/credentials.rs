@@ -151,11 +151,48 @@ fn path_looks_remote(path: &Path) -> bool {
     raw.starts_with(r"\\") || raw.starts_with("//") || raw.contains("wsl.localhost") || raw.contains(r"wsl$")
 }
 
-fn open_sqlite_readonly(path: &Path) -> Result<Connection> {
+/// 只读打开的凭据库。远程/锁定场景会落到临时副本，ReadonlyDb 在 Drop 时
+/// 先关连接（Windows 上打开的文件删不掉）再删除副本，避免 token 在 %TEMP% 残留。
+struct ReadonlyDb {
+    conn: Option<Connection>,
+    tmp: Option<PathBuf>,
+}
+
+impl ReadonlyDb {
+    fn conn(&self) -> &Connection {
+        self.conn.as_ref().expect("db connection")
+    }
+}
+
+impl Drop for ReadonlyDb {
+    fn drop(&mut self) {
+        if self.tmp.is_none() {
+            return;
+        }
+        if let Some(conn) = self.conn.take() {
+            let _ = conn.close();
+        }
+        if let Some(tmp) = self.tmp.take() {
+            remove_tmp_db(&tmp);
+        }
+    }
+}
+
+/// 删除临时副本及其 wal/shm 伴随文件。
+fn remove_tmp_db(tmp: &Path) {
+    let _ = std::fs::remove_file(tmp);
+    if let Some(name) = tmp.file_name().and_then(|n| n.to_str()) {
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(tmp.with_file_name(format!("{name}{suffix}")));
+        }
+    }
+}
+
+fn open_sqlite_readonly(path: &Path) -> Result<ReadonlyDb> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     if !path_looks_remote(path) {
         match Connection::open_with_flags(path, flags) {
-            Ok(conn) => return Ok(conn),
+            Ok(conn) => return Ok(ReadonlyDb { conn: Some(conn), tmp: None }),
             Err(err) if !is_lock_error(&err) => {
                 return Err(err).with_context(|| format!("open {}", path.display()));
             }
@@ -177,7 +214,17 @@ fn open_sqlite_readonly(path: &Path) -> Result<Connection> {
             }
         }
     }
-    Connection::open_with_flags(&tmp, flags).with_context(|| format!("open {}", tmp.display()))
+    match Connection::open_with_flags(&tmp, flags) {
+        Ok(conn) => Ok(ReadonlyDb {
+            conn: Some(conn),
+            tmp: Some(tmp),
+        }),
+        Err(err) => {
+            // 打开失败也不能留下含 token 的临时副本
+            remove_tmp_db(&tmp);
+            Err(err).with_context(|| format!("open {}", tmp.display()))
+        }
+    }
 }
 
 fn is_lock_error(err: &rusqlite::Error) -> bool {
@@ -185,8 +232,8 @@ fn is_lock_error(err: &rusqlite::Error) -> bool {
 }
 
 fn load_from_sqlite(path: &Path, set: &mut CredentialSet) -> Result<()> {
-    let conn = open_sqlite_readonly(path)?;
-    let mut stmt = conn.prepare(
+    let db = open_sqlite_readonly(path)?;
+    let mut stmt = db.conn().prepare(
         "SELECT provider, credential_type, COALESCE(identity_key, ''), data FROM auth_credentials",
     )?;
     let rows = stmt.query_map([], |row| {

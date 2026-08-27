@@ -278,8 +278,12 @@ fn console_host_executable(executable: &std::path::Path) -> Option<std::path::Pa
     let executable_dir = executable.parent()?;
     let dependencies = ["libgcc_s_seh-1.dll", "libwinpthread-1.dll"]
         .into_iter()
-        .map(|name| Some((name, std::fs::read(executable_dir.join(name)).ok()?)))
-        .collect::<Option<Vec<_>>>()?;
+        .filter_map(|name| {
+            std::fs::read(executable_dir.join(name))
+                .ok()
+                .map(|content| (name, content))
+        })
+        .collect::<Vec<_>>();
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for content in std::iter::once(image.as_slice())
         .chain(dependencies.iter().map(|(_, content)| content.as_slice()))

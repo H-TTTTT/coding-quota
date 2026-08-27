@@ -11,21 +11,29 @@ use std::time::Duration;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const QUOTA_VALUE_WIDTH: f32 = 86.0;
+/// 额度标签行（左侧标签 + 右侧重置时间）统一字号，与「剩余 xx%」一致。
+/// 注意不能用 `.small().monospace()`：两者都是设置 text_style，后者会覆盖前者。
+const LABEL_ROW_SIZE: f32 = 11.0;
 
 enum Cmd {
     Refresh,
 }
 
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_taskbar(false)
+        .with_resizable(true)
+        .with_inner_size([340.0, 740.0])
+        .with_min_inner_size([280.0, 200.0])
+        .with_window_level(egui::WindowLevel::AlwaysOnBottom);
+    // 恢复上次关闭时的窗口位置
+    if let Some((x, y)) = load_window_pos() {
+        viewport = viewport.with_position([x, y]);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_taskbar(false)
-            .with_resizable(true)
-            .with_inner_size([340.0, 740.0])
-            .with_min_inner_size([280.0, 200.0])
-            .with_window_level(egui::WindowLevel::AlwaysOnBottom),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -84,6 +92,36 @@ fn load_chinese_font(ctx: &egui::Context) {
             return;
         }
     }
+}
+
+/// 窗口位置持久化：%APPDATA%\coding-quota\window_pos.txt，纯文本 "x y"。
+fn pos_file_path() -> Option<std::path::PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    Some(
+        std::path::PathBuf::from(appdata)
+            .join("coding-quota")
+            .join("window_pos.txt"),
+    )
+}
+
+fn load_window_pos() -> Option<(f32, f32)> {
+    let text = std::fs::read_to_string(pos_file_path()?).ok()?;
+    let mut parts = text.split_whitespace();
+    let x: f32 = parts.next()?.parse().ok()?;
+    let y: f32 = parts.next()?.parse().ok()?;
+    // 粗略过滤明显非法的坐标（屏外保护由 update 里的相交检查兜底）
+    if x.abs() > 10_000.0 || y.abs() > 10_000.0 {
+        return None;
+    }
+    Some((x, y))
+}
+
+fn save_window_pos(x: i32, y: i32) {
+    let Some(path) = pos_file_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, format!("{x} {y}"));
 }
 
 /// Windows 窗口特效：真透明 + 浅白染色 + DWM 圆角。
@@ -272,6 +310,10 @@ struct DesktopApp {
     was_focused: bool,
     glass_applied: bool,
     drag_offset: Option<(i32, i32)>,
+    last_seen_pos: Option<(i32, i32)>,
+    saved_pos: Option<(i32, i32)>,
+    last_pos_save: std::time::Instant,
+    pos_guard_done: bool,
 }
 
 impl DesktopApp {
@@ -321,6 +363,10 @@ impl DesktopApp {
             was_focused: false,
             glass_applied: false,
             drag_offset: None,
+            last_seen_pos: None,
+            saved_pos: None,
+            last_pos_save: std::time::Instant::now() - Duration::from_secs(1),
+            pos_guard_done: false,
         }
     }
 }
@@ -328,6 +374,13 @@ impl DesktopApp {
 impl eframe::App for DesktopApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 关闭时把最后位置落盘，供下次启动恢复
+        if let Some((x, y)) = self.last_seen_pos {
+            save_window_pos(x, y);
+        }
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -340,6 +393,35 @@ impl eframe::App for DesktopApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                 egui::WindowLevel::AlwaysOnBottom,
             ));
+        }
+        // 记录窗口位置：拖动中限频落盘，关闭时由 on_exit 兜底
+        if let Some(outer) = ctx.input(|input| {
+            let v = input.viewport();
+            (v.minimized != Some(true)).then_some(v.outer_rect).flatten()
+        }) {
+            if !self.pos_guard_done {
+                self.pos_guard_done = true;
+                // 上次保存的位置可能因显示器变化落在屏外，拉回主屏左上角
+                if let Some(monitor) = ctx.input(|input| input.viewport().monitor_size) {
+                    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, monitor);
+                    if !screen.intersects(outer) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                            100.0, 100.0,
+                        )));
+                    }
+                }
+            }
+            let pos = (outer.min.x.round() as i32, outer.min.y.round() as i32);
+            self.last_seen_pos = Some(pos);
+            if self.saved_pos != Some(pos) {
+                if self.last_pos_save.elapsed() >= Duration::from_millis(500) {
+                    save_window_pos(pos.0, pos.1);
+                    self.saved_pos = Some(pos);
+                    self.last_pos_save = std::time::Instant::now();
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(300));
+                }
+            }
         }
         let focused = ctx.input(|input| input.viewport().focused).unwrap_or(false);
         if focused && !self.was_focused {
@@ -491,14 +573,14 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(label_cn(&window.label))
-                            .small()
+                            .size(LABEL_ROW_SIZE)
                             .color(egui::Color32::from_rgb(242, 242, 242)),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some(reset) = window.reset_at {
                             ui.label(
                                 egui::RichText::new(compact_until_cn(reset))
-                                    .small()
+                                    .size(LABEL_ROW_SIZE)
                                     .monospace()
                                     .color(egui::Color32::from_rgb(218, 218, 218)),
                             );

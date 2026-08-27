@@ -131,6 +131,11 @@ impl ProviderReport {
     pub fn missing(provider: ProviderId) -> Self {
         Self::err(provider, None, "no credential found")
     }
+
+    /// omp 中没有该平台授权（区别于抓取失败等临时错误）。
+    pub fn is_missing(&self) -> bool {
+        self.error.as_deref() == Some("no credential found")
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

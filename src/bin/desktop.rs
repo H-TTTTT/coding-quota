@@ -314,6 +314,7 @@ struct DesktopApp {
     saved_pos: Option<(i32, i32)>,
     last_pos_save: std::time::Instant,
     pos_guard_done: bool,
+    last_content_height: Option<f32>,
 }
 
 impl DesktopApp {
@@ -367,6 +368,7 @@ impl DesktopApp {
             saved_pos: None,
             last_pos_save: std::time::Instant::now() - Duration::from_secs(1),
             pos_guard_done: false,
+            last_content_height: None,
         }
     }
 }
@@ -511,22 +513,58 @@ impl eframe::App for DesktopApp {
                 );
                 ui.add_space(8.0);
 
+                // 测量内容实际高度，供窗口高度自适应
+                let content_height: f32;
                 match &self.snapshot {
                     None => {
-                        ui.label(
-                            egui::RichText::new("加载中…")
-                                .color(egui::Color32::from_rgb(242, 242, 242)),
-                        );
+                        content_height = ui
+                            .label(
+                                egui::RichText::new("加载中…")
+                                    .color(egui::Color32::from_rgb(242, 242, 242)),
+                            )
+                            .rect
+                            .height();
                     }
                     Some(snapshot) => {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                for report in &snapshot.reports {
-                                    draw_report(ui, report);
-                                    ui.add_space(6.0);
-                                }
-                            });
+                        // 不用 ScrollArea：窗口高度已跟随内容，滚动条只会在
+                        // 高度切换的瞬态帧里闪现。内容超高时由 max_h 兜底裁剪。
+                        let start = ui.cursor().top();
+                        let mut shown = 0;
+                        for report in &snapshot.reports {
+                            // omp 中没有授权的平台直接不显示
+                            if report.is_missing() {
+                                continue;
+                            }
+                            draw_report(ui, report);
+                            ui.add_space(6.0);
+                            shown += 1;
+                        }
+                        if shown == 0 {
+                            ui.label(
+                                egui::RichText::new("无已授权平台")
+                                    .color(egui::Color32::from_rgb(218, 218, 218)),
+                            );
+                        }
+                        content_height = ui.cursor().top() - start;
+                    }
+                }
+                // 只在内容高度变化时调整窗口高度，不覆盖用户手动拖拽的高度
+                let max_h = ctx
+                    .input(|input| input.viewport().monitor_size)
+                    .map(|size| size.y - 60.0)
+                    .unwrap_or(900.0)
+                    .max(240.0);
+                // 标题行 + 分隔间距 8 + 内容 + 上下边距 20 + 4 余量（像素取整）
+                let target = (title_bar.rect.height() + 8.0 + content_height + 24.0).clamp(140.0, max_h);
+                if self.last_content_height != Some(content_height) {
+                    self.last_content_height = Some(content_height);
+                    if let Some(inner) = ctx.input(|input| input.viewport().inner_rect) {
+                        if (inner.height() - target).abs() > 2.0 {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                                inner.width(),
+                                target,
+                            )));
+                        }
                     }
                 }
             });

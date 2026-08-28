@@ -1,5 +1,5 @@
 use crate::model::{ProviderReport, QuotaWindow, Snapshot};
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Datelike, Local, Utc};
 
 pub fn snapshot_text(snapshot: &Snapshot) -> String {
     let mut out = String::new();
@@ -19,6 +19,9 @@ fn provider_block(report: &ProviderReport) -> String {
     if let Some(plan) = &report.plan {
         title.push_str(" · ");
         title.push_str(plan);
+    }
+    if let Some(expiry) = report.expires_at {
+        title.push_str(&format!(" · due {}", expiry_date(expiry)));
     }
     let mut lines = vec![format!("{} — {}", title, report.identity.as_deref().unwrap_or("1 account"))];
     if let Some(resets) = report.resets_left {
@@ -150,10 +153,14 @@ pub fn compact_until_cn(when: DateTime<Utc>) -> String {
         format!("{mins}分钟")
     }
 }
-
-/// 周期到期日期（本地时区，月-日）。
+/// 周期到期日期（本地时区；跨年带年份）。
 pub fn expiry_date(when: DateTime<Utc>) -> String {
-    when.with_timezone(&Local).format("%m-%d").to_string()
+    let local = when.with_timezone(&Local);
+    if local.year() == Local::now().year() {
+        local.format("%m-%d").to_string()
+    } else {
+        local.format("%Y-%m-%d").to_string()
+    }
 }
 
 pub fn reset_with_due(when: DateTime<Utc>) -> String {

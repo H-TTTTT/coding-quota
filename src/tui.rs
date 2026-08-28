@@ -2,7 +2,7 @@ use coding_quota::credentials::CredentialSet;
 use coding_quota::fetch;
 use coding_quota::model::{ProviderId, ProviderReport, Snapshot};
 use coding_quota::render::{
-    ago_cn, bar, label_cn, reset_with_due_cn, status_color, title_cn,
+    ago_cn, bar, expiry_date, label_cn, reset_with_due_cn, status_color, title_cn,
 };
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -479,6 +479,9 @@ fn report_title(report: &ProviderReport) -> String {
     if let Some(plan) = &report.plan {
         title.push_str(" · ");
         title.push_str(plan);
+    }
+    if let Some(expiry) = report.expires_at {
+        title.push_str(&format!(" · 到期 {}", expiry_date(expiry)));
     }
     title
 }

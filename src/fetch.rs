@@ -1,23 +1,13 @@
 use crate::credentials::{self, CredentialSet, StoredCred};
 use crate::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
 const UA: &str = "coding-quota/0.1";
 const TIMEOUT: Duration = Duration::from_secs(20);
-/// 周额度周期（额度百分比 + 重置时间）。注意它返回的 billingPeriodEnd 与
-/// currentPeriod.end 完全相等，是额度重置时间，**不是**订阅到期日。
-const GROK_USAGE_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
-/// 不带 format=credits 时返回的是另一份载荷：自然月对齐的账单视图
-/// （如 08-01 → 09-01，history 逐自然月、monthlyLimit/used），属于 xAI API 的
-/// 日历月账单，**不是 Grok 订阅周年日**，不能当到期日用。
-/// xAI 侧没有任何订阅接口：/v1/user 与 JWT claims 都只有 tier，
-/// /v1/subscription、/v1/entitlements、/v1/plan、api.x.ai/v1/*、grok.com/rest/*
-/// 一律 404。Grok 的到期日因此只能来自 plan_expiry.json 手工配置。
 
 pub async fn fetch_all(creds: &CredentialSet, only: Option<ProviderId>) -> Snapshot {
     let client = match reqwest::Client::builder().timeout(TIMEOUT).build() {
@@ -43,21 +33,9 @@ pub async fn fetch_all(creds: &CredentialSet, only: Option<ProviderId>) -> Snaps
         maybe_fetch(&client, ProviderId::Cursor, creds.cursor.clone(), only),
     );
 
-    let manual = manual_expiries();
     Snapshot {
         fetched_at: Utc::now(),
-        reports: [codex, grok, glm, kimi, cursor]
-            .into_iter()
-            .flatten()
-            .map(|mut report| {
-                if report.expires_at.is_none() {
-                    if let Some(expiry) = manual.get(report.provider.key()) {
-                        report.expires_at = Some(*expiry);
-                    }
-                }
-                report
-            })
-            .collect(),
+        reports: [codex, grok, glm, kimi, cursor].into_iter().flatten().collect(),
     }
 }
 
@@ -135,16 +113,7 @@ async fn fetch_glm(client: &reqwest::Client, cred: StoredCred) -> ProviderReport
     let mut last_err = "no endpoint responded".to_string();
     for url in urls {
         match get_json(client, url, raw_auth(&key)).await {
-            Ok(body) => {
-                let mut report = parse_glm(cred.identity.clone(), body);
-                if let Some((expires_at, product)) = fetch_glm_subscription(client, &key).await {
-                    report.expires_at = Some(expires_at);
-                    if let Some(product) = product {
-                        report.plan = Some(product);
-                    }
-                }
-                return report;
-            }
+            Ok(body) => return parse_glm(cred.identity.clone(), body),
             Err(err) => last_err = err,
         }
     }
@@ -198,57 +167,6 @@ fn glm_count_window(id: &str, label: &str, limit: &Value, reset: Option<DateTime
     }
 }
 
-/// GLM 订阅信息（套餐购买记录）：到期日与产品名。任何失败都静默降级。
-async fn fetch_glm_subscription(
-    client: &reqwest::Client,
-    key: &str,
-) -> Option<(DateTime<Utc>, Option<String>)> {
-    let body = get_json(client, "https://open.bigmodel.cn/api/biz/subscription/list", raw_auth(key))
-        .await
-        .ok()?;
-    let entries = body.get("data")?.as_array()?;
-    let entry = entries
-        .iter()
-        .find(|entry| entry.get("status").and_then(|v| v.as_str()) == Some("VALID"))?;
-    let renew = entry.get("nextRenewTime")?.as_str()?;
-    let date = NaiveDate::parse_from_str(renew.trim(), "%Y-%m-%d").ok()?;
-    let expires_at = date.and_hms_opt(12, 0, 0)?.and_utc();
-    let product = entry
-        .get("productName")
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string);
-    Some((expires_at, product))
-}
-
-/// 手工维护的套餐到期日：%APPDATA%\coding-quota\plan_expiry.json，
-/// 形如 {"codex": "2026-08-30"}。用于没有到期 API 的平台（Codex/Kimi/Grok）。
-fn manual_expiries() -> HashMap<&'static str, DateTime<Utc>> {
-    let mut map = HashMap::new();
-    let Some(appdata) = std::env::var_os("APPDATA") else {
-        return map;
-    };
-    let path = std::path::PathBuf::from(appdata)
-        .join("coding-quota")
-        .join("plan_expiry.json");
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return map;
-    };
-    let Ok(value) = serde_json::from_str::<HashMap<String, String>>(&raw) else {
-        return map;
-    };
-    for (key, date) in value {
-        let Some(provider) = ProviderId::parse_filter(&key) else {
-            continue;
-        };
-        if let Ok(date) = NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d") {
-            if let Some(midday) = date.and_hms_opt(12, 0, 0) {
-                map.insert(provider.key(), midday.and_utc());
-            }
-        }
-    }
-    map
-}
-
 async fn fetch_kimi(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
     let identity = cred.identity.clone();
     match fetch_with_refresh(client, &cred, "kimi-code", |client, token| {
@@ -293,15 +211,13 @@ fn parse_cursor(identity: Option<String>, body: Value) -> ProviderReport {
     if windows.is_empty() {
         return ProviderReport::err(ProviderId::Cursor, identity, "no plan usage data");
     }
-    let mut report = ProviderReport::ok(
+    ProviderReport::ok(
         ProviderId::Cursor,
         "Cursor",
         identity.map(|raw| short_cursor_identity(&raw)),
         None,
         windows,
-    );
-    report.expires_at = reset;
-    report
+    )
 }
 
 fn short_cursor_identity(raw: &str) -> String {
@@ -375,22 +291,16 @@ fn usage_row(id: &str, data: &Value, default_label: &str) -> Option<QuotaWindow>
     }
 }
 
-fn grok_headers(token: &str) -> HeaderMap {
-    let mut headers = bearer(token);
-    headers.insert("x-grok-client-surface", HeaderValue::from_static("grok-build"));
-    headers.insert("x-grok-client-version", HeaderValue::from_static("1.0.0"));
-    headers
-}
-
 async fn fetch_grok(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
     let identity = cred.identity.clone();
     match fetch_with_refresh(client, &cred, "xai-oauth", |client, token| {
-        Box::pin(get_json(client, GROK_USAGE_URL, grok_headers(token)))
+        let mut headers = bearer(token);
+        headers.insert("x-grok-client-surface", HeaderValue::from_static("grok-build"));
+        headers.insert("x-grok-client-version", HeaderValue::from_static("1.0.0"));
+        Box::pin(get_json(client, "https://cli-chat-proxy.grok.com/v1/billing?format=credits", headers))
     })
     .await
     {
-        // expires_at 不在这里赋值：接口侧拿不到订阅到期日（见 GROK_USAGE_URL
-        // 注释），留空后由 fetch_all 用 plan_expiry.json 的手工配置兜底。
         Ok((_, body)) => parse_grok(identity, body),
         Err(err) => ProviderReport::err(ProviderId::Grok, identity, err),
     }
@@ -400,8 +310,6 @@ fn parse_grok(identity: Option<String>, body: Value) -> ProviderReport {
     let config = body.get("config").cloned().unwrap_or(Value::Null);
     let period = config.get("currentPeriod").cloned().unwrap_or(Value::Null);
     let used_percent = number(config.get("creditUsagePercent")).unwrap_or(0.0);
-    // 只用于额度重置时间：currentPeriod.end 与 config.billingPeriodEnd 是同一
-    // 时刻，都是周额度周期末，不能拿来当订阅到期日（到期日由月度账单端点提供）。
     let reset = parse_iso(period.get("end")).or_else(|| parse_iso(config.get("billingPeriodEnd")));
     let kind = period.get("type").and_then(|v| v.as_str()).unwrap_or("").to_ascii_uppercase();
     let label = if kind.contains("WEEK") {
@@ -411,8 +319,6 @@ fn parse_grok(identity: Option<String>, body: Value) -> ProviderReport {
     } else {
         "Period credits"
     };
-    // expires_at 不在这里赋值：订阅到期日来自 fetch_grok 的月度账单端点，
-    // 取不到时留空，由 fetch_all 用 plan_expiry.json 的手工配置兜底。
     ProviderReport::ok(
         ProviderId::Grok,
         "xAI Grok",
@@ -461,10 +367,7 @@ fn parse_codex(identity: Option<String>, plan: Option<String>, body: Value) -> P
     if windows.is_empty() {
         return ProviderReport::err(ProviderId::Codex, identity, "no quota windows");
     }
-    let mut report = ProviderReport::ok(ProviderId::Codex, "OpenAI Codex", identity, plan_label, windows);
-    report.resets_left =
-        number(body.pointer("/rate_limit_reset_credits/available_count")).map(|value| value as i64);
-    report
+    ProviderReport::ok(ProviderId::Codex, "OpenAI Codex", identity, plan_label, windows)
 }
 
 fn push_codex_window(windows: &mut Vec<QuotaWindow>, raw: Option<&Value>, review: bool) {

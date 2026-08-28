@@ -2,13 +2,6 @@
 
 All notable changes to this project are documented in this file.
 
-## Unreleased
-
-### Fixed
-
-- Grok plan expiry showed the quota reset time instead of the subscription date. `/v1/billing?format=credits` returns the **weekly usage** period (`currentPeriod.end` and `config.billingPeriodEnd` are the same instant), which was being reused as the expiry. xAI exposes no subscription endpoint at all (`/v1/subscription`, `/v1/entitlements`, `/v1/plan`, `api.x.ai/v1/*` and `grok.com/rest/*` all 404; `/v1/user` and the JWT only carry `tier`), and the calendar-month payload returned without `format=credits` is the xAI API billing view, not the plan anniversary. Grok's expiry therefore comes from `plan_expiry.json`.
-- The desktop widget clipped content on the right: the window width was fixed at 340px while provider titles grew (plan name + expiry date) and the reset column switched to `6天·09-04`. The width is now fitted to the widest report card, clamped to 300..560 logical px.
-
 ## 0.1.0 - 2026-08-28
 
 ### Added
@@ -19,9 +12,6 @@ All notable changes to this project are documented in this file.
 - Borderless draggable TUI frame with locked dimensions and aligned reset times.
 - Windows Terminal launchers: frameless TUI profile (hidden scrollbar, hidden profile entry) and desktop app shortcut.
 - Cross-compilation setup (WSL + `x86_64-pc-windows-gnu`) with MinGW runtime DLLs bundled in `dist/`.
-- Codex remaining rate-limit reset count (`rate_limit_reset_credits.available_count`).
-- Every quota window shows its period expiry date (relative countdown · MM-DD, local timezone).
-- Plan subscription expiry dates: GLM from `/api/biz/subscription/list` (renewal date + product name), Cursor from `billingCycleEnd`, Grok from the monthly `/v1/billing` period end, and Codex/Kimi via optional `%APPDATA%\coding-quota\plan_expiry.json`.
 
 ### Fixed
 

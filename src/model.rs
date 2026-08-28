@@ -32,16 +32,6 @@ impl ProviderId {
             _ => None,
         }
     }
-
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Grok => "grok",
-            Self::Glm => "glm",
-            Self::Kimi => "kimi",
-            Self::Cursor => "cursor",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,10 +91,6 @@ pub struct ProviderReport {
     pub identity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resets_left: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
     pub windows: Vec<QuotaWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -123,8 +109,6 @@ impl ProviderReport {
             provider,
             title: title.into(),
             identity,
-            resets_left: None,
-            expires_at: None,
             plan,
             windows,
             error: None,
@@ -137,8 +121,6 @@ impl ProviderReport {
             provider,
             title: provider.title().to_string(),
             identity,
-            resets_left: None,
-            expires_at: None,
             plan: None,
             windows: Vec::new(),
             error: Some(error.into()),

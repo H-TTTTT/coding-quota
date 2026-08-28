@@ -3,8 +3,8 @@
 // src/bin/*.rs 都会被 Cargo 当成独立 bin，托盘模块只能放在子目录里。
 #[path = "desktop/tray.rs"]
 mod tray;
-use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
-use coding_quota::render::{ago_cn, expiry_date, label_cn, reset_with_due_cn, title_cn};
+use coding_quota::model::{ProviderId, ProviderReport, Snapshot};
+use coding_quota::render::{ago_cn, compact_until_cn, label_cn, title_cn};
 use coding_quota::{credentials, fetch};
 use eframe::egui;
 #[cfg(windows)]
@@ -17,11 +17,6 @@ const QUOTA_VALUE_WIDTH: f32 = 86.0;
 /// 额度标签行（左侧标签 + 右侧重置时间）统一字号，与「剩余 xx%」一致。
 /// 注意不能用 `.small().monospace()`：两者都是设置 text_style，后者会覆盖前者。
 const LABEL_ROW_SIZE: f32 = 11.0;
-/// 窗口宽度跟随内容（与高度自适应同一思路），限幅避免极端内容把挂件撑爆。
-const MIN_WINDOW_WIDTH: f32 = 300.0;
-const MAX_WINDOW_WIDTH: f32 = 560.0;
-/// 额度条至少要留这么宽，避免窗口被压窄时进度条退化成一小截。
-const MIN_BAR_WIDTH: f32 = 120.0;
 
 enum Cmd {
     Refresh,
@@ -34,7 +29,7 @@ fn main() -> eframe::Result<()> {
         .with_taskbar(false)
         .with_resizable(true)
         .with_inner_size([340.0, 740.0])
-        .with_min_inner_size([MIN_WINDOW_WIDTH, 140.0])
+        .with_min_inner_size([280.0, 200.0])
         .with_window_level(egui::WindowLevel::AlwaysOnBottom);
     // 恢复上次关闭时的窗口位置
     if let Some((x, y)) = load_window_pos() {
@@ -324,7 +319,7 @@ struct DesktopApp {
     saved_pos: Option<(i32, i32)>,
     last_pos_save: std::time::Instant,
     pos_guard_done: bool,
-    last_content_size: Option<(f32, f32)>,
+    last_content_height: Option<f32>,
 }
 
 impl DesktopApp {
@@ -383,7 +378,7 @@ impl DesktopApp {
             saved_pos: None,
             last_pos_save: std::time::Instant::now() - Duration::from_secs(1),
             pos_guard_done: false,
-            last_content_size: None,
+            last_content_height: None,
         }
     }
 }
@@ -415,7 +410,7 @@ impl eframe::App for DesktopApp {
                 }
                 tray::TrayCommand::ProvidersChanged => {
                     self.hidden_providers = tray::load_hidden();
-                    self.last_content_size = None;
+                    self.last_content_height = None;
                 }
                 tray::TrayCommand::Quit => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -546,26 +541,23 @@ impl eframe::App for DesktopApp {
                 );
                 ui.add_space(8.0);
 
-                // 测量内容实际宽高，供窗口尺寸自适应
+                // 测量内容实际高度，供窗口高度自适应
                 let content_height: f32;
-                let content_width: f32;
                 match &self.snapshot {
                     None => {
-                        let rect = ui
+                        content_height = ui
                             .label(
                                 egui::RichText::new("加载中…")
                                     .color(egui::Color32::from_rgb(242, 242, 242)),
                             )
-                            .rect;
-                        content_height = rect.height();
-                        content_width = rect.width();
+                            .rect
+                            .height();
                     }
                     Some(snapshot) => {
                         // 不用 ScrollArea：窗口高度已跟随内容，滚动条只会在
                         // 高度切换的瞬态帧里闪现。内容超高时由 max_h 兜底裁剪。
                         let start = ui.cursor().top();
                         let mut shown = 0;
-                        let mut widest: f32 = 0.0;
                         for report in &snapshot.reports {
                             // omp 中没有授权的、以及托盘里取消勾选的平台都不显示
                             if report.is_missing()
@@ -573,9 +565,6 @@ impl eframe::App for DesktopApp {
                             {
                                 continue;
                             }
-                            // 先量宽度再绘制：到期日期、套餐名等会让卡片变宽，
-                            // 宽度写死时右侧文字会被裁掉，所以让窗口跟着内容走。
-                            widest = widest.max(measure_report_width(ui, report));
                             draw_report(ui, report);
                             ui.add_space(6.0);
                             shown += 1;
@@ -587,28 +576,23 @@ impl eframe::App for DesktopApp {
                             );
                         }
                         content_height = ui.cursor().top() - start;
-                        content_width = widest;
                     }
                 }
-                // 只在内容尺寸变化时调整窗口，不覆盖用户手动拖拽的尺寸
+                // 只在内容高度变化时调整窗口高度，不覆盖用户手动拖拽的高度
                 let max_h = ctx
                     .input(|input| input.viewport().monitor_size)
                     .map(|size| size.y - 60.0)
                     .unwrap_or(900.0)
                     .max(240.0);
                 // 标题行 + 分隔间距 8 + 内容 + 上下边距 20 + 4 余量（像素取整）
-                let target_h =
-                    (title_bar.rect.height() + 8.0 + content_height + 24.0).clamp(140.0, max_h);
-                // 内容宽度 + 面板左右各 10 的边距
-                let target_w = (content_width + 20.0).clamp(MIN_WINDOW_WIDTH, MAX_WINDOW_WIDTH);
-                if self.last_content_size != Some((content_width, content_height)) {
-                    self.last_content_size = Some((content_width, content_height));
+                let target = (title_bar.rect.height() + 8.0 + content_height + 24.0).clamp(140.0, max_h);
+                if self.last_content_height != Some(content_height) {
+                    self.last_content_height = Some(content_height);
                     if let Some(inner) = ctx.input(|input| input.viewport().inner_rect) {
-                        if (inner.height() - target_h).abs() > 2.0
-                            || (inner.width() - target_w).abs() > 2.0
-                        {
+                        if (inner.height() - target).abs() > 2.0 {
                             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                                target_w, target_h,
+                                inner.width(),
+                                target,
                             )));
                         }
                     }
@@ -617,79 +601,12 @@ impl eframe::App for DesktopApp {
     }
 }
 
-/// 卡片标题行文案：套餐名与到期日期都拼在标题里。
-/// 宽度测量与绘制必须走同一份拼接逻辑，否则量出来的宽度对不上实际内容。
-fn report_title(report: &ProviderReport) -> String {
+fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
     let mut title = title_cn(&report.title).to_string();
     if let Some(plan) = &report.plan {
         title.push_str(" · ");
         title.push_str(plan);
     }
-    if let Some(expiry) = report.expires_at {
-        title.push_str(&format!(" · 到期 {}", expiry_date(expiry)));
-    }
-    title
-}
-
-/// 额度条右侧的剩余量文案。
-fn remaining_text(report: &ProviderReport, window: &QuotaWindow) -> String {
-    let remaining = (1.0 - window.used_fraction).clamp(0.0, 1.0) as f32;
-    if report.provider == ProviderId::Kimi {
-        format!("剩余 {:.0}%", remaining * 100.0)
-    } else {
-        match (window.used, window.limit) {
-            (Some(used), Some(limit)) => format!("剩余 {:.0}/{limit:.0}", (limit - used).max(0.0)),
-            _ => format!("剩余 {:.0}%", remaining * 100.0),
-        }
-    }
-}
-
-fn text_width(ui: &egui::Ui, text: &str, font_id: egui::FontId) -> f32 {
-    ui.fonts(|fonts| fonts.layout_no_wrap(text.to_string(), font_id, egui::Color32::WHITE))
-        .size()
-        .x
-}
-
-/// 量出这张卡片完整显示所需的最小宽度（含卡片左右各 8 的内边距）。
-/// 必须画之前量：内容超出可用宽度时 egui 会直接裁掉右侧，画完再量只能量到被裁后的尺寸。
-fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
-    let body = egui::TextStyle::Body.resolve(ui.style());
-    let small = egui::TextStyle::Small.resolve(ui.style());
-    let label = egui::FontId::new(LABEL_ROW_SIZE, egui::FontFamily::Proportional);
-    let label_mono = egui::FontId::new(LABEL_ROW_SIZE, egui::FontFamily::Monospace);
-    let value = egui::FontId::new(11.0, egui::FontFamily::Proportional);
-    let gap = ui.spacing().item_spacing.x;
-
-    let mut width = text_width(ui, &report_title(report), body);
-    if let Some(identity) = &report.identity {
-        width += gap + text_width(ui, identity, small.clone());
-    }
-    if let Some(resets) = report.resets_left {
-        width = width.max(text_width(
-            ui,
-            &format!("限流重置：剩余 {resets} 次"),
-            small.clone(),
-        ));
-    }
-    if let Some(error) = &report.error {
-        width = width.max(text_width(ui, error, small.clone()));
-    }
-    for window in &report.windows {
-        let mut row = text_width(ui, &label_cn(&window.label), label.clone());
-        if let Some(reset) = window.reset_at {
-            row += gap + text_width(ui, &reset_with_due_cn(reset), label_mono.clone());
-        }
-        width = width.max(row);
-        // 额度条行：条至少 MIN_BAR_WIDTH，右侧固定留 QUOTA_VALUE_WIDTH 给剩余量
-        width = width.max(
-            MIN_BAR_WIDTH + gap + text_width(ui, &remaining_text(report, window), value.clone()),
-        );
-    }
-    width + 16.0
-}
-
-fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
-    let title = report_title(report);
     egui::Frame::new()
         .fill(egui::Color32::from_black_alpha(18))
         .corner_radius(egui::CornerRadius::same(8))
@@ -711,13 +628,6 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                     }
                 });
             });
-            if let Some(resets) = report.resets_left {
-                ui.label(
-                    egui::RichText::new(format!("限流重置：剩余 {resets} 次"))
-                        .small()
-                        .color(egui::Color32::from_rgb(160, 160, 160)),
-                );
-            }
             if let Some(error) = &report.error {
                 ui.label(
                     egui::RichText::new(error)
@@ -737,7 +647,7 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some(reset) = window.reset_at {
                             ui.label(
-                                egui::RichText::new(reset_with_due_cn(reset))
+                                egui::RichText::new(compact_until_cn(reset))
                                     .size(LABEL_ROW_SIZE)
                                     .monospace()
                                     .color(egui::Color32::from_rgb(218, 218, 218)),
@@ -745,7 +655,16 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                         }
                     });
                 });
-                let extra = remaining_text(report, window);
+                let extra = if report.provider == ProviderId::Kimi {
+                    format!("剩余 {:.0}%", remaining * 100.0)
+                } else {
+                    match (window.used, window.limit) {
+                        (Some(used), Some(limit)) => {
+                            format!("剩余 {:.0}/{limit:.0}", (limit - used).max(0.0))
+                        }
+                        _ => format!("剩余 {:.0}%", remaining * 100.0),
+                    }
+                };
                 ui.horizontal(|ui| {
                     let bar_width = (ui.available_width() - QUOTA_VALUE_WIDTH).max(80.0);
                     let bar = egui::ProgressBar::new(remaining)

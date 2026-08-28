@@ -14,6 +14,7 @@ All notable changes to this project are documented in this file.
 - Cross-compilation setup (WSL + `x86_64-pc-windows-gnu`) with MinGW runtime DLLs bundled in `dist/`.
 - Codex remaining rate-limit reset count (`rate_limit_reset_credits.available_count`).
 - Every quota window shows its period expiry date (relative countdown · MM-DD, local timezone).
+- Plan subscription expiry dates: GLM from `/api/biz/subscription/list` (renewal date + product name), Cursor/Grok from their billing period end, and Codex/Kimi via optional `%APPDATA%\coding-quota\plan_expiry.json`.
 
 ### Fixed
 

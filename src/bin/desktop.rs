@@ -4,7 +4,7 @@
 #[path = "desktop/tray.rs"]
 mod tray;
 use coding_quota::model::{ProviderId, ProviderReport, Snapshot};
-use coding_quota::render::{ago_cn, label_cn, reset_with_due_cn, title_cn};
+use coding_quota::render::{ago_cn, expiry_date, label_cn, reset_with_due_cn, title_cn};
 use coding_quota::{credentials, fetch};
 use eframe::egui;
 #[cfg(windows)]
@@ -606,6 +606,9 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
     if let Some(plan) = &report.plan {
         title.push_str(" · ");
         title.push_str(plan);
+    }
+    if let Some(expiry) = report.expires_at {
+        title.push_str(&format!(" · 到期 {}", expiry_date(expiry)));
     }
     egui::Frame::new()
         .fill(egui::Color32::from_black_alpha(18))

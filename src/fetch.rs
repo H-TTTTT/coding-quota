@@ -1,8 +1,9 @@
 use crate::credentials::{self, CredentialSet, StoredCred};
 use crate::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
@@ -33,9 +34,21 @@ pub async fn fetch_all(creds: &CredentialSet, only: Option<ProviderId>) -> Snaps
         maybe_fetch(&client, ProviderId::Cursor, creds.cursor.clone(), only),
     );
 
+    let manual = manual_expiries();
     Snapshot {
         fetched_at: Utc::now(),
-        reports: [codex, grok, glm, kimi, cursor].into_iter().flatten().collect(),
+        reports: [codex, grok, glm, kimi, cursor]
+            .into_iter()
+            .flatten()
+            .map(|mut report| {
+                if report.expires_at.is_none() {
+                    if let Some(expiry) = manual.get(report.provider.key()) {
+                        report.expires_at = Some(*expiry);
+                    }
+                }
+                report
+            })
+            .collect(),
     }
 }
 
@@ -113,7 +126,16 @@ async fn fetch_glm(client: &reqwest::Client, cred: StoredCred) -> ProviderReport
     let mut last_err = "no endpoint responded".to_string();
     for url in urls {
         match get_json(client, url, raw_auth(&key)).await {
-            Ok(body) => return parse_glm(cred.identity.clone(), body),
+            Ok(body) => {
+                let mut report = parse_glm(cred.identity.clone(), body);
+                if let Some((expires_at, product)) = fetch_glm_subscription(client, &key).await {
+                    report.expires_at = Some(expires_at);
+                    if let Some(product) = product {
+                        report.plan = Some(product);
+                    }
+                }
+                return report;
+            }
             Err(err) => last_err = err,
         }
     }
@@ -167,6 +189,57 @@ fn glm_count_window(id: &str, label: &str, limit: &Value, reset: Option<DateTime
     }
 }
 
+/// GLM 订阅信息（套餐购买记录）：到期日与产品名。任何失败都静默降级。
+async fn fetch_glm_subscription(
+    client: &reqwest::Client,
+    key: &str,
+) -> Option<(DateTime<Utc>, Option<String>)> {
+    let body = get_json(client, "https://open.bigmodel.cn/api/biz/subscription/list", raw_auth(key))
+        .await
+        .ok()?;
+    let entries = body.get("data")?.as_array()?;
+    let entry = entries
+        .iter()
+        .find(|entry| entry.get("status").and_then(|v| v.as_str()) == Some("VALID"))?;
+    let renew = entry.get("nextRenewTime")?.as_str()?;
+    let date = NaiveDate::parse_from_str(renew.trim(), "%Y-%m-%d").ok()?;
+    let expires_at = date.and_hms_opt(12, 0, 0)?.and_utc();
+    let product = entry
+        .get("productName")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    Some((expires_at, product))
+}
+
+/// 手工维护的套餐到期日：%APPDATA%\coding-quota\plan_expiry.json，
+/// 形如 {"codex": "2026-08-30"}。用于没有到期 API 的平台（Codex/Kimi）。
+fn manual_expiries() -> HashMap<&'static str, DateTime<Utc>> {
+    let mut map = HashMap::new();
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return map;
+    };
+    let path = std::path::PathBuf::from(appdata)
+        .join("coding-quota")
+        .join("plan_expiry.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return map;
+    };
+    let Ok(value) = serde_json::from_str::<HashMap<String, String>>(&raw) else {
+        return map;
+    };
+    for (key, date) in value {
+        let Some(provider) = ProviderId::parse_filter(&key) else {
+            continue;
+        };
+        if let Ok(date) = NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d") {
+            if let Some(midday) = date.and_hms_opt(12, 0, 0) {
+                map.insert(provider.key(), midday.and_utc());
+            }
+        }
+    }
+    map
+}
+
 async fn fetch_kimi(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
     let identity = cred.identity.clone();
     match fetch_with_refresh(client, &cred, "kimi-code", |client, token| {
@@ -211,13 +284,15 @@ fn parse_cursor(identity: Option<String>, body: Value) -> ProviderReport {
     if windows.is_empty() {
         return ProviderReport::err(ProviderId::Cursor, identity, "no plan usage data");
     }
-    ProviderReport::ok(
+    let mut report = ProviderReport::ok(
         ProviderId::Cursor,
         "Cursor",
         identity.map(|raw| short_cursor_identity(&raw)),
         None,
         windows,
-    )
+    );
+    report.expires_at = reset;
+    report
 }
 
 fn short_cursor_identity(raw: &str) -> String {
@@ -319,13 +394,15 @@ fn parse_grok(identity: Option<String>, body: Value) -> ProviderReport {
     } else {
         "Period credits"
     };
-    ProviderReport::ok(
+    let mut report = ProviderReport::ok(
         ProviderId::Grok,
         "xAI Grok",
         identity,
         None,
         vec![QuotaWindow::from_used_percent("grok-credits", label, used_percent, reset)],
-    )
+    );
+    report.expires_at = reset;
+    report
 }
 
 async fn fetch_codex(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {

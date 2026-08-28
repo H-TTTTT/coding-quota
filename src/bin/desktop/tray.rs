@@ -463,6 +463,16 @@ mod imp {
         }
     }
 
+    /// 同理，隐藏状态下 eframe 走不完退出流程，先把窗口显示回来再让主循环收尾，
+    /// 这样窗口位置仍会由 on_exit 落盘。
+    unsafe fn request_quit() {
+        let hwnd = WIDGET_HWND.load(Ordering::Relaxed) as *mut c_void;
+        if !hwnd.is_null() && IsWindowVisible(hwnd) == 0 {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        dispatch(TrayCommand::Quit);
+    }
+
     unsafe extern "system" fn wnd_proc(
         hwnd: *mut c_void,
         msg: u32,
@@ -551,7 +561,7 @@ mod imp {
         match id {
             ID_TOGGLE => unsafe { toggle_window() },
             ID_REFRESH => dispatch(TrayCommand::Refresh),
-            ID_QUIT => dispatch(TrayCommand::Quit),
+            ID_QUIT => unsafe { request_quit() },
             ID_AUTOSTART => {
                 set_autostart(!autostart_enabled());
             }

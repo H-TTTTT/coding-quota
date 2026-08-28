@@ -4,7 +4,7 @@
 #[path = "desktop/tray.rs"]
 mod tray;
 use coding_quota::model::{ProviderId, ProviderReport, Snapshot};
-use coding_quota::render::{ago_cn, compact_until_cn, label_cn, title_cn};
+use coding_quota::render::{ago_cn, label_cn, reset_with_due_cn, title_cn};
 use coding_quota::{credentials, fetch};
 use eframe::egui;
 #[cfg(windows)]
@@ -628,6 +628,13 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                     }
                 });
             });
+            if let Some(resets) = report.resets_left {
+                ui.label(
+                    egui::RichText::new(format!("限流重置：剩余 {resets} 次"))
+                        .small()
+                        .color(egui::Color32::from_rgb(160, 160, 160)),
+                );
+            }
             if let Some(error) = &report.error {
                 ui.label(
                     egui::RichText::new(error)
@@ -647,7 +654,7 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some(reset) = window.reset_at {
                             ui.label(
-                                egui::RichText::new(compact_until_cn(reset))
+                                egui::RichText::new(reset_with_due_cn(reset))
                                     .size(LABEL_ROW_SIZE)
                                     .monospace()
                                     .color(egui::Color32::from_rgb(218, 218, 218)),

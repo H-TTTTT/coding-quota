@@ -91,6 +91,8 @@ pub struct ProviderReport {
     pub identity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_left: Option<i64>,
     pub windows: Vec<QuotaWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -109,6 +111,7 @@ impl ProviderReport {
             provider,
             title: title.into(),
             identity,
+            resets_left: None,
             plan,
             windows,
             error: None,
@@ -121,6 +124,7 @@ impl ProviderReport {
             provider,
             title: provider.title().to_string(),
             identity,
+            resets_left: None,
             plan: None,
             windows: Vec::new(),
             error: Some(error.into()),

@@ -1,5 +1,5 @@
 use crate::model::{ProviderReport, QuotaWindow, Snapshot};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 
 pub fn snapshot_text(snapshot: &Snapshot) -> String {
     let mut out = String::new();
@@ -21,6 +21,9 @@ fn provider_block(report: &ProviderReport) -> String {
         title.push_str(plan);
     }
     let mut lines = vec![format!("{} — {}", title, report.identity.as_deref().unwrap_or("1 account"))];
+    if let Some(resets) = report.resets_left {
+        lines.push(format!("  rate-limit resets left: {resets}"));
+    }
     if let Some(error) = &report.error {
         lines.push(format!("  ○ {error}"));
         return lines.join("\n");
@@ -45,7 +48,7 @@ fn format_window(window: &QuotaWindow) -> String {
         (Some(used), Some(limit)) => format!("{:.0}/{limit:.0} left", (limit - used).max(0.0)),
         _ => format!("{pct:.0}% left"),
     };
-    let reset = window.reset_at.map(compact_until).unwrap_or_default();
+    let reset = window.reset_at.map(reset_with_due).unwrap_or_default();
     let pad = (ROW_WIDTH - 2).saturating_sub(window.label.chars().count() + reset.chars().count());
     format!(
         "  {}{}{}\n  {}  {}",
@@ -146,6 +149,19 @@ pub fn compact_until_cn(when: DateTime<Utc>) -> String {
     } else {
         format!("{mins}分钟")
     }
+}
+
+/// 周期到期日期（本地时区，月-日）。
+pub fn expiry_date(when: DateTime<Utc>) -> String {
+    when.with_timezone(&Local).format("%m-%d").to_string()
+}
+
+pub fn reset_with_due(when: DateTime<Utc>) -> String {
+    format!("{}·{}", compact_until(when), expiry_date(when))
+}
+
+pub fn reset_with_due_cn(when: DateTime<Utc>) -> String {
+    format!("{}·{}", compact_until_cn(when), expiry_date(when))
 }
 
 pub fn ago_cn(when: DateTime<Utc>) -> String {

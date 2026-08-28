@@ -12,6 +12,8 @@ All notable changes to this project are documented in this file.
 - Borderless draggable TUI frame with locked dimensions and aligned reset times.
 - Windows Terminal launchers: frameless TUI profile (hidden scrollbar, hidden profile entry) and desktop app shortcut.
 - Cross-compilation setup (WSL + `x86_64-pc-windows-gnu`) with MinGW runtime DLLs bundled in `dist/`.
+- Codex remaining rate-limit reset count (`rate_limit_reset_credits.available_count`).
+- Every quota window shows its period expiry date (relative countdown · MM-DD, local timezone).
 
 ### Fixed
 

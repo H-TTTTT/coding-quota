@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// src/bin/*.rs 都会被 Cargo 当成独立 bin，托盘模块只能放在子目录里。
+#[path = "desktop/tray.rs"]
+mod tray;
 use coding_quota::model::{ProviderId, ProviderReport, Snapshot};
 use coding_quota::render::{ago_cn, compact_until_cn, label_cn, title_cn};
 use coding_quota::{credentials, fetch};
@@ -61,7 +64,7 @@ fn main() -> eframe::Result<()> {
             visuals.widgets.active.corner_radius = radius;
             visuals.widgets.open.corner_radius = radius;
             cc.egui_ctx.set_visuals(visuals);
-            Ok(Box::new(DesktopApp::new()))
+            Ok(Box::new(DesktopApp::new(cc.egui_ctx.clone())))
         }),
     )
 }
@@ -307,6 +310,8 @@ struct DesktopApp {
     snapshot: Option<Snapshot>,
     snap_rx: mpsc::Receiver<Snapshot>,
     cmd_tx: mpsc::Sender<Cmd>,
+    tray_rx: mpsc::Receiver<tray::TrayCommand>,
+    hidden_providers: Vec<String>,
     was_focused: bool,
     glass_applied: bool,
     drag_offset: Option<(i32, i32)>,
@@ -318,7 +323,7 @@ struct DesktopApp {
 }
 
 impl DesktopApp {
-    fn new() -> Self {
+    fn new(ctx: egui::Context) -> Self {
         let (snap_tx, snap_rx) = mpsc::channel::<Snapshot>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
         std::thread::spawn(move || {
@@ -357,10 +362,15 @@ impl DesktopApp {
                 }
             }
         });
+        // 托盘菜单在独立线程里跑自己的消息循环，靠 request_repaint 唤醒界面
+        let (tray_tx, tray_rx) = mpsc::channel::<tray::TrayCommand>();
+        tray::spawn(tray_tx, move || ctx.request_repaint());
         Self {
             snapshot: None,
             snap_rx,
             cmd_tx,
+            tray_rx,
+            hidden_providers: tray::load_hidden(),
             was_focused: false,
             glass_applied: false,
             drag_offset: None,
@@ -388,6 +398,24 @@ impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         while let Ok(snapshot) = self.snap_rx.try_recv() {
             self.snapshot = Some(snapshot);
+        }
+        #[cfg(windows)]
+        if let Some(hwnd) = hwnd_of(frame) {
+            tray::set_widget_hwnd(hwnd as isize);
+        }
+        while let Ok(command) = self.tray_rx.try_recv() {
+            match command {
+                tray::TrayCommand::Refresh => {
+                    let _ = self.cmd_tx.send(Cmd::Refresh);
+                }
+                tray::TrayCommand::ProvidersChanged => {
+                    self.hidden_providers = tray::load_hidden();
+                    self.last_content_height = None;
+                }
+                tray::TrayCommand::Quit => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
         }
         apply_window_chrome(frame, &mut self.glass_applied);
         if ctx.input(|input| input.viewport().minimized == Some(true)) {
@@ -531,8 +559,10 @@ impl eframe::App for DesktopApp {
                         let start = ui.cursor().top();
                         let mut shown = 0;
                         for report in &snapshot.reports {
-                            // omp 中没有授权的平台直接不显示
-                            if report.is_missing() {
+                            // omp 中没有授权的、以及托盘里取消勾选的平台都不显示
+                            if report.is_missing()
+                                || tray::is_hidden(&self.hidden_providers, report.provider)
+                            {
                                 continue;
                             }
                             draw_report(ui, report);
@@ -541,7 +571,7 @@ impl eframe::App for DesktopApp {
                         }
                         if shown == 0 {
                             ui.label(
-                                egui::RichText::new("无已授权平台")
+                                egui::RichText::new("无可显示平台")
                                     .color(egui::Color32::from_rgb(218, 218, 218)),
                             );
                         }

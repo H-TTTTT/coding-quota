@@ -215,6 +215,30 @@ mod imp {
         icon_sm: *mut c_void,
     }
 
+    #[repr(C)]
+    struct BitmapInfoHeader {
+        bi_size: u32,
+        bi_width: i32,
+        bi_height: i32,
+        bi_planes: u16,
+        bi_bit_count: u16,
+        bi_compression: u32,
+        bi_size_image: u32,
+        bi_x_pels_per_meter: i32,
+        bi_y_pels_per_meter: i32,
+        bi_clr_used: u32,
+        bi_clr_important: u32,
+    }
+
+    #[repr(C)]
+    struct IconInfo {
+        is_icon: i32,
+        x_hotspot: u32,
+        y_hotspot: u32,
+        mask: *mut c_void,
+        color: *mut c_void,
+    }
+
     #[link(name = "user32")]
     extern "system" {
         fn RegisterClassExW(class: *const WndClassExW) -> u16;
@@ -273,6 +297,8 @@ mod imp {
             cy: i32,
             flags: u32,
         ) -> i32;
+        fn CreateIconIndirect(info: *mut IconInfo) -> *mut c_void;
+        fn DestroyIcon(icon: *mut c_void) -> i32;
     }
 
     #[link(name = "shell32")]
@@ -401,14 +427,37 @@ mod imp {
         let mut data: NotifyIconData = std::mem::zeroed();
         data.cb_size = std::mem::size_of::<NotifyIconData>() as u32;
         data.hwnd = hwnd;
-        data.id = 1;
         data.flags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         data.callback_message = WM_TRAY;
         data.icon = app_icon(instance);
         let tip = wide("编程额度");
         let len = tip.len().min(data.tip.len());
         data.tip[..len].copy_from_slice(&tip[..len]);
-        Shell_NotifyIconW(NIM_ADD, &mut data) != 0
+        let added = Shell_NotifyIconW(NIM_ADD, &mut data) != 0;
+        // NIM_ADD 之后系统持有自己的拷贝，句柄可以立即释放
+        if !data.icon.is_null() {
+            DestroyIcon(data.icon);
+        }
+        added
+    }
+    #[link(name = "gdi32")]
+    extern "system" {
+        fn CreateDIBSection(
+            dc: *mut c_void,
+            header: *const BitmapInfoHeader,
+            usage: u32,
+            bits: *mut *mut c_void,
+            file: *mut c_void,
+            offset: u32,
+        ) -> *mut c_void;
+        fn CreateBitmap(
+            width: i32,
+            height: i32,
+            planes: u32,
+            bpp: u32,
+            bits: *const c_void,
+        ) -> *mut c_void;
+        fn DeleteObject(object: *mut c_void) -> i32;
     }
 
     unsafe fn remove_icon(hwnd: *mut c_void) {
@@ -419,8 +468,12 @@ mod imp {
         Shell_NotifyIconW(NIM_DELETE, &mut data);
     }
 
-    /// build.rs 把 assets/icon.ico 以资源 ID 1 嵌进 exe，优先取 16×16 的小图标。
+    /// 托盘图标：优先运行时逐像素绘制，失败再回退到嵌入的 .ico 资源。
     unsafe fn app_icon(instance: *mut c_void) -> *mut c_void {
+        let icon = build_rounded_ring_icon();
+        if !icon.is_null() {
+            return icon;
+        }
         let id = 1_usize as *const u16;
         let icon = LoadImageW(
             instance,
@@ -438,6 +491,167 @@ mod imp {
             return icon;
         }
         LoadIconW(std::ptr::null_mut(), IDI_APPLICATION as *const u16)
+    }
+
+    /// 运行时按系统小图标尺寸逐像素画一枚圆润的「进度环」图标：
+    /// 圆角方形底 + 半透明轨道 + 绿色 3/4 圆头弧（与小组件进度条同系），
+    /// 4× 超采样抗锯齿，比 .ico 整体缩放更锐利。
+    unsafe fn build_rounded_ring_icon() -> *mut c_void {
+        let mut size = GetSystemMetrics(SM_CXSMICON);
+        if size <= 0 {
+            size = 16;
+        }
+        let size = size.min(64) as usize;
+        icon_from_bgra(size, &draw_ring_pixels(size))
+    }
+
+    fn draw_ring_pixels(size: usize) -> Vec<u8> {
+        const SS: usize = 4;
+        let (w, h) = (size as f32, size as f32);
+        let (cx, cy) = (w / 2.0, h / 2.0);
+        let half = w / 2.0;
+        let corner = w * 0.30;
+        let ring_r = w * 0.345;
+        let ring_t = w * 0.13;
+        let half_t = ring_t / 2.0;
+        let start = -std::f32::consts::FRAC_PI_2; // 顶部
+        let sweep = std::f32::consts::TAU * 0.75;
+        let end = start + sweep;
+        let cap1 = (cx + start.cos() * ring_r, cy + start.sin() * ring_r);
+        let cap2 = (cx + end.cos() * ring_r, cy + end.sin() * ring_r);
+
+        let bg_top = (46.0_f32, 56.0, 76.0); // #2E384C
+        let bg_bottom = (22.0_f32, 27.0, 38.0); // #161B26
+        let track = (255.0_f32, 255.0, 255.0);
+        let track_a = 0.30;
+        let arc = (112.0_f32, 219.0, 146.0); // #70DB92
+
+        let mut pixels = vec![0u8; size * size * 4];
+        for py in 0..size {
+            for px in 0..size {
+                let (mut acc_b, mut acc_g, mut acc_r, mut acc_a) =
+                    (0f32, 0f32, 0f32, 0f32);
+                for sy in 0..SS {
+                    for sx in 0..SS {
+                        let x = px as f32 + (sx as f32 + 0.5) / SS as f32;
+                        let y = py as f32 + (sy as f32 + 0.5) / SS as f32;
+                        // 圆角矩形 SDF：外距 + 内距 - 圆角半径
+                        let qx = (x - cx).abs() - (half - corner);
+                        let qy = (y - cy).abs() - (half - corner);
+                        let outside = (qx.max(0.0)).hypot(qy.max(0.0));
+                        let dist = outside + qx.max(qy).min(0.0) - corner;
+                        let bg_cov = (0.5 - dist).clamp(0.0, 1.0);
+                        let t = (y / h).clamp(0.0, 1.0);
+                        // 本子样本局部预乘值：先背景，再环；最后才累加。
+                        // 不能在累加器上直接合成，否则破坏求和不变量。
+                        let (br, bg, bb) = (
+                            bg_top.0 + (bg_bottom.0 - bg_top.0) * t,
+                            bg_top.1 + (bg_bottom.1 - bg_top.1) * t,
+                            bg_top.2 + (bg_bottom.2 - bg_top.2) * t,
+                        );
+                        let (mut sr, mut sg, mut sb, mut sa) =
+                            (br * bg_cov, bg * bg_cov, bb * bg_cov, bg_cov);
+
+                        let d = ((x - cx) * (x - cx) + (y - cy) * (y - cy)).sqrt();
+                        let ring_cov = (half_t - (d - ring_r).abs()).clamp(0.0, 1.0);
+                        if ring_cov > 0.0 {
+                            let mut ang = (y - cy).atan2(x - cx) - start;
+                            while ang < 0.0 {
+                                ang += std::f32::consts::TAU;
+                            }
+                            let in_cap1 = ((x - cap1.0) * (x - cap1.0)
+                                + (y - cap1.1) * (y - cap1.1))
+                                .sqrt()
+                                <= half_t;
+                            let in_cap2 = ((x - cap2.0) * (x - cap2.0)
+                                + (y - cap2.1) * (y - cap2.1))
+                                .sqrt()
+                                <= half_t;
+                            let (cr, cg, cb, alpha) = if ang <= sweep || in_cap1 || in_cap2 {
+                                (arc.0, arc.1, arc.2, ring_cov)
+                            } else {
+                                (track.0, track.1, track.2, ring_cov * track_a)
+                            };
+                            let k = 1.0 - alpha;
+                            sr = cr * alpha + sr * k;
+                            sg = cg * alpha + sg * k;
+                            sb = cb * alpha + sb * k;
+                            sa = alpha + sa * k;
+                        }
+                        acc_r += sr;
+                        acc_g += sg;
+                        acc_b += sb;
+                        acc_a += sa;
+                    }
+                }
+                let n = (SS * SS) as f32;
+                let base = (py * size + px) * 4;
+                // 预乘颜色直接给 CreateIconIndirect；PNG 预览时再解除预乘
+                pixels[base] = (acc_b / n).round().clamp(0.0, 255.0) as u8;
+                pixels[base + 1] = (acc_g / n).round().clamp(0.0, 255.0) as u8;
+                pixels[base + 2] = (acc_r / n).round().clamp(0.0, 255.0) as u8;
+                // 覆盖率是 0..1，写入字节前要放大到 0..255
+                pixels[base + 3] = (acc_a / n * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        pixels
+    }
+
+    /// 32bpp ARGB DIB → HICON。位图用负高度自上而下，与像素数组顺序一致。
+    unsafe fn icon_from_bgra(size: usize, bgra: &[u8]) -> *mut c_void {
+        let header = BitmapInfoHeader {
+            bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+            bi_width: size as i32,
+            bi_height: -(size as i32),
+            bi_planes: 1,
+            bi_bit_count: 32,
+            bi_compression: 0,
+            bi_size_image: 0,
+            bi_x_pels_per_meter: 0,
+            bi_y_pels_per_meter: 0,
+            bi_clr_used: 0,
+            bi_clr_important: 0,
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let color = CreateDIBSection(
+            std::ptr::null_mut(),
+            &header,
+            0,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        );
+        if color.is_null() || bits.is_null() {
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
+
+        // 全零掩码 + 32bpp alpha，Windows 会按 alpha 混合
+        let stride = ((size + 15) / 16) * 2;
+        let mask_bits = vec![0u8; stride * size];
+        let mask = CreateBitmap(
+            size as i32,
+            size as i32,
+            1,
+            1,
+            mask_bits.as_ptr() as *const c_void,
+        );
+        if mask.is_null() {
+            DeleteObject(color);
+            return std::ptr::null_mut();
+        }
+
+        let mut info = IconInfo {
+            is_icon: 1,
+            x_hotspot: 0,
+            y_hotspot: 0,
+            mask,
+            color,
+        };
+        let icon = CreateIconIndirect(&mut info);
+        DeleteObject(color);
+        DeleteObject(mask);
+        icon
     }
 
     /// 隐藏后 egui 主循环停摆，所以显示/隐藏全部由托盘线程自己完成。

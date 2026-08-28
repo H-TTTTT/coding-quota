@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
-- Grok plan expiry showed the quota reset time instead of the subscription date. `/v1/billing?format=credits` returns the **weekly usage** period (`currentPeriod.end` and `config.billingPeriodEnd` are the same instant), so it was mislabelled as the expiry. The real monthly billing cycle now comes from `/v1/billing` without the query string, falling back to `plan_expiry.json` when unavailable.
+- Grok plan expiry showed the quota reset time instead of the subscription date. `/v1/billing?format=credits` returns the **weekly usage** period (`currentPeriod.end` and `config.billingPeriodEnd` are the same instant), which was being reused as the expiry. xAI exposes no subscription endpoint at all (`/v1/subscription`, `/v1/entitlements`, `/v1/plan`, `api.x.ai/v1/*` and `grok.com/rest/*` all 404; `/v1/user` and the JWT only carry `tier`), and the calendar-month payload returned without `format=credits` is the xAI API billing view, not the plan anniversary. Grok's expiry therefore comes from `plan_expiry.json`.
 - The desktop widget clipped content on the right: the window width was fixed at 340px while provider titles grew (plan name + expiry date) and the reset column switched to `6天·09-04`. The width is now fitted to the widest report card, clamped to 300..560 logical px.
 
 ## 0.1.0 - 2026-08-28

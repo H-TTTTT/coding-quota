@@ -2,7 +2,7 @@ use coding_quota::credentials::CredentialSet;
 use coding_quota::fetch;
 use coding_quota::model::{ProviderId, ProviderReport, Snapshot};
 use coding_quota::render::{
-    ago_cn, bar, expiry_date, label_cn, reset_with_due_cn, status_color, title_cn,
+    ago_cn, bar, compact_until_cn, label_cn, status_color, title_cn,
 };
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -418,12 +418,6 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
         Span::raw(" ".repeat(pad + gap)),
         Span::styled(identity, Style::default().add_modifier(Modifier::DIM)),
     ])];
-    if let Some(resets) = report.resets_left {
-        lines.push(Line::from(Span::styled(
-            format!("{}限流重置：剩余 {resets} 次", " ".repeat(TUI_LEFT_GUTTER)),
-            Style::default().add_modifier(Modifier::DIM),
-        )));
-    }
 
     if let Some(error) = &report.error {
         lines.push(Line::from(Span::styled(
@@ -452,7 +446,7 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
                 _ => format!("剩余 {:.0}%", (remaining * 100.0).round()),
             }
         };
-        let reset = window.reset_at.map(reset_with_due_cn).unwrap_or_default();
+        let reset = window.reset_at.map(compact_until_cn).unwrap_or_default();
         let used_width = TUI_LEFT_GUTTER
             + BAR_WIDTH
             + 2
@@ -479,9 +473,6 @@ fn report_title(report: &ProviderReport) -> String {
     if let Some(plan) = &report.plan {
         title.push_str(" · ");
         title.push_str(plan);
-    }
-    if let Some(expiry) = report.expires_at {
-        title.push_str(&format!(" · 到期 {}", expiry_date(expiry)));
     }
     title
 }

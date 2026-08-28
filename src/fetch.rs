@@ -12,9 +12,12 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// 周额度周期（额度百分比 + 重置时间）。注意它返回的 billingPeriodEnd 与
 /// currentPeriod.end 完全相等，是额度重置时间，**不是**订阅到期日。
 const GROK_USAGE_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
-/// 月度账单周期：不带 format 参数时返回真实账单周期（如 08-01 → 09-01），
-/// 周期末即订阅续费/到期日。与上面是同一个路径但载荷不同。
-const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
+/// 不带 format=credits 时返回的是另一份载荷：自然月对齐的账单视图
+/// （如 08-01 → 09-01，history 逐自然月、monthlyLimit/used），属于 xAI API 的
+/// 日历月账单，**不是 Grok 订阅周年日**，不能当到期日用。
+/// xAI 侧没有任何订阅接口：/v1/user 与 JWT claims 都只有 tier，
+/// /v1/subscription、/v1/entitlements、/v1/plan、api.x.ai/v1/*、grok.com/rest/*
+/// 一律 404。Grok 的到期日因此只能来自 plan_expiry.json 手工配置。
 
 pub async fn fetch_all(creds: &CredentialSet, only: Option<ProviderId>) -> Snapshot {
     let client = match reqwest::Client::builder().timeout(TIMEOUT).build() {
@@ -218,7 +221,7 @@ async fn fetch_glm_subscription(
 }
 
 /// 手工维护的套餐到期日：%APPDATA%\coding-quota\plan_expiry.json，
-/// 形如 {"codex": "2026-08-30"}。用于没有到期 API 的平台（Codex/Kimi）。
+/// 形如 {"codex": "2026-08-30"}。用于没有到期 API 的平台（Codex/Kimi/Grok）。
 fn manual_expiries() -> HashMap<&'static str, DateTime<Utc>> {
     let mut map = HashMap::new();
     let Some(appdata) = std::env::var_os("APPDATA") else {
@@ -386,18 +389,9 @@ async fn fetch_grok(client: &reqwest::Client, cred: StoredCred) -> ProviderRepor
     })
     .await
     {
-        Ok((token, body)) => {
-            let mut report = parse_grok(identity.clone(), body);
-            // 复用已验证可用的 token 再取一次月度账单：周额度端点没有订阅信息，
-            // 只有这个端点的 period end 才是订阅到期日。取不到就留空，交给
-            // plan_expiry.json 的手工配置兜底。
-            if let Ok(billing) = get_json(client, GROK_BILLING_URL, grok_headers(&token)).await {
-                if let Some(expiry) = parse_iso(billing.pointer("/config/billingPeriodEnd")) {
-                    report.expires_at = Some(expiry);
-                }
-            }
-            report
-        }
+        // expires_at 不在这里赋值：接口侧拿不到订阅到期日（见 GROK_USAGE_URL
+        // 注释），留空后由 fetch_all 用 plan_expiry.json 的手工配置兜底。
+        Ok((_, body)) => parse_grok(identity, body),
         Err(err) => ProviderReport::err(ProviderId::Grok, identity, err),
     }
 }

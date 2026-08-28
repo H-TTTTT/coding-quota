@@ -9,6 +9,12 @@ use std::time::Duration;
 
 const UA: &str = "coding-quota/0.1";
 const TIMEOUT: Duration = Duration::from_secs(20);
+/// 周额度周期（额度百分比 + 重置时间）。注意它返回的 billingPeriodEnd 与
+/// currentPeriod.end 完全相等，是额度重置时间，**不是**订阅到期日。
+const GROK_USAGE_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+/// 月度账单周期：不带 format 参数时返回真实账单周期（如 08-01 → 09-01），
+/// 周期末即订阅续费/到期日。与上面是同一个路径但载荷不同。
+const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
 
 pub async fn fetch_all(creds: &CredentialSet, only: Option<ProviderId>) -> Snapshot {
     let client = match reqwest::Client::builder().timeout(TIMEOUT).build() {
@@ -366,17 +372,32 @@ fn usage_row(id: &str, data: &Value, default_label: &str) -> Option<QuotaWindow>
     }
 }
 
+fn grok_headers(token: &str) -> HeaderMap {
+    let mut headers = bearer(token);
+    headers.insert("x-grok-client-surface", HeaderValue::from_static("grok-build"));
+    headers.insert("x-grok-client-version", HeaderValue::from_static("1.0.0"));
+    headers
+}
+
 async fn fetch_grok(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
     let identity = cred.identity.clone();
     match fetch_with_refresh(client, &cred, "xai-oauth", |client, token| {
-        let mut headers = bearer(token);
-        headers.insert("x-grok-client-surface", HeaderValue::from_static("grok-build"));
-        headers.insert("x-grok-client-version", HeaderValue::from_static("1.0.0"));
-        Box::pin(get_json(client, "https://cli-chat-proxy.grok.com/v1/billing?format=credits", headers))
+        Box::pin(get_json(client, GROK_USAGE_URL, grok_headers(token)))
     })
     .await
     {
-        Ok((_, body)) => parse_grok(identity, body),
+        Ok((token, body)) => {
+            let mut report = parse_grok(identity.clone(), body);
+            // 复用已验证可用的 token 再取一次月度账单：周额度端点没有订阅信息，
+            // 只有这个端点的 period end 才是订阅到期日。取不到就留空，交给
+            // plan_expiry.json 的手工配置兜底。
+            if let Ok(billing) = get_json(client, GROK_BILLING_URL, grok_headers(&token)).await {
+                if let Some(expiry) = parse_iso(billing.pointer("/config/billingPeriodEnd")) {
+                    report.expires_at = Some(expiry);
+                }
+            }
+            report
+        }
         Err(err) => ProviderReport::err(ProviderId::Grok, identity, err),
     }
 }
@@ -385,6 +406,8 @@ fn parse_grok(identity: Option<String>, body: Value) -> ProviderReport {
     let config = body.get("config").cloned().unwrap_or(Value::Null);
     let period = config.get("currentPeriod").cloned().unwrap_or(Value::Null);
     let used_percent = number(config.get("creditUsagePercent")).unwrap_or(0.0);
+    // 只用于额度重置时间：currentPeriod.end 与 config.billingPeriodEnd 是同一
+    // 时刻，都是周额度周期末，不能拿来当订阅到期日（到期日由月度账单端点提供）。
     let reset = parse_iso(period.get("end")).or_else(|| parse_iso(config.get("billingPeriodEnd")));
     let kind = period.get("type").and_then(|v| v.as_str()).unwrap_or("").to_ascii_uppercase();
     let label = if kind.contains("WEEK") {
@@ -394,15 +417,15 @@ fn parse_grok(identity: Option<String>, body: Value) -> ProviderReport {
     } else {
         "Period credits"
     };
-    let mut report = ProviderReport::ok(
+    // expires_at 不在这里赋值：订阅到期日来自 fetch_grok 的月度账单端点，
+    // 取不到时留空，由 fetch_all 用 plan_expiry.json 的手工配置兜底。
+    ProviderReport::ok(
         ProviderId::Grok,
         "xAI Grok",
         identity,
         None,
         vec![QuotaWindow::from_used_percent("grok-credits", label, used_percent, reset)],
-    );
-    report.expires_at = reset;
-    report
+    )
 }
 
 async fn fetch_codex(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {

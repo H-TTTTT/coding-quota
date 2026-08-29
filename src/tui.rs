@@ -418,6 +418,12 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
         Span::raw(" ".repeat(pad + gap)),
         Span::styled(identity, Style::default().add_modifier(Modifier::DIM)),
     ])];
+    if let Some(resets) = report.resets_left {
+        lines.push(Line::from(Span::styled(
+            format!("{}限流重置：剩余 {resets} 次", " ".repeat(TUI_LEFT_GUTTER)),
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
 
     if let Some(error) = &report.error {
         lines.push(Line::from(Span::styled(

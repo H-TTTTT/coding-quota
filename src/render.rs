@@ -21,6 +21,9 @@ fn provider_block(report: &ProviderReport) -> String {
         title.push_str(plan);
     }
     let mut lines = vec![format!("{} — {}", title, report.identity.as_deref().unwrap_or("1 account"))];
+    if let Some(resets) = report.resets_left {
+        lines.push(format!("  rate-limit resets left: {resets}"));
+    }
     if let Some(error) = &report.error {
         lines.push(format!("  ○ {error}"));
         return lines.join("\n");

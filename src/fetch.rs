@@ -367,7 +367,11 @@ fn parse_codex(identity: Option<String>, plan: Option<String>, body: Value) -> P
     if windows.is_empty() {
         return ProviderReport::err(ProviderId::Codex, identity, "no quota windows");
     }
-    ProviderReport::ok(ProviderId::Codex, "OpenAI Codex", identity, plan_label, windows)
+    let mut report =
+        ProviderReport::ok(ProviderId::Codex, "OpenAI Codex", identity, plan_label, windows);
+    report.resets_left =
+        number(body.pointer("/rate_limit_reset_credits/available_count")).map(|value| value as i64);
+    report
 }
 
 fn push_codex_window(windows: &mut Vec<QuotaWindow>, raw: Option<&Value>, review: bool) {

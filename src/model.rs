@@ -91,6 +91,9 @@ pub struct ProviderReport {
     pub identity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// 剩余限流重置次数（目前只有 Codex 提供）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_left: Option<i64>,
     pub windows: Vec<QuotaWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -110,6 +113,7 @@ impl ProviderReport {
             title: title.into(),
             identity,
             plan,
+            resets_left: None,
             windows,
             error: None,
             fetched_at: Utc::now(),
@@ -122,6 +126,7 @@ impl ProviderReport {
             title: provider.title().to_string(),
             identity,
             plan: None,
+            resets_left: None,
             windows: Vec::new(),
             error: Some(error.into()),
             fetched_at: Utc::now(),

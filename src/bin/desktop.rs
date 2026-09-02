@@ -326,6 +326,8 @@ struct DesktopApp {
     last_pos_save: std::time::Instant,
     pos_guard_done: bool,
     last_content_size: Option<(f32, f32)>,
+    /// 正在刷新（点刷新按钮/托盘刷新后到新数据到达前），标题栏显示转圈提示。
+    refreshing: bool,
 }
 
 impl DesktopApp {
@@ -388,6 +390,7 @@ impl DesktopApp {
             last_pos_save: std::time::Instant::now() - Duration::from_secs(1),
             pos_guard_done: false,
             last_content_size: None,
+            refreshing: false,
         }
     }
 }
@@ -407,6 +410,7 @@ impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         while let Ok(snapshot) = self.snap_rx.try_recv() {
             self.snapshot = Some(snapshot);
+            self.refreshing = false;
         }
         #[cfg(windows)]
         if let Some(hwnd) = hwnd_of(frame) {
@@ -416,6 +420,7 @@ impl eframe::App for DesktopApp {
             match command {
                 tray::TrayCommand::Refresh => {
                     let _ = self.cmd_tx.send(Cmd::Refresh);
+                    self.refreshing = true;
                 }
                 tray::TrayCommand::ProvidersChanged => {
                     self.hidden_providers = tray::load_hidden();
@@ -469,8 +474,12 @@ impl eframe::App for DesktopApp {
             ));
         }
         self.was_focused = focused;
+        // 刷新中（含首屏加载）：短间隔重绘让标题栏转圈动起来
+        let refreshing = self.refreshing || self.snapshot.is_none();
         if self.drag_offset.is_some() {
             ctx.request_repaint();
+        } else if refreshing {
+            ctx.request_repaint_after(Duration::from_millis(250));
         } else {
             ctx.request_repaint_after(Duration::from_secs(30));
         }
@@ -505,14 +514,30 @@ impl eframe::App for DesktopApp {
                             if close.clicked() {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
-                            let refresh = icon_button(ui, IconKind::Refresh, "刷新");
+                            let refresh = icon_button(
+                                ui,
+                                IconKind::Refresh,
+                                if refreshing { "正在刷新" } else { "刷新" },
+                            );
                             if refresh.hovered() {
                                 over_icon = true;
                             }
-                            if refresh.clicked() {
+                            if refresh.clicked() && !refreshing {
                                 let _ = self.cmd_tx.send(Cmd::Refresh);
+                                self.refreshing = true;
                             }
-                            if let Some(snapshot) = &self.snapshot {
+                            if refreshing {
+                                ui.add_space(4.0);
+                                ui.add(
+                                    egui::Spinner::new()
+                                        .size(14.0)
+                                        .color(egui::Color32::from_rgb(242, 242, 242)),
+                                );
+                                ui.label(
+                                    egui::RichText::new("刷新中…")
+                                        .color(egui::Color32::from_rgb(242, 242, 242)),
+                                );
+                            } else if let Some(snapshot) = &self.snapshot {
                                 ui.add_space(4.0);
                                 ui.label(
                                     egui::RichText::new(ago_cn(snapshot.fetched_at))

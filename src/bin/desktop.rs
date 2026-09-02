@@ -273,7 +273,7 @@ enum IconKind {
     Close,
 }
 
-fn icon_button(ui: &mut egui::Ui, kind: IconKind, tip: &str) -> egui::Response {
+fn icon_button(ui: &mut egui::Ui, kind: IconKind, tip: &str, spin: f32) -> egui::Response {
     let size = egui::vec2(22.0, 22.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let painter = ui.painter();
@@ -293,7 +293,7 @@ fn icon_button(ui: &mut egui::Ui, kind: IconKind, tip: &str) -> egui::Response {
         }
         IconKind::Refresh => {
             let r = 5.0;
-            let start = -std::f32::consts::FRAC_PI_2 + 0.45;
+            let start = -std::f32::consts::FRAC_PI_2 + 0.45 + spin;
             let sweep = std::f32::consts::TAU * 0.78;
             let mut points = Vec::with_capacity(22);
             for i in 0..=20 {
@@ -326,7 +326,7 @@ struct DesktopApp {
     last_pos_save: std::time::Instant,
     pos_guard_done: bool,
     last_content_size: Option<(f32, f32)>,
-    /// 正在刷新（点刷新按钮/托盘刷新后到新数据到达前），标题栏显示转圈提示。
+    /// 正在刷新（点刷新按钮/托盘刷新后到新数据到达前），刷新图标自身旋转。
     refreshing: bool,
 }
 
@@ -474,12 +474,10 @@ impl eframe::App for DesktopApp {
             ));
         }
         self.was_focused = focused;
-        // 刷新中（含首屏加载）：短间隔重绘让标题栏转圈动起来
+        // 刷新中（含首屏加载）：每帧重绘，刷新图标才能转起来
         let refreshing = self.refreshing || self.snapshot.is_none();
-        if self.drag_offset.is_some() {
+        if self.drag_offset.is_some() || refreshing {
             ctx.request_repaint();
-        } else if refreshing {
-            ctx.request_repaint_after(Duration::from_millis(250));
         } else {
             ctx.request_repaint_after(Duration::from_secs(30));
         }
@@ -507,17 +505,23 @@ impl eframe::App for DesktopApp {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = 2.0;
-                            let close = icon_button(ui, IconKind::Close, "关闭");
+                            let close = icon_button(ui, IconKind::Close, "关闭", 0.0);
                             if close.hovered() {
                                 over_icon = true;
                             }
                             if close.clicked() {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
+                            let spin = if refreshing {
+                                ui.input(|input| input.time as f32) * std::f32::consts::TAU
+                            } else {
+                                0.0
+                            };
                             let refresh = icon_button(
                                 ui,
                                 IconKind::Refresh,
                                 if refreshing { "正在刷新" } else { "刷新" },
+                                spin,
                             );
                             if refresh.hovered() {
                                 over_icon = true;
@@ -526,18 +530,7 @@ impl eframe::App for DesktopApp {
                                 let _ = self.cmd_tx.send(Cmd::Refresh);
                                 self.refreshing = true;
                             }
-                            if refreshing {
-                                ui.add_space(4.0);
-                                ui.add(
-                                    egui::Spinner::new()
-                                        .size(14.0)
-                                        .color(egui::Color32::from_rgb(242, 242, 242)),
-                                );
-                                ui.label(
-                                    egui::RichText::new("刷新中…")
-                                        .color(egui::Color32::from_rgb(242, 242, 242)),
-                                );
-                            } else if let Some(snapshot) = &self.snapshot {
+                            if let Some(snapshot) = &self.snapshot {
                                 ui.add_space(4.0);
                                 ui.label(
                                     egui::RichText::new(ago_cn(snapshot.fetched_at))

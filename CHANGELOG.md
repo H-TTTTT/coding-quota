@@ -8,6 +8,8 @@ All notable changes to this project are documented in this file.
 
 - Codex remaining rate-limit reset count (`rate_limit_reset_credits.available_count`), shown in the desktop widget, TUI and `--snapshot` output.
 - Desktop widget width is fitted to the widest report card instead of being fixed at 340px, so longer titles are no longer clipped on the right. 340 stays as the lower bound, so the widget keeps its usual width and only grows when the content needs more.
+- Failed refreshes now keep showing the last good quota values with the error message alongside, instead of replacing the card with an error-only line. Last good reports are cached in `%APPDATA%\coding-quota\last_good.json` (so data survives a restart, e.g. network not ready at boot); restored values are drawn dimmed and labelled with their age. Applies to the desktop widget and the TUI; `--json`/`--snapshot` still report the raw result of the current round.
+- Transport errors are condensed to a short phrase (`连接失败` / `请求超时`) instead of the full reqwest message with its URL, so error lines fit the widget card in one line.
 
 ## 0.1.0 - 2026-08-28
 

@@ -1,3 +1,4 @@
+use coding_quota::cache;
 use coding_quota::credentials::CredentialSet;
 use coding_quota::fetch;
 use coding_quota::model::{ProviderId, ProviderReport, Snapshot};
@@ -307,6 +308,14 @@ mod native_drag {
     }
 }
 
+/// 刷新一轮：成功的落盘，失败的用上一轮数据回填（错误信息保留）。
+async fn refresh_snapshot(creds: &CredentialSet, only: Option<ProviderId>) -> Snapshot {
+    let mut snapshot = fetch::fetch_all(creds, only).await;
+    cache::save(&snapshot);
+    cache::apply(&mut snapshot);
+    snapshot
+}
+
 pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
     let original_size = crossterm::terminal::size().ok();
     enable_raw_mode()?;
@@ -314,7 +323,7 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
     execute!(stdout, SetTitle("编程额度"), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let mut snapshot = fetch::fetch_all(&creds, only).await;
+    let mut snapshot = refresh_snapshot(&creds, only).await;
     resize_terminal(&mut terminal);
     let _drag_watcher = native_drag::Watcher::start();
     let mut last_refresh = Instant::now();
@@ -330,9 +339,8 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
                     KeyCode::Char('r') => {
                         loading = true;
                         terminal.draw(|frame| draw(frame, &snapshot, loading))?;
-                        snapshot = fetch::fetch_all(&creds, only).await;
+                        snapshot = refresh_snapshot(&creds, only).await;
                         last_refresh = Instant::now();
-                        loading = false;
                     }
                     _ => {}
                 },
@@ -342,9 +350,8 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
         if last_refresh.elapsed() >= auto {
             loading = true;
             terminal.draw(|frame| draw(frame, &snapshot, loading))?;
-            snapshot = fetch::fetch_all(&creds, only).await;
+            snapshot = refresh_snapshot(&creds, only).await;
             last_refresh = Instant::now();
-            loading = false;
         }
     };
     drop(_drag_watcher);
@@ -425,12 +432,25 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
         )));
     }
 
+    // 有回填数据（windows 非空）时：报错行 + 变灰的旧额度，不再直接返回
+    let stale = report.error.is_some() && !report.windows.is_empty();
     if let Some(error) = &report.error {
+        let text = if stale {
+            format!(
+                "更新失败，显示{}数据：{}",
+                ago_cn(report.fetched_at),
+                error_cn(error)
+            )
+        } else {
+            format!("错误：{}", error_cn(error))
+        };
         lines.push(Line::from(Span::styled(
-            format!("{}错误：{}", " ".repeat(TUI_LEFT_GUTTER), error_cn(error)),
+            format!("{}{text}", " ".repeat(TUI_LEFT_GUTTER)),
             Style::default().fg(ratatui::style::Color::Red),
         )));
-        return lines;
+        if !stale {
+            return lines;
+        }
     }
     if report.windows.is_empty() {
         lines.push(Line::from(format!("{}暂无额度数据", " ".repeat(TUI_LEFT_GUTTER))));
@@ -463,7 +483,11 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
             Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
             Span::styled(
                 bar(remaining, BAR_WIDTH),
-                Style::default().fg(status_color(window.used_fraction)),
+                Style::default().fg(if stale {
+                    ratatui::style::Color::DarkGray
+                } else {
+                    status_color(window.used_fraction)
+                }),
             ),
             Span::raw("  "),
             Span::styled(extra, Style::default().add_modifier(Modifier::DIM)),

@@ -5,7 +5,7 @@
 mod tray;
 use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
 use coding_quota::render::{ago_cn, compact_until_cn, label_cn, title_cn};
-use coding_quota::{credentials, fetch};
+use coding_quota::{cache, credentials, fetch};
 use eframe::egui;
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -340,7 +340,7 @@ impl DesktopApp {
             loop {
                 // Reload the database for every refresh. A transient UNC/SQLite
                 // failure must not leave the widget permanently credential-less.
-                let snapshot = match credentials::load() {
+                let mut snapshot = match credentials::load() {
                     Ok(creds) => rt.block_on(fetch::fetch_all(&creds, None)),
                     Err(err) => {
                         let message = format!("凭据读取失败：{err}");
@@ -359,6 +359,9 @@ impl DesktopApp {
                         }
                     }
                 };
+                // 成功的先落盘，失败的用上一轮数据回填：报错但额度照常显示
+                cache::save(&snapshot);
+                cache::apply(&mut snapshot);
                 if snap_tx.send(snapshot).is_err() {
                     return;
                 }
@@ -642,6 +645,19 @@ fn remaining_text(report: &ProviderReport, window: &QuotaWindow) -> String {
     }
 }
 
+/// 失败提示文案。带回填数据时标明显示的是上一轮的数据（时间取旧报表的
+/// fetched_at，「x分钟前」如实反映数据年龄）。
+fn error_text(report: &ProviderReport) -> String {
+    let Some(error) = &report.error else {
+        return String::new();
+    };
+    if report.windows.is_empty() {
+        error.clone()
+    } else {
+        format!("更新失败，显示{}数据：{error}", ago_cn(report.fetched_at))
+    }
+}
+
 fn text_width(ui: &egui::Ui, text: &str, font_id: egui::FontId) -> f32 {
     ui.fonts(|fonts| fonts.layout_no_wrap(text.to_string(), font_id, egui::Color32::WHITE))
         .size()
@@ -669,8 +685,8 @@ fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
             small.clone(),
         ));
     }
-    if let Some(error) = &report.error {
-        width = width.max(text_width(ui, error, small.clone()));
+    if report.error.is_some() {
+        width = width.max(text_width(ui, &error_text(report), small.clone()));
     }
     for window in &report.windows {
         let mut row = text_width(ui, &label_cn(&window.label), label.clone());
@@ -716,21 +732,35 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                         .color(egui::Color32::from_rgb(160, 160, 160)),
                 );
             }
-            if let Some(error) = &report.error {
+            // 有回填数据（windows 非空）时：报错行 + 变灰的旧额度，不再直接 return
+            let stale = report.error.is_some() && !report.windows.is_empty();
+            if report.error.is_some() {
                 ui.label(
-                    egui::RichText::new(error)
+                    egui::RichText::new(error_text(report))
                         .color(egui::Color32::from_rgb(190, 50, 40))
                         .small(),
                 );
-                return;
+                if !stale {
+                    return;
+                }
             }
+            let main = if stale {
+                egui::Color32::from_rgb(196, 196, 196)
+            } else {
+                egui::Color32::from_rgb(242, 242, 242)
+            };
+            let dim = if stale {
+                egui::Color32::from_rgb(178, 178, 178)
+            } else {
+                egui::Color32::from_rgb(218, 218, 218)
+            };
             for window in &report.windows {
                 let remaining = (1.0 - window.used_fraction).clamp(0.0, 1.0) as f32;
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(label_cn(&window.label))
                             .size(LABEL_ROW_SIZE)
-                            .color(egui::Color32::from_rgb(242, 242, 242)),
+                            .color(main),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some(reset) = window.reset_at {
@@ -738,7 +768,7 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                                 egui::RichText::new(compact_until_cn(reset))
                                     .size(LABEL_ROW_SIZE)
                                     .monospace()
-                                    .color(egui::Color32::from_rgb(218, 218, 218)),
+                                    .color(dim),
                             );
                         }
                     });
@@ -749,13 +779,17 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                     let bar = egui::ProgressBar::new(remaining)
                         .desired_width(bar_width)
                         .desired_height(13.0)
-                        .fill(remaining_color(remaining));
+                        .fill(if stale {
+                            egui::Color32::from_rgb(150, 150, 150)
+                        } else {
+                            remaining_color(remaining)
+                        });
                     ui.add(bar);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(extra)
                                 .size(11.0)
-                                .color(egui::Color32::from_rgb(242, 242, 242)),
+                                .color(main),
                         );
                     });
                 });

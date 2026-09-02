@@ -402,9 +402,9 @@ async fn get_json(client: &reqwest::Client, url: &str, headers: HeaderMap) -> Re
         .headers(headers)
         .send()
         .await
-        .map_err(|err| sanitize(&err.to_string()))?;
+        .map_err(|err| brief(&err))?;
     let status = response.status();
-    let text = response.text().await.map_err(|err| sanitize(&err.to_string()))?;
+    let text = response.text().await.map_err(|err| brief(&err))?;
     if !status.is_success() {
         return Err(format!("HTTP {status}: {}", snippet(&text)));
     }
@@ -419,9 +419,9 @@ async fn post_json(client: &reqwest::Client, url: &str, mut headers: HeaderMap) 
         .body("{}")
         .send()
         .await
-        .map_err(|err| sanitize(&err.to_string()))?;
+        .map_err(|err| brief(&err))?;
     let status = response.status();
-    let text = response.text().await.map_err(|err| sanitize(&err.to_string()))?;
+    let text = response.text().await.map_err(|err| brief(&err))?;
     if !status.is_success() {
         return Err(format!("HTTP {status}: {}", snippet(&text)));
     }
@@ -503,6 +503,22 @@ fn parse_reset(data: &Value) -> Option<DateTime<Utc>> {
         }
     }
     None
+}
+
+/// 网络层错误压成一句短话：挂件一行放不下带完整 URL 的 reqwest 报错。
+fn brief(err: &reqwest::Error) -> String {
+    if err.is_timeout() {
+        "请求超时".to_string()
+    } else if err.is_connect() {
+        "连接失败".to_string()
+    } else {
+        // 其余错误去掉 Display 末尾附带的 " for url (...)"，正文照旧（已脱敏）
+        let text = err.to_string();
+        match text.find(" for url ") {
+            Some(idx) => sanitize(&text[..idx]),
+            None => sanitize(&text),
+        }
+    }
 }
 
 fn snippet(text: &str) -> String {

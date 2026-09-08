@@ -1,7 +1,7 @@
 use coding_quota::cache;
 use coding_quota::credentials::CredentialSet;
 use coding_quota::fetch;
-use coding_quota::model::{ProviderId, ProviderReport, Snapshot};
+use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
 use coding_quota::render::{
     ago_cn, bar, compact_until_cn, label_cn, status_color, title_cn,
 };
@@ -20,13 +20,16 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::io::{stdout, Stdout};
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 use unicode_width::UnicodeWidthStr;
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 const BAR_WIDTH: usize = 22;
 pub const TUI_COLUMNS: u16 = 48;
+const TUI_MAX_COLUMNS: u16 = 80;
 pub const TUI_LEFT_GUTTER: usize = 2;
 pub const TUI_ROWS: u16 = 34;
+const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 #[cfg(windows)]
 mod native_drag {
@@ -38,6 +41,15 @@ mod native_drag {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
+    static PROGRAMMATIC_RESIZE: AtomicBool = AtomicBool::new(false);
+
+    pub fn begin_resize() {
+        PROGRAMMATIC_RESIZE.store(true, Ordering::Relaxed);
+    }
+
+    pub fn end_resize() {
+        PROGRAMMATIC_RESIZE.store(false, Ordering::Relaxed);
+    }
     pub struct Watcher {
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
@@ -133,7 +145,7 @@ mod native_drag {
         };
         thread::sleep(Duration::from_millis(300));
         lock_window_size(hwnd);
-        let (fixed_width, fixed_height) = unsafe {
+        let (mut fixed_width, mut fixed_height) = unsafe {
             let mut rect = Rect::default();
             if GetWindowRect(hwnd, &mut rect) == 0 {
                 return;
@@ -151,7 +163,11 @@ mod native_drag {
                 if GetCursorPos(&mut cursor) != 0 && GetWindowRect(hwnd, &mut rect) != 0 {
                     let width = rect.right - rect.left;
                     let height = rect.bottom - rect.top;
-                    if width != fixed_width || height != fixed_height {
+                    if PROGRAMMATIC_RESIZE.load(Ordering::Relaxed) {
+                        fixed_width = width;
+                        fixed_height = height;
+                        clip_to_client(hwnd);
+                    } else if width != fixed_width || height != fixed_height {
                         const SWP_NOZORDER: u32 = 0x0004;
                         const SWP_NOACTIVATE: u32 = 0x0010;
                         SetWindowPos(
@@ -306,6 +322,9 @@ mod native_drag {
             Self
         }
     }
+
+    pub fn begin_resize() {}
+    pub fn end_resize() {}
 }
 
 /// 刷新一轮：成功的落盘，失败的用上一轮数据回填（错误信息保留）。
@@ -323,35 +342,55 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
     execute!(stdout, SetTitle("编程额度"), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let mut snapshot = refresh_snapshot(&creds, only).await;
-    resize_terminal(&mut terminal);
+    let mut last_cols = TUI_COLUMNS;
+    resize_terminal(&mut terminal, last_cols);
     let _drag_watcher = native_drag::Watcher::start();
+    let mut snapshot: Option<Snapshot> = None;
+    let mut inflight: Option<JoinHandle<Snapshot>> = Some(spawn_refresh(creds.clone(), only));
     let mut last_refresh = Instant::now();
     let auto = Duration::from_secs(120);
-    let mut loading = false;
+    let mut spin_frame: usize = 0;
 
     let result = loop {
-        terminal.draw(|frame| draw(frame, &snapshot, loading))?;
-        if event::poll(Duration::from_millis(200))? {
+        if inflight.as_ref().is_some_and(|handle| handle.is_finished()) {
+            if let Some(handle) = inflight.take() {
+                if let Ok(snap) = handle.await {
+                    snapshot = Some(snap);
+                    last_refresh = Instant::now();
+                    let cols = needed_columns(snapshot.as_ref());
+                    if cols != last_cols {
+                        last_cols = cols;
+                        resize_terminal(&mut terminal, cols);
+                    }
+                }
+            }
+        }
+
+        let loading = inflight.is_some();
+        terminal.draw(|frame| draw(frame, snapshot.as_ref(), loading.then_some(spin_frame)))?;
+        if loading {
+            spin_frame = spin_frame.wrapping_add(1);
+        }
+
+        let poll = if loading {
+            Duration::from_millis(80)
+        } else {
+            Duration::from_millis(200)
+        };
+        if event::poll(poll)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                    KeyCode::Char('r') => {
-                        loading = true;
-                        terminal.draw(|frame| draw(frame, &snapshot, loading))?;
-                        snapshot = refresh_snapshot(&creds, only).await;
-                        last_refresh = Instant::now();
+                    KeyCode::Char('r') if inflight.is_none() => {
+                        inflight = Some(spawn_refresh(creds.clone(), only));
                     }
                     _ => {}
                 },
                 _ => {}
             }
         }
-        if last_refresh.elapsed() >= auto {
-            loading = true;
-            terminal.draw(|frame| draw(frame, &snapshot, loading))?;
-            snapshot = refresh_snapshot(&creds, only).await;
-            last_refresh = Instant::now();
+        if inflight.is_none() && last_refresh.elapsed() >= auto {
+            inflight = Some(spawn_refresh(creds.clone(), only));
         }
     };
     drop(_drag_watcher);
@@ -364,7 +403,11 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
     result
 }
 
-fn draw(frame: &mut Frame, snapshot: &Snapshot, loading: bool) {
+fn spawn_refresh(creds: CredentialSet, only: Option<ProviderId>) -> JoinHandle<Snapshot> {
+    tokio::spawn(async move { refresh_snapshot(&creds, only).await })
+}
+
+fn draw(frame: &mut Frame, snapshot: Option<&Snapshot>, spin: Option<usize>) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -377,31 +420,43 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, loading: bool) {
         ])
         .split(frame.area());
 
-    let title = if loading {
-        "编程额度 · 正在刷新…".to_string()
-    } else {
-        format!("编程额度 · 更新于 {}", ago_cn(snapshot.fetched_at))
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("{}{}", " ".repeat(TUI_LEFT_GUTTER), title),
-            Style::default().add_modifier(Modifier::BOLD),
-        ))),
-        chunks[1],
-    );
-
-    let width = (chunks[3].width as usize).saturating_sub(TUI_LEFT_GUTTER);
-    let mut lines = Vec::new();
-    for (index, report) in snapshot.reports.iter().enumerate() {
-        if index > 0 {
-            lines.push(Line::default());
-        }
-        lines.extend(report_lines(report, width));
+    let mut right = String::new();
+    if let Some(snapshot) = snapshot {
+        right.push_str(&ago_cn(snapshot.fetched_at));
     }
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        chunks[3],
-    );
+    if let Some(frame_i) = spin {
+        if !right.is_empty() {
+            right.push(' ');
+        }
+        right.push(SPINNER[frame_i % SPINNER.len()]);
+    }
+    let title_width = chunks[1].width as usize;
+    let used = TUI_LEFT_GUTTER + display_width("编程额度") + display_width(&right);
+    let pad = title_width.saturating_sub(used);
+    let mut title = vec![
+        Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
+        Span::styled("编程额度", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(pad)),
+    ];
+    if !right.is_empty() {
+        title.push(Span::styled(right, Style::default().add_modifier(Modifier::DIM)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(title)), chunks[1]);
+
+    if let Some(snapshot) = snapshot {
+        let width = (chunks[3].width as usize).saturating_sub(TUI_LEFT_GUTTER);
+        let mut lines = Vec::new();
+        for (index, report) in snapshot.reports.iter().enumerate() {
+            if index > 0 {
+                lines.push(Line::default());
+            }
+            lines.extend(report_lines(report, width));
+        }
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            chunks[3],
+        );
+    }
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -432,18 +487,8 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
         )));
     }
 
-    // 有回填数据（windows 非空）时：报错行 + 变灰的旧额度，不再直接返回
     let stale = report.error.is_some() && !report.windows.is_empty();
-    if let Some(error) = &report.error {
-        let text = if stale {
-            format!(
-                "更新失败，显示{}数据：{}",
-                ago_cn(report.fetched_at),
-                error_cn(error)
-            )
-        } else {
-            format!("错误：{}", error_cn(error))
-        };
+    if let Some(text) = error_line(report) {
         lines.push(Line::from(Span::styled(
             format!("{}{text}", " ".repeat(TUI_LEFT_GUTTER)),
             Style::default().fg(ratatui::style::Color::Red),
@@ -462,16 +507,7 @@ fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(Span::raw(format!("{}{label}", " ".repeat(TUI_LEFT_GUTTER)))));
 
         let remaining = (1.0 - window.used_fraction).clamp(0.0, 1.0);
-        let extra = if report.provider == ProviderId::Kimi {
-            format!("剩余 {:.0}%", (remaining * 100.0).round())
-        } else {
-            match (window.used, window.limit) {
-                (Some(used), Some(limit)) => {
-                    format!("剩余 {:.0}/{limit:.0}", (limit - used).max(0.0))
-                }
-                _ => format!("剩余 {:.0}%", (remaining * 100.0).round()),
-            }
-        };
+        let extra = remaining_extra(report, window);
         let reset = window.reset_at.map(compact_until_cn).unwrap_or_default();
         let used_width = TUI_LEFT_GUTTER
             + BAR_WIDTH
@@ -519,20 +555,98 @@ fn error_cn(error: &str) -> String {
     }
 }
 
+fn remaining_extra(report: &ProviderReport, window: &QuotaWindow) -> String {
+    let remaining = (1.0 - window.used_fraction).clamp(0.0, 1.0);
+    if report.provider == ProviderId::Kimi {
+        format!("剩余 {:.0}%", (remaining * 100.0).round())
+    } else {
+        match (window.used, window.limit) {
+            (Some(used), Some(limit)) => {
+                format!("剩余 {:.0}/{limit:.0}", (limit - used).max(0.0))
+            }
+            _ => format!("剩余 {:.0}%", (remaining * 100.0).round()),
+        }
+    }
+}
+
+fn error_line(report: &ProviderReport) -> Option<String> {
+    let error = report.error.as_deref()?;
+    let stale = !report.windows.is_empty();
+    Some(if stale {
+        format!(
+            "更新失败，显示{}数据：{}",
+            ago_cn(report.fetched_at),
+            error_cn(error)
+        )
+    } else {
+        format!("错误：{}", error_cn(error))
+    })
+}
+
+fn measure_report_columns(report: &ProviderReport) -> usize {
+    let title = report_title(report);
+    let identity = report.identity.as_deref().unwrap_or("");
+    let mut cols = TUI_LEFT_GUTTER + display_width(&title);
+    if !identity.is_empty() {
+        cols += 2 + display_width(identity);
+    }
+    if let Some(resets) = report.resets_left {
+        cols = cols.max(TUI_LEFT_GUTTER + display_width(&format!("限流重置：剩余 {resets} 次")));
+    }
+    if let Some(error) = error_line(report) {
+        cols = cols.max(TUI_LEFT_GUTTER + display_width(&error));
+    }
+    for window in &report.windows {
+        let label = label_cn(&window.label);
+        let reset = window.reset_at.map(compact_until_cn).unwrap_or_default();
+        let label_row = TUI_LEFT_GUTTER
+            + display_width(&label)
+            + if reset.is_empty() {
+                0
+            } else {
+                1 + display_width(&reset)
+            };
+        cols = cols.max(label_row);
+        let extra = remaining_extra(report, window);
+        cols = cols.max(
+            TUI_LEFT_GUTTER
+                + BAR_WIDTH
+                + 2
+                + display_width(&extra)
+                + if reset.is_empty() {
+                    0
+                } else {
+                    display_width(&reset)
+                },
+        );
+    }
+    cols
+}
+
+fn needed_columns(snapshot: Option<&Snapshot>) -> u16 {
+    let mut cols = TUI_COLUMNS as usize;
+    cols = cols.max(TUI_LEFT_GUTTER + display_width("编程额度") + 1 + display_width("99 小时前") + 2);
+    cols = cols.max(TUI_LEFT_GUTTER + display_width("[Q] 关闭  [R] 刷新  每 2 分钟自动刷新"));
+    if let Some(snapshot) = snapshot {
+        for report in &snapshot.reports {
+            cols = cols.max(measure_report_columns(report));
+        }
+    }
+    cols.clamp(TUI_COLUMNS as usize, TUI_MAX_COLUMNS as usize) as u16
+}
+
 fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
-
-fn resize_terminal(terminal: &mut AppTerminal) {
-    if execute!(
-        terminal.backend_mut(),
-        SetSize(TUI_COLUMNS, TUI_ROWS)
-    )
-    .is_ok()
-    {
+fn resize_terminal(terminal: &mut AppTerminal, columns: u16) {
+    native_drag::begin_resize();
+    if execute!(terminal.backend_mut(), SetSize(columns, TUI_ROWS)).is_ok() {
         std::thread::sleep(Duration::from_millis(120));
         let _ = terminal.autoresize();
         let _ = terminal.clear();
     }
+    native_drag::end_resize();
 }
+
+

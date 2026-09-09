@@ -12,7 +12,7 @@ All notable changes to this project are documented in this file.
 - Transport errors are condensed to a short phrase (`连接失败` / `请求超时`) instead of the full reqwest message with its URL, so error lines fit the widget card in one line.
 - Clicking refresh (title-bar button or tray menu) spins the refresh icon itself until the new snapshot arrives; existing cards stay visible. The same spin covers the first load.
 - TUI title-bar refresh spinner (braille) while a round is in flight; existing cards stay visible. First load included. Refresh no longer blocks the event loop.
-- TUI layout: status dot per provider, reset time next to the window name, remaining percent on the bar row (bars stretch to fill the card width), and highlighted [Q]/[R] keys.
+- TUI layout: status dot per provider, reset time (`N天后重置`) at the right edge of the label row, remaining percent in a uniform-width bold column, and highlighted [Q]/[R] keys. Bars stretch to fill the card width with a dimmed track so only the filled part carries the status color, and the window height fits the content instead of a fixed 34 rows.
 
 ## 0.1.0 - 2026-08-28
 

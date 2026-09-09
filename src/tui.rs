@@ -3,9 +3,10 @@ use coding_quota::credentials::CredentialSet;
 use coding_quota::fetch;
 use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
 use coding_quota::render::{
-    ago_cn, bar, compact_until_cn, label_cn, status_color, title_cn,
+    ago_cn, bar_parts, compact_until_cn, label_cn, status_color, title_cn,
 };
 use anyhow::Result;
+use chrono::Utc;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -28,6 +29,9 @@ const BAR_MIN_WIDTH: usize = 22;
 pub const TUI_COLUMNS: u16 = 48;
 pub const TUI_LEFT_GUTTER: usize = 2;
 pub const TUI_ROWS: u16 = 34;
+const TUI_MIN_ROWS: u16 = 8;
+const TUI_MAX_ROWS: u16 = 48;
+const CHROME_ROWS: u16 = 5;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 
@@ -346,9 +350,10 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
     execute!(stdout, SetTitle("编程额度"), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    resize_terminal(&mut terminal, TUI_COLUMNS);
+    resize_terminal(&mut terminal, TUI_COLUMNS, TUI_ROWS);
     let _drag_watcher = native_drag::Watcher::start();
     let mut snapshot: Option<Snapshot> = None;
+    let mut last_rows = TUI_ROWS;
     let mut inflight: Option<JoinHandle<Snapshot>> = Some(spawn_refresh(creds.clone(), only));
     let mut last_refresh = Instant::now();
     let auto = Duration::from_secs(120);
@@ -360,6 +365,11 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
                 if let Ok(snap) = handle.await {
                     snapshot = Some(snap);
                     last_refresh = Instant::now();
+                    let rows = needed_rows(snapshot.as_ref());
+                    if rows != last_rows {
+                        last_rows = rows;
+                        resize_terminal(&mut terminal, TUI_COLUMNS, rows);
+                    }
                 }
             }
         }
@@ -436,7 +446,7 @@ fn draw(frame: &mut Frame, snapshot: Option<&Snapshot>, spin: Option<usize>) {
     let title_width = chunks[1].width as usize;
     let right_width: usize = right_spans.iter().map(|s| display_width(s.content.as_ref())).sum();
     let used = TUI_LEFT_GUTTER + display_width("编程额度") + right_width;
-    let pad = title_width.saturating_sub(used + 1);
+    let pad = title_width.saturating_sub(used + 2);
     let mut title = vec![
         Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
         Span::styled("编程额度", Style::default().add_modifier(Modifier::BOLD)),
@@ -447,29 +457,8 @@ fn draw(frame: &mut Frame, snapshot: Option<&Snapshot>, spin: Option<usize>) {
 
     if let Some(snapshot) = snapshot {
         let width = (chunks[3].width as usize).saturating_sub(TUI_LEFT_GUTTER);
-        let extra_width = snapshot
-            .reports
-            .iter()
-            .flat_map(|report| {
-                report
-                    .windows
-                    .iter()
-                    .map(move |window| display_width(&remaining_extra(report, window)))
-            })
-            .max()
-            .unwrap_or(0);
-        let bar_width = width
-            .saturating_sub(TUI_LEFT_GUTTER + 2 + extra_width)
-            .max(BAR_MIN_WIDTH);
-        let mut lines = Vec::new();
-        for (index, report) in snapshot.reports.iter().enumerate() {
-            if index > 0 {
-                lines.push(Line::default());
-            }
-            lines.extend(report_lines(report, width, bar_width));
-        }
         frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            Paragraph::new(body_lines(snapshot, width)).wrap(Wrap { trim: false }),
             chunks[3],
         );
     }
@@ -484,6 +473,37 @@ fn draw(frame: &mut Frame, snapshot: Option<&Snapshot>, spin: Option<usize>) {
         ])),
         chunks[5],
     );
+}
+
+fn body_lines(snapshot: &Snapshot, width: usize) -> Vec<Line<'static>> {
+    let extra_width = snapshot
+        .reports
+        .iter()
+        .flat_map(|report| {
+            report
+                .windows
+                .iter()
+                .map(move |window| display_width(&remaining_extra(report, window)))
+        })
+        .max()
+        .unwrap_or(0);
+    let bar_width = width
+        .saturating_sub(TUI_LEFT_GUTTER + 2 + extra_width)
+        .max(BAR_MIN_WIDTH);
+    let mut lines = Vec::new();
+    for (index, report) in snapshot.reports.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::default());
+        }
+        lines.extend(report_lines(report, width, bar_width));
+    }
+    lines
+}
+
+fn needed_rows(snapshot: Option<&Snapshot>) -> u16 {
+    let width = (TUI_COLUMNS as usize).saturating_sub(TUI_LEFT_GUTTER);
+    let content = snapshot.map_or(1, |snap| body_lines(snap, width).len());
+    (content as u16 + CHROME_ROWS).clamp(TUI_MIN_ROWS, TUI_MAX_ROWS)
 }
 
 fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<Line<'static>> {
@@ -542,10 +562,13 @@ fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<
 
     for window in &report.windows {
         let label = label_cn(&window.label);
-        let reset = window.reset_at.map(compact_until_cn).unwrap_or_default();
+        let reset = reset_text(window);
+        let label_pad = width.saturating_sub(
+            TUI_LEFT_GUTTER + display_width(&label) + display_width(&reset),
+        );
         lines.push(Line::from(vec![
             Span::raw(format!("{}{label}", " ".repeat(TUI_LEFT_GUTTER))),
-            Span::raw(if reset.is_empty() { String::new() } else { "  ".into() }),
+            Span::raw(" ".repeat(label_pad)),
             Span::styled(reset, Style::default().fg(FG_MUTED)),
         ]));
 
@@ -558,11 +581,16 @@ fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<
         };
         let used_width = TUI_LEFT_GUTTER + bar_width + 2 + display_width(&extra);
         let pad = width.saturating_sub(used_width);
+        let (filled, track) = bar_parts(remaining, bar_width);
         lines.push(Line::from(vec![
             Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
-            Span::styled(bar(remaining, bar_width), Style::default().fg(color)),
+            Span::styled(filled, Style::default().fg(color)),
+            Span::styled(track, Style::default().fg(FG_MUTED)),
             Span::raw("  "),
-            Span::styled(extra, Style::default().fg(color)),
+            Span::styled(
+                extra,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" ".repeat(pad)),
         ]));
     }
@@ -590,16 +618,24 @@ fn error_cn(error: &str) -> String {
     }
 }
 
+fn reset_text(window: &QuotaWindow) -> String {
+    match window.reset_at {
+        Some(when) if when <= Utc::now() => "即将重置".into(),
+        Some(when) => format!("{}后重置", compact_until_cn(when)),
+        None => String::new(),
+    }
+}
+
 fn remaining_extra(report: &ProviderReport, window: &QuotaWindow) -> String {
     let remaining = (1.0 - window.used_fraction).clamp(0.0, 1.0);
     if report.provider == ProviderId::Kimi {
-        format!("剩余 {:.0}%", (remaining * 100.0).round())
+        format!("剩余 {:>3.0}%", remaining * 100.0)
     } else {
         match (window.used, window.limit) {
             (Some(used), Some(limit)) => {
                 format!("剩余 {:.0}/{limit:.0}", (limit - used).max(0.0))
             }
-            _ => format!("剩余 {:.0}%", (remaining * 100.0).round()),
+            _ => format!("剩余 {:>3.0}%", remaining * 100.0),
         }
     }
 }
@@ -623,9 +659,9 @@ fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
-fn resize_terminal(terminal: &mut AppTerminal, columns: u16) {
+fn resize_terminal(terminal: &mut AppTerminal, columns: u16, rows: u16) {
     native_drag::begin_resize();
-    if execute!(terminal.backend_mut(), SetSize(columns, TUI_ROWS)).is_ok() {
+    if execute!(terminal.backend_mut(), SetSize(columns, rows)).is_ok() {
         std::thread::sleep(Duration::from_millis(120));
         let _ = terminal.autoresize();
         let _ = terminal.clear();

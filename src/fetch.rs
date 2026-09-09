@@ -233,11 +233,6 @@ fn short_cursor_identity(raw: &str) -> String {
 fn parse_kimi(identity: Option<String>, body: Value) -> ProviderReport {
     let data = body.get("data").unwrap_or(&body);
     let mut windows = Vec::new();
-    if let Some(usage) = data.get("usage") {
-        if let Some(window) = usage_row("kimi-usage", usage, "Total quota") {
-            windows.push(window);
-        }
-    }
     if let Some(limits) = data.get("limits").and_then(|v| v.as_array()) {
         for (idx, item) in limits.iter().enumerate() {
             let detail = item.get("detail").unwrap_or(item);
@@ -250,6 +245,11 @@ fn parse_kimi(identity: Option<String>, body: Value) -> ProviderReport {
             if let Some(window) = usage_row(&format!("kimi-{idx}"), detail, &label) {
                 windows.push(window);
             }
+        }
+    }
+    if let Some(usage) = data.get("usage") {
+        if let Some(window) = usage_row("kimi-usage", usage, "Total quota") {
+            windows.push(window);
         }
     }
     if windows.is_empty() {

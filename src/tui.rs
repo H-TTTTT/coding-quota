@@ -14,7 +14,7 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
@@ -24,12 +24,16 @@ use tokio::task::JoinHandle;
 use unicode_width::UnicodeWidthStr;
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
-const BAR_WIDTH: usize = 22;
+const BAR_MIN_WIDTH: usize = 22;
 pub const TUI_COLUMNS: u16 = 48;
-const TUI_MAX_COLUMNS: u16 = 80;
 pub const TUI_LEFT_GUTTER: usize = 2;
 pub const TUI_ROWS: u16 = 34;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+
+const FG_MUTED: Color = Color::DarkGray;
+const FG_ACCENT: Color = Color::Cyan;
+const FG_ERR: Color = Color::Red;
 
 #[cfg(windows)]
 mod native_drag {
@@ -342,8 +346,7 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
     execute!(stdout, SetTitle("编程额度"), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let mut last_cols = TUI_COLUMNS;
-    resize_terminal(&mut terminal, last_cols);
+    resize_terminal(&mut terminal, TUI_COLUMNS);
     let _drag_watcher = native_drag::Watcher::start();
     let mut snapshot: Option<Snapshot> = None;
     let mut inflight: Option<JoinHandle<Snapshot>> = Some(spawn_refresh(creds.clone(), only));
@@ -357,11 +360,6 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
                 if let Ok(snap) = handle.await {
                     snapshot = Some(snap);
                     last_refresh = Instant::now();
-                    let cols = needed_columns(snapshot.as_ref());
-                    if cols != last_cols {
-                        last_cols = cols;
-                        resize_terminal(&mut terminal, cols);
-                    }
                 }
             }
         }
@@ -419,38 +417,56 @@ fn draw(frame: &mut Frame, snapshot: Option<&Snapshot>, spin: Option<usize>) {
             Constraint::Length(1),
         ])
         .split(frame.area());
-
-    let mut right = String::new();
+    let mut right_spans: Vec<Span> = Vec::new();
     if let Some(snapshot) = snapshot {
-        right.push_str(&ago_cn(snapshot.fetched_at));
+        right_spans.push(Span::styled(
+            ago_cn(snapshot.fetched_at),
+            Style::default().fg(FG_MUTED),
+        ));
     }
     if let Some(frame_i) = spin {
-        if !right.is_empty() {
-            right.push(' ');
+        if !right_spans.is_empty() {
+            right_spans.push(Span::raw(" "));
         }
-        right.push(SPINNER[frame_i % SPINNER.len()]);
+        right_spans.push(Span::styled(
+            SPINNER[frame_i % SPINNER.len()].to_string(),
+            Style::default().fg(FG_ACCENT),
+        ));
     }
     let title_width = chunks[1].width as usize;
-    let used = TUI_LEFT_GUTTER + display_width("编程额度") + display_width(&right);
-    let pad = title_width.saturating_sub(used);
+    let right_width: usize = right_spans.iter().map(|s| display_width(s.content.as_ref())).sum();
+    let used = TUI_LEFT_GUTTER + display_width("编程额度") + right_width;
+    let pad = title_width.saturating_sub(used + 1);
     let mut title = vec![
         Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
         Span::styled("编程额度", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" ".repeat(pad)),
     ];
-    if !right.is_empty() {
-        title.push(Span::styled(right, Style::default().add_modifier(Modifier::DIM)));
-    }
+    title.extend(right_spans);
     frame.render_widget(Paragraph::new(Line::from(title)), chunks[1]);
 
     if let Some(snapshot) = snapshot {
         let width = (chunks[3].width as usize).saturating_sub(TUI_LEFT_GUTTER);
+        let extra_width = snapshot
+            .reports
+            .iter()
+            .flat_map(|report| {
+                report
+                    .windows
+                    .iter()
+                    .map(move |window| display_width(&remaining_extra(report, window)))
+            })
+            .max()
+            .unwrap_or(0);
+        let bar_width = width
+            .saturating_sub(TUI_LEFT_GUTTER + 2 + extra_width)
+            .max(BAR_MIN_WIDTH);
         let mut lines = Vec::new();
         for (index, report) in snapshot.reports.iter().enumerate() {
             if index > 0 {
                 lines.push(Line::default());
             }
-            lines.extend(report_lines(report, width));
+            lines.extend(report_lines(report, width, bar_width));
         }
         frame.render_widget(
             Paragraph::new(lines).wrap(Wrap { trim: false }),
@@ -459,76 +475,95 @@ fn draw(frame: &mut Frame, snapshot: Option<&Snapshot>, spin: Option<usize>) {
     }
 
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("{}[Q] 关闭  [R] 刷新  每 2 分钟自动刷新", " ".repeat(TUI_LEFT_GUTTER)),
-            Style::default().add_modifier(Modifier::DIM),
-        ))),
+        Paragraph::new(Line::from(vec![
+            Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
+            Span::styled("[Q]", Style::default().fg(FG_ACCENT)),
+            Span::styled(" 关闭  ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("[R]", Style::default().fg(FG_ACCENT)),
+            Span::styled(" 刷新  每 2 分钟自动刷新", Style::default().add_modifier(Modifier::DIM)),
+        ])),
         chunks[5],
     );
 }
 
-fn report_lines(report: &ProviderReport, width: usize) -> Vec<Line<'static>> {
+fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<Line<'static>> {
+    let stale = report.error.is_some() && !report.windows.is_empty();
+    let worst = report
+        .windows
+        .iter()
+        .map(|window| window.used_fraction)
+        .fold(0.0_f64, f64::max);
+    let dot_color = if stale {
+        FG_MUTED
+    } else {
+        status_color(worst)
+    };
+
     let title = report_title(report);
     let identity = report.identity.clone().unwrap_or_default();
     let gap = usize::from(!identity.is_empty()) * 2;
     let pad = width.saturating_sub(
-        TUI_LEFT_GUTTER + display_width(&title) + display_width(&identity) + gap,
+        TUI_LEFT_GUTTER + 2 + display_width(&title) + display_width(&identity) + gap,
     );
     let mut lines = vec![Line::from(vec![
         Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
+        Span::styled("●", Style::default().fg(dot_color)),
+        Span::raw(" "),
         Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" ".repeat(pad + gap)),
         Span::styled(identity, Style::default().add_modifier(Modifier::DIM)),
     ])];
     if let Some(resets) = report.resets_left {
-        lines.push(Line::from(Span::styled(
-            format!("{}限流重置：剩余 {resets} 次", " ".repeat(TUI_LEFT_GUTTER)),
-            Style::default().add_modifier(Modifier::DIM),
-        )));
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
+            Span::styled(
+                format!("限流重置：剩余 {resets} 次"),
+                Style::default().fg(FG_ACCENT),
+            ),
+        ]));
     }
 
-    let stale = report.error.is_some() && !report.windows.is_empty();
     if let Some(text) = error_line(report) {
         lines.push(Line::from(Span::styled(
             format!("{}{text}", " ".repeat(TUI_LEFT_GUTTER)),
-            Style::default().fg(ratatui::style::Color::Red),
+            Style::default().fg(FG_ERR),
         )));
         if !stale {
             return lines;
         }
     }
     if report.windows.is_empty() {
-        lines.push(Line::from(format!("{}暂无额度数据", " ".repeat(TUI_LEFT_GUTTER))));
+        lines.push(Line::from(format!(
+            "{}暂无额度数据",
+            " ".repeat(TUI_LEFT_GUTTER)
+        )));
         return lines;
     }
 
     for window in &report.windows {
         let label = label_cn(&window.label);
-        lines.push(Line::from(Span::raw(format!("{}{label}", " ".repeat(TUI_LEFT_GUTTER)))));
+        let reset = window.reset_at.map(compact_until_cn).unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::raw(format!("{}{label}", " ".repeat(TUI_LEFT_GUTTER))),
+            Span::raw(if reset.is_empty() { String::new() } else { "  ".into() }),
+            Span::styled(reset, Style::default().fg(FG_MUTED)),
+        ]));
 
         let remaining = (1.0 - window.used_fraction).clamp(0.0, 1.0);
         let extra = remaining_extra(report, window);
-        let reset = window.reset_at.map(compact_until_cn).unwrap_or_default();
-        let used_width = TUI_LEFT_GUTTER
-            + BAR_WIDTH
-            + 2
-            + display_width(&extra)
-            + display_width(&reset);
+        let color = if stale {
+            FG_MUTED
+        } else {
+            status_color(window.used_fraction)
+        };
+        let used_width = TUI_LEFT_GUTTER + bar_width + 2 + display_width(&extra);
         let pad = width.saturating_sub(used_width);
         lines.push(Line::from(vec![
             Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
-            Span::styled(
-                bar(remaining, BAR_WIDTH),
-                Style::default().fg(if stale {
-                    ratatui::style::Color::DarkGray
-                } else {
-                    status_color(window.used_fraction)
-                }),
-            ),
+            Span::styled(bar(remaining, bar_width), Style::default().fg(color)),
             Span::raw("  "),
-            Span::styled(extra, Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(extra, Style::default().fg(color)),
             Span::raw(" ".repeat(pad)),
-            Span::styled(reset, Style::default().add_modifier(Modifier::DIM)),
         ]));
     }
     lines
@@ -583,57 +618,6 @@ fn error_line(report: &ProviderReport) -> Option<String> {
     })
 }
 
-fn measure_report_columns(report: &ProviderReport) -> usize {
-    let title = report_title(report);
-    let identity = report.identity.as_deref().unwrap_or("");
-    let mut cols = TUI_LEFT_GUTTER + display_width(&title);
-    if !identity.is_empty() {
-        cols += 2 + display_width(identity);
-    }
-    if let Some(resets) = report.resets_left {
-        cols = cols.max(TUI_LEFT_GUTTER + display_width(&format!("限流重置：剩余 {resets} 次")));
-    }
-    if let Some(error) = error_line(report) {
-        cols = cols.max(TUI_LEFT_GUTTER + display_width(&error));
-    }
-    for window in &report.windows {
-        let label = label_cn(&window.label);
-        let reset = window.reset_at.map(compact_until_cn).unwrap_or_default();
-        let label_row = TUI_LEFT_GUTTER
-            + display_width(&label)
-            + if reset.is_empty() {
-                0
-            } else {
-                1 + display_width(&reset)
-            };
-        cols = cols.max(label_row);
-        let extra = remaining_extra(report, window);
-        cols = cols.max(
-            TUI_LEFT_GUTTER
-                + BAR_WIDTH
-                + 2
-                + display_width(&extra)
-                + if reset.is_empty() {
-                    0
-                } else {
-                    display_width(&reset)
-                },
-        );
-    }
-    cols
-}
-
-fn needed_columns(snapshot: Option<&Snapshot>) -> u16 {
-    let mut cols = TUI_COLUMNS as usize;
-    cols = cols.max(TUI_LEFT_GUTTER + display_width("编程额度") + 1 + display_width("99 小时前") + 2);
-    cols = cols.max(TUI_LEFT_GUTTER + display_width("[Q] 关闭  [R] 刷新  每 2 分钟自动刷新"));
-    if let Some(snapshot) = snapshot {
-        for report in &snapshot.reports {
-            cols = cols.max(measure_report_columns(report));
-        }
-    }
-    cols.clamp(TUI_COLUMNS as usize, TUI_MAX_COLUMNS as usize) as u16
-}
 
 fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)

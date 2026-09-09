@@ -11,8 +11,8 @@ All notable changes to this project are documented in this file.
 - Failed refreshes now keep showing the last good quota values with the error message alongside, instead of replacing the card with an error-only line. Last good reports are cached in `%APPDATA%\coding-quota\last_good.json` (so data survives a restart, e.g. network not ready at boot); restored values are drawn dimmed and labelled with their age. Applies to the desktop widget and the TUI; `--json`/`--snapshot` still report the raw result of the current round.
 - Transport errors are condensed to a short phrase (`连接失败` / `请求超时`) instead of the full reqwest message with its URL, so error lines fit the widget card in one line.
 - Clicking refresh (title-bar button or tray menu) spins the refresh icon itself until the new snapshot arrives; existing cards stay visible. The same spin covers the first load.
-- TUI width fits the widest report (48–80 columns; 48 is the lower bound, matching the old fixed size). Windows Terminal's size lock yields during programmatic resize so the pane can grow.
 - TUI title-bar refresh spinner (braille) while a round is in flight; existing cards stay visible. First load included. Refresh no longer blocks the event loop.
+- TUI layout: status dot per provider, reset time next to the window name, remaining percent on the bar row (bars stretch to fill the card width), and highlighted [Q]/[R] keys.
 
 ## 0.1.0 - 2026-08-28
 

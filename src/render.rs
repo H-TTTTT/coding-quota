@@ -61,8 +61,13 @@ fn format_window(window: &QuotaWindow) -> String {
 }
 
 pub fn bar(fraction: f64, width: usize) -> String {
+    let (filled, track) = bar_parts(fraction, width);
+    format!("{filled}{track}")
+}
+
+pub fn bar_parts(fraction: f64, width: usize) -> (String, String) {
     let filled = ((fraction.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+    ("█".repeat(filled), "░".repeat(width - filled))
 }
 
 pub fn compact_until(when: DateTime<Utc>) -> String {

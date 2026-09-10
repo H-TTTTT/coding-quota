@@ -344,6 +344,15 @@ async fn refresh_snapshot(creds: &CredentialSet, only: Option<ProviderId>) -> Sn
 }
 
 pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
+    run_with(creds, only, false).await
+}
+
+/// 演示模式：固定模拟数据，不读凭据、不联网、不自动刷新（供截图与预览）。
+pub async fn run_demo() -> Result<()> {
+    run_with(CredentialSet::default(), None, true).await
+}
+
+async fn run_with(creds: CredentialSet, only: Option<ProviderId>, demo: bool) -> Result<()> {
     let original_size = crossterm::terminal::size().ok();
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -352,9 +361,18 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
 
     resize_terminal(&mut terminal, TUI_COLUMNS, TUI_ROWS);
     let _drag_watcher = native_drag::Watcher::start();
-    let mut snapshot: Option<Snapshot> = None;
+    let mut snapshot: Option<Snapshot> = demo.then(demo_snapshot);
     let mut last_rows = TUI_ROWS;
-    let mut inflight: Option<JoinHandle<Snapshot>> = Some(spawn_refresh(creds.clone(), only));
+    if demo {
+        // 演示模式没有刷新回调，启动时直接按内容收一次高度。
+        let rows = needed_rows(snapshot.as_ref());
+        if rows != last_rows {
+            last_rows = rows;
+            resize_terminal(&mut terminal, TUI_COLUMNS, rows);
+        }
+    }
+    let mut inflight: Option<JoinHandle<Snapshot>> =
+        (!demo).then(|| spawn_refresh(creds.clone(), only));
     let mut last_refresh = Instant::now();
     let auto = Duration::from_secs(120);
     let mut spin_frame: usize = 0;
@@ -389,7 +407,7 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                    KeyCode::Char('r') if inflight.is_none() => {
+                    KeyCode::Char('r') if inflight.is_none() && !demo => {
                         inflight = Some(spawn_refresh(creds.clone(), only));
                     }
                     _ => {}
@@ -397,7 +415,7 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
                 _ => {}
             }
         }
-        if inflight.is_none() && last_refresh.elapsed() >= auto {
+        if !demo && inflight.is_none() && last_refresh.elapsed() >= auto {
             inflight = Some(spawn_refresh(creds.clone(), only));
         }
     };
@@ -413,6 +431,67 @@ pub async fn run(creds: CredentialSet, only: Option<ProviderId>) -> Result<()> {
 
 fn spawn_refresh(creds: CredentialSet, only: Option<ProviderId>) -> JoinHandle<Snapshot> {
     tokio::spawn(async move { refresh_snapshot(&creds, only).await })
+}
+
+/// 固定的演示数据：身份一律为 example.com / demo 占位，用量覆盖绿黄红三档。
+fn demo_snapshot() -> Snapshot {
+    let now = Utc::now();
+    let days = |n: i64| Some(now + chrono::Duration::days(n));
+    let hours = |n: i64| Some(now + chrono::Duration::hours(n));
+    let mut codex = ProviderReport::ok(
+        ProviderId::Codex,
+        "OpenAI Codex",
+        Some("demo@example.com".into()),
+        Some("pro".into()),
+        vec![QuotaWindow::from_used_percent("7d", "7 days", 76.0, days(4))],
+    );
+    codex.resets_left = Some(2);
+    let reports = vec![
+        codex,
+        ProviderReport::ok(
+            ProviderId::Grok,
+            "xAI Grok",
+            Some("demo@example.com".into()),
+            None,
+            vec![QuotaWindow::from_used_percent("weekly", "Weekly credits", 8.0, days(3))],
+        ),
+        ProviderReport::ok(
+            ProviderId::Glm,
+            "Zhipu Coding Plan",
+            None,
+            Some("Coding Plan MAX".into()),
+            vec![
+                QuotaWindow::from_used_percent("5h", "5h window", 24.0, hours(2)),
+                QuotaWindow::from_used_percent("week", "Weekly", 55.0, days(1)),
+                QuotaWindow::from_used_percent("mcp", "MCP / tools", 12.0, days(4)),
+            ],
+        ),
+        ProviderReport::ok(
+            ProviderId::Kimi,
+            "Kimi Code",
+            Some("demo-user-id".into()),
+            None,
+            vec![
+                QuotaWindow::from_used_percent("5h", "5h limit", 15.0, hours(3)),
+                QuotaWindow::from_used_percent("total", "Total quota", 48.0, days(1)),
+            ],
+        ),
+        ProviderReport::ok(
+            ProviderId::Cursor,
+            "Cursor",
+            Some("demo".into()),
+            None,
+            vec![
+                QuotaWindow::from_used_percent("api", "API / named models", 100.0, days(2)),
+                QuotaWindow::from_used_percent("auto", "Auto models", 30.0, days(2)),
+                QuotaWindow::from_used_percent("total", "Included total", 44.0, days(2)),
+            ],
+        ),
+    ];
+    Snapshot {
+        fetched_at: now - chrono::Duration::minutes(1),
+        reports,
+    }
 }
 
 fn draw(frame: &mut Frame, snapshot: Option<&Snapshot>, spin: Option<usize>) {

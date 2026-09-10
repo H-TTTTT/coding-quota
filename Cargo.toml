@@ -1,6 +1,6 @@
 [package]
 name = "coding-quota"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Unified coding-plan quota viewer for Codex, Grok, GLM, Kimi, and Cursor"
 license = "MIT"

@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## Unreleased
+## 0.2.0 - 2026-09-10
 
 ### Added
 
@@ -14,6 +14,7 @@ All notable changes to this project are documented in this file.
 - TUI title-bar refresh spinner (braille) while a round is in flight; existing cards stay visible. First load included. Refresh no longer blocks the event loop.
 - TUI layout: status dot per provider, reset time (`N天后重置`) at the right edge of the label row, remaining percent in a uniform-width bold column, and highlighted [Q]/[R] keys. Bars stretch to fill the card width with a dimmed track so only the filled part carries the status color, and the window height fits the content instead of a fixed 34 rows.
 - Kimi's 5h limit window is now listed above the total quota (applies to the desktop widget, TUI and snapshot output).
+- `--demo` renders the TUI with mock data (identities are `demo@example.com` etc.) for previews and screenshots, without touching credentials or the network.
 
 ## 0.1.0 - 2026-08-28
 

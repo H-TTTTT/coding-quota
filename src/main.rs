@@ -29,6 +29,10 @@ struct Cli {
     /// Refresh every N seconds in snapshot mode
     #[arg(long)]
     watch: Option<u64>,
+
+    /// Show the TUI with mock data (no credentials needed)
+    #[arg(long)]
+    demo: bool,
 }
 
 fn enable_windows_console() {
@@ -367,6 +371,9 @@ async fn main() -> Result<()> {
     let hosted = std::env::var_os("CODING_QUOTA_TUI_HOSTED").is_some();
     if interactive && launch_focused_tui() {
         return Ok(());
+    }
+    if cli.demo {
+        return tui::run_demo().await;
     }
     let want_tui = interactive && (hosted || std::io::stdout().is_terminal());
 

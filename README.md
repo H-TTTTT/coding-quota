@@ -14,7 +14,12 @@ See the remaining quota of five AI coding plans in one place: **OpenAI Codex, xA
 
 ## Download
 
-Grab the latest `coding-quota-*-windows-x86_64.zip` from [Releases](../../releases) and unzip it — keep the two executables and the two MinGW runtime DLLs in the same directory. No installation required.
+Grab the executables from [Releases](../../releases):
+
+- `coding-quota.exe` — terminal TUI / CLI
+- `coding-quota-desktop.exe` — desktop widget
+
+Both are standalone (only Windows system DLLs are linked), no installation required.
 
 ## Credentials
 

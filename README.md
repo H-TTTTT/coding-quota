@@ -6,7 +6,7 @@ See the remaining quota of five AI coding plans in one place: **OpenAI Codex, xA
 
 ## Two flavors
 
-| | `coding-quota-desktop.exe` (desktop widget) | `coding-quota.exe` (terminal TUI / CLI) |
+| | `coding-quota-gui.exe` (desktop widget) | `coding-quota-tui.exe` (terminal TUI / CLI) |
 | --- | --- | --- |
 | UI | Borderless acrylic widget pinned to the desktop | Compact 48-column TUI in a frameless Windows Terminal window |
 | Interaction | Drag by the title bar, tray icon context menu | `R` refresh, `Q` quit, auto-refresh every 2 minutes |
@@ -16,8 +16,8 @@ See the remaining quota of five AI coding plans in one place: **OpenAI Codex, xA
 
 Grab the executables from [Releases](../../releases):
 
-- `coding-quota.exe` — terminal TUI / CLI
-- `coding-quota-desktop.exe` — desktop widget
+- `coding-quota-tui.exe` — terminal TUI / CLI
+- `coding-quota-gui.exe` — desktop widget
 
 Both are standalone (only Windows system DLLs are linked), no installation required.
 

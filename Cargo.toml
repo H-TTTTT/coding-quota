@@ -26,7 +26,11 @@ gui = ["dep:eframe", "dep:raw-window-handle"]
 
 
 [[bin]]
-name = "coding-quota-desktop"
+name = "coding-quota-tui"
+path = "src/main.rs"
+
+[[bin]]
+name = "coding-quota-gui"
 path = "src/bin/desktop.rs"
 required-features = ["gui"]
 

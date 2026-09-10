@@ -10,7 +10,7 @@ use std::io::IsTerminal;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "coding-quota",
+    name = "coding-quota-tui",
     about = "Show Codex, Grok, GLM, Kimi, and Cursor coding-plan quotas in one place"
 )]
 struct Cli {
@@ -303,7 +303,7 @@ fn console_host_executable(executable: &std::path::Path) -> Option<std::path::Pa
         .join("CodingQuota")
         .join(format!("{hash:016x}"));
     std::fs::create_dir_all(&directory).ok()?;
-    let runtime = directory.join("coding-quota.exe");
+    let runtime = directory.join("coding-quota-tui.exe");
     cache_file(&runtime, &image)?;
     for (name, content) in dependencies {
         cache_file(&directory.join(name), &content)?;

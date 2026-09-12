@@ -10,7 +10,7 @@ See the remaining quota of five AI coding plans in one place: **OpenAI Codex, xA
 | --- | --- | --- |
 | UI | Borderless acrylic widget pinned to the desktop | Compact 48-column TUI in a frameless Windows Terminal window |
 | Interaction | Drag by the title bar, tray icon context menu | `R` refresh, `Q` quit, auto-refresh every 2 minutes |
-| Extras | Launch with Windows, per-provider visibility, window position memory | `--snapshot` plain text, `--json` for scripts, `-p <provider>` to filter, `--demo` for a mock-data preview |
+| Extras | Launch with Windows, per-provider visibility, window position memory | `--snapshot` plain text, `--json` for scripts, `-p <provider>` to filter |
 
 ## Download
 

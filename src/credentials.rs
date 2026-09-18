@@ -4,7 +4,9 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn hidden_command(program: &str) -> Command {
+/// 拉起子进程但不弹控制台窗口。GUI 是 windows 子系统程序，spawn 控制台程序
+/// （tasklist/taskkill 等）不加 CREATE_NO_WINDOW 就会闪一个黑色窗口。
+pub fn hidden_command(program: &str) -> Command {
     let command = Command::new(program);
     #[cfg(windows)]
     {

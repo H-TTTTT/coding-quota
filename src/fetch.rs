@@ -590,7 +590,7 @@ fn fetch_devin_banner() -> ProviderReport {
     };
     // 横幅只在拥有真实控制台时渲染：CREATE_NO_WINDOW 下 devin 直接不画 TUI。
     // conhost --headless 给它一个隐形控制台；cwd 用已信任目录，避免目录信任弹窗。
-    let mut command = std::process::Command::new("conhost.exe");
+    let mut command = credentials::hidden_command("conhost.exe");
     command
         .arg("--headless")
         .arg("--")
@@ -600,12 +600,6 @@ fn fetch_devin_banner() -> ProviderReport {
         .stderr(std::process::Stdio::null());
     if let Some(trusted) = devin_trusted_cwd() {
         command.current_dir(trusted);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
     }
     let Ok(mut child) = command
         .spawn()
@@ -646,7 +640,7 @@ fn fetch_devin_banner() -> ProviderReport {
     }
     // conhost 只是壳，child.kill() 杀不掉里面的 devin.exe；孤儿 devin 会持有
     // session 锁。只终止自己拉起的这棵进程树，绝不按进程名杀别人的 devin。
-    let _ = std::process::Command::new("taskkill")
+    let _ = credentials::hidden_command("taskkill")
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .status();
     let _ = child.wait();
@@ -685,7 +679,7 @@ fn fetch_devin_banner() -> ProviderReport {
 
 /// 只读检测 devin.exe 是否在运行（用户可能有任务在跑）。绝不杀进程。
 fn devin_running() -> bool {
-    let output = std::process::Command::new("tasklist")
+    let output = credentials::hidden_command("tasklist")
         .args(["/FI", "IMAGENAME eq devin.exe", "/NH"])
         .output();
     match output {

@@ -647,6 +647,13 @@ fn fetch_devin_banner() -> ProviderReport {
 
     match banner {
         Some((plan, remaining, reset_in)) => {
+            // CLI 启动时刚刷新过 user_status 缓存，里面有日额度；
+            // 缓存新鲜且套餐名一致（同一账号）就直接用缓存的完整两行。
+            if let Some(cached) = parse_devin_cache_fresh(180) {
+                if cached.plan.as_deref() == Some(plan.as_str()) {
+                    return cached;
+                }
+            }
             let reset_at = reset_in
                 .as_deref()
                 .and_then(parse_devin_reset)
@@ -658,8 +665,8 @@ fn fetch_devin_banner() -> ProviderReport {
                 None,
                 Some(plan),
                 vec![QuotaWindow::from_used_percent(
-                    "billing-cycle",
-                    "Billing cycle",
+                    "weekly",
+                    "Weekly",
                     used,
                     reset_at,
                 )],
@@ -682,8 +689,19 @@ fn devin_running() -> bool {
 }
 
 /// 用户任务运行期间从 user_status 缓存读额度，不 spawn 新实例。
-/// 缓存是 JSON 包 base64 的 protobuf：f13{ f1{f2=套餐名}, f15=剩余%, f18=重置时间戳 }。
+/// 缓存是 JSON 包 base64 的 protobuf。f13 内关键字段：
+/// f1.2=套餐名，f14=日额度剩余%，f15=周额度剩余%，
+/// f17=日额度重置锚点（未消费时停留在过去，不展示），f18=周额度重置时间戳。
 fn parse_devin_cache() -> Option<ProviderReport> {
+    parse_devin_cache_inner(0)
+}
+
+/// 只接受 max_age_secs 内的新鲜缓存（banner 路径刚让 CLI 刷新过缓存时用）。
+fn parse_devin_cache_fresh(max_age_secs: i64) -> Option<ProviderReport> {
+    parse_devin_cache_inner(max_age_secs)
+}
+
+fn parse_devin_cache_inner(max_age_secs: i64) -> Option<ProviderReport> {
     let local = std::env::var_os("LOCALAPPDATA")?;
     let dir = std::path::PathBuf::from(local)
         .join("devin")
@@ -700,30 +718,49 @@ fn parse_devin_cache() -> Option<ProviderReport> {
         .max_by_key(|entry| entry.metadata().ok().and_then(|m| m.modified().ok()))?;
     let raw = std::fs::read_to_string(newest.path()).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if max_age_secs > 0 {
+        let fetched = value.get("fetched_at_secs")?.as_i64()?;
+        if Utc::now().timestamp() - fetched > max_age_secs {
+            return None;
+        }
+    }
     let payload = base64_decode(value.get("payload")?.as_str()?)?;
     let quota = proto_field(&payload, 13)?;
     let plan = proto_field(&quota, 1)
         .and_then(|plan_msg| proto_field(&plan_msg, 2))
         .and_then(|bytes| proto_string(&bytes))
         .unwrap_or_else(|| "Unknown".into());
-    let remaining = proto_varint_field(&quota, 15)?;
-    let reset_at = proto_varint_field(&quota, 18)
+    let weekly = proto_varint_field(&quota, 15)?;
+    let weekly_reset = proto_varint_field(&quota, 18)
         .filter(|secs| *secs > 1_600_000_000)
         .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0));
-    if !(0..=100).contains(&remaining) {
+    if !(0..=100).contains(&weekly) {
         return None;
     }
+    let mut windows = Vec::new();
+    if let Some(daily) = proto_varint_field(&quota, 14).filter(|d| (0..=100).contains(d)) {
+        let daily_reset = proto_varint_field(&quota, 17)
+            .filter(|secs| *secs > Utc::now().timestamp())
+            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0));
+        windows.push(QuotaWindow::from_used_percent(
+            "daily",
+            "Daily",
+            100.0 - daily as f64,
+            daily_reset,
+        ));
+    }
+    windows.push(QuotaWindow::from_used_percent(
+        "weekly",
+        "Weekly",
+        100.0 - weekly as f64,
+        weekly_reset,
+    ));
     Some(ProviderReport::ok(
         ProviderId::Devin,
         "Devin",
         None,
         Some(plan),
-        vec![QuotaWindow::from_used_percent(
-            "billing-cycle",
-            "Billing cycle",
-            100.0 - remaining as f64,
-            reset_at,
-        )],
+        windows,
     ))
 }
 

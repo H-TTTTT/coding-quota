@@ -113,6 +113,7 @@ pub fn title_cn(title: &str) -> &str {
 pub fn label_cn(label: &str) -> String {
     match label {
         "Weekly credits" | "Weekly" => "每周额度".into(),
+        "Daily" => "1 天额度".into(),
         "Monthly credits" => "每月额度".into(),
         "Period credits" => "周期额度".into(),
         "MCP / tools" => "MCP / 工具".into(),

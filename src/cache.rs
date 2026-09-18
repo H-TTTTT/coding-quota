@@ -38,15 +38,21 @@ fn load() -> HashMap<ProviderId, ProviderReport> {
     map
 }
 
-/// 把本轮成功的报表落盘。全部失败时不写，避免把仅存的好数据抹掉。
+/// 把本轮成功的报表落盘（与已有缓存合并：本轮失败/未出现的条目保留旧值，
+/// 否则部分失败的轮次会把失败平台的好数据抹掉，导致回填失效）。
+/// 凭据被移除（missing）的平台顺手清掉缓存条目，旧数据不该继续挂着。
 pub fn save(snapshot: &Snapshot) {
-    let reports: Vec<ProviderReport> = snapshot
-        .reports
-        .iter()
-        .filter(|report| report.error.is_none())
-        .cloned()
-        .collect();
-    if reports.is_empty() {
+    let mut merged = load();
+    let mut any_success = false;
+    for report in &snapshot.reports {
+        if report.is_missing() {
+            merged.remove(&report.provider);
+        } else if report.error.is_none() {
+            merged.insert(report.provider, report.clone());
+            any_success = true;
+        }
+    }
+    if !any_success {
         return;
     }
     let Some(path) = cache_path() else {
@@ -55,6 +61,7 @@ pub fn save(snapshot: &Snapshot) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    let reports: Vec<ProviderReport> = merged.into_values().collect();
     let Ok(text) = serde_json::to_string(&CacheFile { reports }) else {
         return;
     };

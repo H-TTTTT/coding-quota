@@ -9,6 +9,7 @@ pub enum ProviderId {
     Glm,
     Kimi,
     Cursor,
+    Devin,
 }
 
 impl ProviderId {
@@ -19,6 +20,7 @@ impl ProviderId {
             Self::Glm => "GLM",
             Self::Kimi => "Kimi",
             Self::Cursor => "Cursor",
+            Self::Devin => "Devin",
         }
     }
 
@@ -29,6 +31,7 @@ impl ProviderId {
             "glm" | "zhipu" | "zhipu-coding-plan" | "zai" => Some(Self::Glm),
             "kimi" | "kimi-code" | "kimi-for-coding" => Some(Self::Kimi),
             "cursor" => Some(Self::Cursor),
+            "devin" | "devin-cli" | "cognition" => Some(Self::Devin),
             _ => None,
         }
     }

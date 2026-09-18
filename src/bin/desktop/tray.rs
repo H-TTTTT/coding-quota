@@ -21,13 +21,13 @@ pub fn set_widget_hwnd(hwnd: isize) {
     WIDGET_HWND.store(hwnd, Ordering::Relaxed);
 }
 
-/// 「显示套餐」子菜单条目，顺序与主界面一致。
-pub const PROVIDERS: [(ProviderId, &str); 5] = [
+pub const PROVIDERS: [(ProviderId, &str); 6] = [
     (ProviderId::Codex, "OpenAI Codex"),
     (ProviderId::Grok, "xAI Grok"),
     (ProviderId::Glm, "智谱 Coding Plan"),
     (ProviderId::Kimi, "Kimi Code"),
     (ProviderId::Cursor, "Cursor"),
+    (ProviderId::Devin, "Devin"),
 ];
 
 fn provider_key(provider: ProviderId) -> &'static str {
@@ -37,9 +37,9 @@ fn provider_key(provider: ProviderId) -> &'static str {
         ProviderId::Glm => "glm",
         ProviderId::Kimi => "kimi",
         ProviderId::Cursor => "cursor",
+        ProviderId::Devin => "devin",
     }
 }
-
 fn hidden_file() -> Option<std::path::PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
     Some(

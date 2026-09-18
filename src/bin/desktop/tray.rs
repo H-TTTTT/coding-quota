@@ -99,6 +99,15 @@ where
     imp::spawn(tx, Box::new(wake));
 }
 
+/// 进程退出前调用：同步删除托盘图标，避免退出后图标残留。
+#[cfg(windows)]
+pub fn shutdown() {
+    imp::shutdown();
+}
+
+#[cfg(not(windows))]
+pub fn shutdown() {}
+
 #[cfg(not(windows))]
 pub fn spawn<F>(_tx: mpsc::Sender<TrayCommand>, _wake: F)
 where
@@ -111,7 +120,7 @@ mod imp {
     use super::{is_hidden, load_hidden, toggle_hidden, TrayCommand, PROVIDERS, WIDGET_HWND};
     use core::ffi::c_void;
     use std::cell::RefCell;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicIsize, Ordering};
     use std::sync::mpsc;
 
     const WM_TRAY: u32 = 0x8000 + 1; // WM_APP + 1
@@ -127,6 +136,8 @@ mod imp {
     const NIF_MESSAGE: u32 = 0x01;
     const NIF_ICON: u32 = 0x02;
     const NIF_TIP: u32 = 0x04;
+    /// NIM_ADD / NIM_DELETE 必须用同一个 uID，否则退出时图标删不掉。
+    const TRAY_ICON_ID: u32 = 1;
 
     const MF_STRING: u32 = 0x0000;
     const MF_CHECKED: u32 = 0x0008;
@@ -369,6 +380,9 @@ mod imp {
         static SHARED: RefCell<Option<Shared>> = const { RefCell::new(None) };
     }
 
+    /// 托盘宿主窗口句柄，供进程退出时（on_exit）从主线程同步删掉托盘图标。
+    static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -419,6 +433,7 @@ mod imp {
         if hwnd.is_null() {
             return;
         }
+        TRAY_HWND.store(hwnd as isize, Ordering::Relaxed);
         if !add_icon(hwnd, instance) {
             DestroyWindow(hwnd);
             return;
@@ -437,6 +452,7 @@ mod imp {
         let mut data: NotifyIconData = std::mem::zeroed();
         data.cb_size = std::mem::size_of::<NotifyIconData>() as u32;
         data.hwnd = hwnd;
+        data.id = TRAY_ICON_ID;
         data.flags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         data.callback_message = WM_TRAY;
         data.icon = app_icon(instance);
@@ -450,11 +466,27 @@ mod imp {
         }
         added
     }
+    #[repr(C)]
+    struct RgbQuad {
+        blue: u8,
+        green: u8,
+        red: u8,
+        reserved: u8,
+    }
+
+    /// CreateDIBSection 的第二参是 BITMAPINFO（头 + 调色板槽位），不是裸的
+    /// BITMAPINFOHEADER；32bpp 下虽不读调色板，类型上必须给够。
+    #[repr(C)]
+    struct BitmapInfo {
+        header: BitmapInfoHeader,
+        colors: [RgbQuad; 1],
+    }
+
     #[link(name = "gdi32")]
     extern "system" {
         fn CreateDIBSection(
             dc: *mut c_void,
-            header: *const BitmapInfoHeader,
+            info: *const BitmapInfo,
             usage: u32,
             bits: *mut *mut c_void,
             file: *mut c_void,
@@ -474,8 +506,18 @@ mod imp {
         let mut data: NotifyIconData = std::mem::zeroed();
         data.cb_size = std::mem::size_of::<NotifyIconData>() as u32;
         data.hwnd = hwnd;
-        data.id = 1;
+        data.id = TRAY_ICON_ID;
         Shell_NotifyIconW(NIM_DELETE, &mut data);
+        TRAY_HWND.store(0, Ordering::Relaxed);
+    }
+
+    /// 进程退出时由主线程调用（on_exit）：同步删除托盘图标。
+    /// 托盘线程自己的消息循环走不到这里，正常退出路径必须靠这个入口。
+    pub fn shutdown() {
+        let hwnd = TRAY_HWND.swap(0, Ordering::Relaxed) as *mut c_void;
+        if !hwnd.is_null() {
+            unsafe { remove_icon(hwnd) };
+        }
     }
 
     /// 托盘图标：优先运行时逐像素绘制，失败再回退到嵌入的 .ico 资源。
@@ -609,28 +651,29 @@ mod imp {
 
     /// 32bpp ARGB DIB → HICON。位图用负高度自上而下，与像素数组顺序一致。
     unsafe fn icon_from_bgra(size: usize, bgra: &[u8]) -> *mut c_void {
-        let header = BitmapInfoHeader {
-            bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
-            bi_width: size as i32,
-            bi_height: -(size as i32),
-            bi_planes: 1,
-            bi_bit_count: 32,
-            bi_compression: 0,
-            bi_size_image: 0,
-            bi_x_pels_per_meter: 0,
-            bi_y_pels_per_meter: 0,
-            bi_clr_used: 0,
-            bi_clr_important: 0,
+        let info = BitmapInfo {
+            header: BitmapInfoHeader {
+                bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                bi_width: size as i32,
+                bi_height: -(size as i32),
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: 0,
+                bi_size_image: 0,
+                bi_x_pels_per_meter: 0,
+                bi_y_pels_per_meter: 0,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            },
+            colors: [RgbQuad {
+                blue: 0,
+                green: 0,
+                red: 0,
+                reserved: 0,
+            }],
         };
         let mut bits: *mut c_void = std::ptr::null_mut();
-        let color = CreateDIBSection(
-            std::ptr::null_mut(),
-            &header,
-            0,
-            &mut bits,
-            std::ptr::null_mut(),
-            0,
-        );
+        let color = CreateDIBSection(std::ptr::null_mut(), &info, 0, &mut bits, std::ptr::null_mut(), 0);
         if color.is_null() || bits.is_null() {
             return std::ptr::null_mut();
         }

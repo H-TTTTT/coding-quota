@@ -13,6 +13,10 @@ All notable changes to this project are documented in this file.
 
 - The last-good cache now merges successful reports per provider instead of rewriting the whole file per round, so a partially failed round no longer discards good data for the other providers.
 
+### Fixed
+
+- The tray icon is now removed when the widget exits: the add/delete calls used different icon ids, and the normal exit path never reached the tray thread's cleanup. The icon is now deleted synchronously from `on_exit`.
+
 ### Changed
 
 - Renamed the executables: `coding-quota-tui.exe` (terminal TUI/CLI, was `coding-quota.exe`) and `coding-quota-gui.exe` (desktop widget, was `coding-quota-desktop.exe`).

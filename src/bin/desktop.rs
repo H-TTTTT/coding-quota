@@ -405,7 +405,8 @@ impl eframe::App for DesktopApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // 关闭时把最后位置落盘，供下次启动恢复
+        // 关闭时把最后位置落盘，供下次启动恢复；托盘图标同步删除，避免残留
+        tray::shutdown();
         if let Some((x, y)) = self.last_seen_pos {
             save_window_pos(x, y);
         }

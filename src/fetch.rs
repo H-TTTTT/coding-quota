@@ -9,7 +9,7 @@ use std::time::Duration;
 const UA: &str = "coding-quota/0.1";
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-pub async fn fetch_all(creds: &CredentialSet, only: Option<ProviderId>) -> Snapshot {
+pub async fn fetch_all(creds: &CredentialSet, only: Option<ProviderId>, skip: &[ProviderId]) -> Snapshot {
     let client = match reqwest::Client::builder().timeout(TIMEOUT).build() {
         Ok(client) => client,
         Err(err) => {
@@ -21,10 +21,11 @@ pub async fn fetch_all(creds: &CredentialSet, only: Option<ProviderId>) -> Snaps
                 ProviderId::Cursor,
                 ProviderId::Devin,
             ]
-                .into_iter()
-                .filter(|provider| only.is_none_or(|wanted| wanted == *provider))
-                .map(|provider| ProviderReport::err(provider, None, format!("http client: {err}")))
-                .collect();
+            .into_iter()
+            .filter(|provider| only.is_none_or(|wanted| wanted == *provider))
+            .filter(|provider| !skip.contains(provider))
+            .map(|provider| ProviderReport::err(provider, None, format!("http client: {err}")))
+            .collect();
             return Snapshot {
                 fetched_at: Utc::now(),
                 reports,
@@ -33,12 +34,12 @@ pub async fn fetch_all(creds: &CredentialSet, only: Option<ProviderId>) -> Snaps
     };
 
     let (codex, grok, glm, kimi, cursor, devin) = tokio::join!(
-        maybe_fetch(&client, ProviderId::Codex, creds.codex.clone(), only),
-        maybe_fetch(&client, ProviderId::Grok, creds.grok.clone(), only),
-        maybe_fetch(&client, ProviderId::Glm, creds.glm.clone(), only),
-        maybe_fetch(&client, ProviderId::Kimi, creds.kimi.clone(), only),
-        maybe_fetch(&client, ProviderId::Cursor, creds.cursor.clone(), only),
-        maybe_devin(only),
+        maybe_fetch(&client, ProviderId::Codex, creds.codex.clone(), only, skip),
+        maybe_fetch(&client, ProviderId::Grok, creds.grok.clone(), only, skip),
+        maybe_fetch(&client, ProviderId::Glm, creds.glm.clone(), only, skip),
+        maybe_fetch(&client, ProviderId::Kimi, creds.kimi.clone(), only, skip),
+        maybe_fetch(&client, ProviderId::Cursor, creds.cursor.clone(), only, skip),
+        maybe_devin(only, skip),
     );
 
     Snapshot {
@@ -55,8 +56,13 @@ async fn maybe_fetch(
     provider: ProviderId,
     cred: Option<StoredCred>,
     only: Option<ProviderId>,
+    skip: &[ProviderId],
 ) -> Option<ProviderReport> {
     if only.is_some_and(|wanted| wanted != provider) {
+        return None;
+    }
+    // 用户在挂件里退订（隐藏）的平台：完全不取数
+    if skip.contains(&provider) {
         return None;
     }
     Some(match cred {
@@ -552,8 +558,8 @@ fn sanitize(text: &str) -> String {
 /// Devin CLI 没有公开额度 API：横幅里那行「Pro · 9% remaining (resets in 2d 4h)」
 /// 是它启动时自己调 GetUserStatus 拿到的实时数据。这里无窗口拉起 devin.exe、
 /// 从 stdout 抓这一行，抓到即杀进程。
-async fn maybe_devin(only: Option<ProviderId>) -> Option<ProviderReport> {
-    if only.is_some_and(|wanted| wanted != ProviderId::Devin) {
+async fn maybe_devin(only: Option<ProviderId>, skip: &[ProviderId]) -> Option<ProviderReport> {
+    if only.is_some_and(|wanted| wanted != ProviderId::Devin) || skip.contains(&ProviderId::Devin) {
         return None;
     }
     Some(fetch_devin())

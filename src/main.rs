@@ -379,7 +379,7 @@ async fn main() -> Result<()> {
 
     let creds = credentials::load()?;
     if cli.json {
-        let snapshot = fetch::fetch_all(&creds, only).await;
+        let snapshot = fetch::fetch_all(&creds, only, &[]).await;
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
@@ -389,7 +389,7 @@ async fn main() -> Result<()> {
     }
 
     loop {
-        let snapshot = fetch::fetch_all(&creds, only).await;
+        let snapshot = fetch::fetch_all(&creds, only, &[]).await;
         if cli.watch.is_some() {
             print!("\x1B[2J\x1B[H");
         }

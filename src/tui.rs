@@ -337,7 +337,7 @@ mod native_drag {
 
 /// 刷新一轮：成功的落盘，失败的用上一轮数据回填（错误信息保留）。
 async fn refresh_snapshot(creds: &CredentialSet, only: Option<ProviderId>) -> Snapshot {
-    let mut snapshot = fetch::fetch_all(creds, only).await;
+    let mut snapshot = fetch::fetch_all(creds, only, &[]).await;
     cache::save(&snapshot);
     cache::apply(&mut snapshot);
     snapshot

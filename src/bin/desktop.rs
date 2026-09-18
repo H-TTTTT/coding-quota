@@ -343,7 +343,11 @@ impl DesktopApp {
                 // Reload the database for every refresh. A transient UNC/SQLite
                 // failure must not leave the widget permanently credential-less.
                 let mut snapshot = match credentials::load() {
-                    Ok(creds) => rt.block_on(fetch::fetch_all(&creds, None)),
+                    Ok(creds) => {
+                        // 托盘里隐藏（退订）的平台：完全不取数，也不会失效凭据 401
+                        let skip = tray::hidden_provider_ids();
+                        rt.block_on(fetch::fetch_all(&creds, None, &skip))
+                    }
                     Err(err) => {
                         let message = format!("凭据读取失败：{err}");
                         Snapshot {

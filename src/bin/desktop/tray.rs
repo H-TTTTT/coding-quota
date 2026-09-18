@@ -65,6 +65,16 @@ pub fn is_hidden(hidden: &[String], provider: ProviderId) -> bool {
     hidden.iter().any(|item| item == key)
 }
 
+/// 隐藏列表映射为 ProviderId，供取数层整体跳过（退订的平台不再请求）。
+pub fn hidden_provider_ids() -> Vec<ProviderId> {
+    let hidden = load_hidden();
+    PROVIDERS
+        .iter()
+        .filter(|(provider, _)| is_hidden(&hidden, *provider))
+        .map(|(provider, _)| *provider)
+        .collect()
+}
+
 fn toggle_hidden(provider: ProviderId) {
     let Some(path) = hidden_file() else { return };
     let key = provider_key(provider);

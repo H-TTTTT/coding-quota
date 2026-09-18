@@ -1,5 +1,5 @@
 use coding_quota::cache;
-use coding_quota::credentials::CredentialSet;
+use coding_quota::credentials::{self, CredentialSet};
 use coding_quota::fetch;
 use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
 use coding_quota::render::{
@@ -429,15 +429,29 @@ async fn run_with(creds: CredentialSet, only: Option<ProviderId>, demo: bool) ->
     result
 }
 
-fn spawn_refresh(creds: CredentialSet, only: Option<ProviderId>) -> JoinHandle<Snapshot> {
-    tokio::spawn(async move { refresh_snapshot(&creds, only).await })
+fn spawn_refresh(fallback: CredentialSet, only: Option<ProviderId>) -> JoinHandle<Snapshot> {
+    tokio::spawn(async move {
+        // 每轮重读 omp 凭据库：omp 里 logout 的平台下一轮刷新即变为
+        // 「未找到凭据」并从界面隐藏；库读取失败时退回启动时的凭据。
+        let creds = credentials::load().unwrap_or(fallback);
+        refresh_snapshot(&creds, only).await
+    })
+}
+
+fn days(offset: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    Some(chrono::Utc::now() + chrono::Duration::days(offset))
+}
+
+fn hours(offset: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    Some(chrono::Utc::now() + chrono::Duration::hours(offset))
+}
+
+fn now() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
 }
 
 /// 固定的演示数据：身份一律为 example.com / demo 占位，用量覆盖绿黄红三档。
 fn demo_snapshot() -> Snapshot {
-    let now = Utc::now();
-    let days = |n: i64| Some(now + chrono::Duration::days(n));
-    let hours = |n: i64| Some(now + chrono::Duration::hours(n));
     let mut codex = ProviderReport::ok(
         ProviderId::Codex,
         "OpenAI Codex",
@@ -489,7 +503,7 @@ fn demo_snapshot() -> Snapshot {
         ),
     ];
     Snapshot {
-        fetched_at: now - chrono::Duration::minutes(1),
+        fetched_at: now() - chrono::Duration::minutes(1),
         reports,
     }
 }
@@ -570,7 +584,12 @@ fn body_lines(snapshot: &Snapshot, width: usize) -> Vec<Line<'static>> {
         .saturating_sub(TUI_LEFT_GUTTER + 2 + extra_width)
         .max(BAR_MIN_WIDTH);
     let mut lines = Vec::new();
-    for (index, report) in snapshot.reports.iter().enumerate() {
+    for (index, report) in snapshot
+        .reports
+        .iter()
+        .filter(|report| !report.is_missing())
+        .enumerate()
+    {
         if index > 0 {
             lines.push(Line::default());
         }

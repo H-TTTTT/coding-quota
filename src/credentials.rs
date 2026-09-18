@@ -236,7 +236,8 @@ fn is_lock_error(err: &rusqlite::Error) -> bool {
 fn load_from_sqlite(path: &Path, set: &mut CredentialSet) -> Result<()> {
     let db = open_sqlite_readonly(path)?;
     let mut stmt = db.conn().prepare(
-        "SELECT provider, credential_type, COALESCE(identity_key, ''), data FROM auth_credentials",
+        "SELECT provider, credential_type, COALESCE(identity_key, ''), data
+         FROM auth_credentials WHERE disabled_cause IS NULL",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -432,4 +433,54 @@ pub fn token_expiring(expires_ms: Option<i64>, token: Option<&str>) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn soft_logout_removes_provider_and_login_restores_it() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "coding-quota-logout-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let result = (|| -> Result<()> {
+            let db = rusqlite::Connection::open(&path)?;
+            db.execute_batch(
+                "CREATE TABLE auth_credentials (
+                    provider TEXT, credential_type TEXT, identity_key TEXT,
+                    data TEXT, disabled_cause TEXT
+                 );
+                 INSERT INTO auth_credentials VALUES
+                    ('xai-oauth', 'oauth', '', '{}', NULL),
+                    ('kimi-code', 'oauth', '', '{}', NULL);",
+            )?;
+            let mut before = CredentialSet::default();
+            load_from_sqlite(&path, &mut before)?;
+            assert!(before.grok.is_some());
+
+            db.execute(
+                "UPDATE auth_credentials SET disabled_cause = 'deleted by user'
+                 WHERE provider = 'xai-oauth'",
+                [],
+            )?;
+            let mut logged_out = CredentialSet::default();
+            load_from_sqlite(&path, &mut logged_out)?;
+            assert!(logged_out.grok.is_none(), "soft-deleted credentials must not authorize Grok");
+            assert!(logged_out.kimi.is_some(), "other active providers must remain available");
+
+            db.execute(
+                "UPDATE auth_credentials SET disabled_cause = NULL WHERE provider = 'xai-oauth'",
+                [],
+            )?;
+            let mut logged_in = CredentialSet::default();
+            load_from_sqlite(&path, &mut logged_in)?;
+            assert!(logged_in.grok.is_some(), "login must restore the provider");
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&path);
+        result
+    }
 }

@@ -7,6 +7,8 @@ All notable changes to this project are documented in this file.
 ### Changed
 
 - Renamed the executables: `coding-quota-tui.exe` (terminal TUI/CLI, was `coding-quota.exe`) and `coding-quota-gui.exe` (desktop widget, was `coding-quota-desktop.exe`).
+- TUI reloads omp credentials on every refresh and hides providers whose credentials were removed, including after logout. Hidden providers no longer reserve vertical space; transient credential-read failures retain the startup credentials rather than falsely treating all accounts as logged out.
+- Credential loading now excludes rows with a non-null `disabled_cause`. omp logout marks credentials `deleted by user` instead of deleting their rows; both UIs now treat these accounts as unauthorized rather than querying stale tokens.
 
 ## 0.2.0 - 2026-09-10
 

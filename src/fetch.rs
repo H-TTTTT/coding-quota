@@ -576,12 +576,16 @@ fn devin_executable() -> Option<std::path::PathBuf> {
 }
 
 fn fetch_devin() -> ProviderReport {
-    // 用户可能有 devin 任务在跑：spawn 新实例会抢 session 锁，必须让路。
-    if devin_running() {
-        return parse_devin_cache()
-            .unwrap_or_else(|| ProviderReport::err(ProviderId::Devin, None, "devin 任务运行中，暂停刷新"));
+    // 横幅是实时数据（周额度）。实测 devin 运行中并行拉起互不影响
+    // （用户日常就高频多开；清理用 PID 树精确终止，不留孤儿）。
+    // 横幅失败再退回 user_status 缓存兜底。
+    let report = fetch_devin_banner();
+    if report.error.is_some() {
+        if let Some(cached) = parse_devin_cache() {
+            return cached;
+        }
     }
-    fetch_devin_banner()
+    report
 }
 
 fn fetch_devin_banner() -> ProviderReport {
@@ -642,66 +646,43 @@ fn fetch_devin_banner() -> ProviderReport {
     // session 锁。只终止自己拉起的这棵进程树，绝不按进程名杀别人的 devin。
     let _ = credentials::hidden_command("taskkill")
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     let _ = child.wait();
 
     match banner {
         Some((plan, remaining, reset_in)) => {
-            // CLI 启动时刚刷新过 user_status 缓存，里面有日额度；
-            // 缓存新鲜且套餐名一致（同一账号）就直接用缓存的完整两行。
-            if let Some(cached) = parse_devin_cache_fresh(180) {
-                if cached.plan.as_deref() == Some(plan.as_str()) {
-                    return cached;
-                }
-            }
             let reset_at = reset_in
                 .as_deref()
                 .and_then(parse_devin_reset)
                 .map(|secs| Utc::now() + chrono::Duration::seconds(secs));
             let used = 100.0 - remaining;
-            ProviderReport::ok(
-                ProviderId::Devin,
-                "Devin",
-                None,
-                Some(plan),
-                vec![QuotaWindow::from_used_percent(
-                    "weekly",
-                    "Weekly",
-                    used,
-                    reset_at,
-                )],
-            )
+            let mut windows = Vec::new();
+            // 日额度只在 user_status 缓存里（横幅和我们拉起的实例都不写/不含它）；
+            // 同账号时把缓存里的日额度行带上，周额度用横幅的实时值。
+            if let Some(cached) = parse_devin_cache() {
+                if cached.plan.as_deref() == Some(plan.as_str()) {
+                    windows.extend(cached.windows.into_iter().filter(|w| w.id == "daily"));
+                }
+            }
+            windows.push(QuotaWindow::from_used_percent("weekly", "Weekly", used, reset_at));
+            ProviderReport::ok(ProviderId::Devin, "Devin", None, Some(plan), windows)
         }
         None => ProviderReport::err(ProviderId::Devin, None, "未从 devin 横幅捕获到额度"),
     }
 }
 
 
-/// 只读检测 devin.exe 是否在运行（用户可能有任务在跑）。绝不杀进程。
-fn devin_running() -> bool {
-    let output = credentials::hidden_command("tasklist")
-        .args(["/FI", "IMAGENAME eq devin.exe", "/NH"])
-        .output();
-    match output {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).to_lowercase().contains("devin.exe"),
-        Err(_) => false,
-    }
-}
-
-/// 用户任务运行期间从 user_status 缓存读额度，不 spawn 新实例。
-/// 缓存是 JSON 包 base64 的 protobuf。f13 内关键字段：
+/// 从 user_status 缓存读额度。缓存是 JSON 包 base64 的 protobuf，f13 内关键字段：
 /// f1.2=套餐名，f14=日额度剩余%，f15=周额度剩余%，
 /// f17=日额度重置锚点（未消费时停留在过去，不展示），f18=周额度重置时间戳。
+/// 注意：缓存只在真实 devin 进程启动时刷新，长跑任务期间会滞后。
 fn parse_devin_cache() -> Option<ProviderReport> {
-    parse_devin_cache_inner(0)
+    parse_devin_cache_inner()
 }
 
-/// 只接受 max_age_secs 内的新鲜缓存（banner 路径刚让 CLI 刷新过缓存时用）。
-fn parse_devin_cache_fresh(max_age_secs: i64) -> Option<ProviderReport> {
-    parse_devin_cache_inner(max_age_secs)
-}
-
-fn parse_devin_cache_inner(max_age_secs: i64) -> Option<ProviderReport> {
+fn parse_devin_cache_inner() -> Option<ProviderReport> {
     let local = std::env::var_os("LOCALAPPDATA")?;
     let dir = std::path::PathBuf::from(local)
         .join("devin")
@@ -718,12 +699,6 @@ fn parse_devin_cache_inner(max_age_secs: i64) -> Option<ProviderReport> {
         .max_by_key(|entry| entry.metadata().ok().and_then(|m| m.modified().ok()))?;
     let raw = std::fs::read_to_string(newest.path()).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    if max_age_secs > 0 {
-        let fetched = value.get("fetched_at_secs")?.as_i64()?;
-        if Utc::now().timestamp() - fetched > max_age_secs {
-            return None;
-        }
-    }
     let payload = base64_decode(value.get("payload")?.as_str()?)?;
     let quota = proto_field(&payload, 13)?;
     let plan = proto_field(&quota, 1)
@@ -947,6 +922,12 @@ fn parse_devin_banner(text: &str) -> Option<(String, f64, Option<String>)> {
         if plan.is_empty() {
             continue;
         }
+        // 无头 conhost 会把「Unsupported terminal」警告挤进横幅同一行，
+        // 形如「…for the best experience Pro · 0% remaining …」，剥掉已知噪声前缀。
+        let plan = plan
+            .rsplit_once("best experience")
+            .map(|(_, tail)| tail.trim())
+            .unwrap_or(plan);
         let reset = reset_part.trim();
         return Some((
             plan.to_string(),

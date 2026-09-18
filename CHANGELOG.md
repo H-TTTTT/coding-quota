@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Devin provider card: the weekly quota is fetched live from the CLI banner via a hidden `conhost.exe` launch of `devin.exe` (safe alongside running Devin tasks), and the daily quota is merged in from the CLI's `user_status` cache. Helper processes are spawned without console windows, so the widget no longer flashes a black console every refresh round.
+- Providers hidden in the tray menu are now skipped entirely — no requests and no token refresh, treating hidden as unsubscribed. The CLI and TUI still fetch all providers.
+
+### Fixed
+
+- The last-good cache now merges successful reports per provider instead of rewriting the whole file per round, so a partially failed round no longer discards good data for the other providers.
+
 ### Changed
 
 - Renamed the executables: `coding-quota-tui.exe` (terminal TUI/CLI, was `coding-quota.exe`) and `coding-quota-gui.exe` (desktop widget, was `coding-quota-desktop.exe`).

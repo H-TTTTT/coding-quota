@@ -16,6 +16,7 @@ All notable changes to this project are documented in this file.
 ### Fixed
 
 - The tray icon is now removed when the widget exits: the add/delete calls used different icon ids, and the normal exit path never reached the tray thread's cleanup. The icon is now deleted synchronously from `on_exit`.
+- Devin's daily quota line no longer disappears while a quota is exhausted: the `user_status` protobuf omits zero-valued fields (proto3), which used to make the whole cache read fail. Missing fields are now treated as 0% remaining.
 
 ### Changed
 

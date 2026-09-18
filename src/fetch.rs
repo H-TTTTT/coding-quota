@@ -705,7 +705,7 @@ fn parse_devin_cache_inner() -> Option<ProviderReport> {
         .and_then(|plan_msg| proto_field(&plan_msg, 2))
         .and_then(|bytes| proto_string(&bytes))
         .unwrap_or_else(|| "Unknown".into());
-    let weekly = proto_varint_field(&quota, 15)?;
+    let weekly = proto_varint_field(&quota, 15).unwrap_or(0);
     let weekly_reset = proto_varint_field(&quota, 18)
         .filter(|secs| *secs > 1_600_000_000)
         .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0));
@@ -713,7 +713,10 @@ fn parse_devin_cache_inner() -> Option<ProviderReport> {
         return None;
     }
     let mut windows = Vec::new();
-    if let Some(daily) = proto_varint_field(&quota, 14).filter(|d| (0..=100).contains(d)) {
+    // proto3 省略零值字段：额度耗尽时 f14/f15 干脆不出现，按 0% 剩余处理，
+    // 否则用尽期间日/周额度行会整行消失。
+    let daily = proto_varint_field(&quota, 14).unwrap_or(0);
+    if (0..=100).contains(&daily) {
         let daily_reset = proto_varint_field(&quota, 17)
             .filter(|secs| *secs > Utc::now().timestamp())
             .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0));

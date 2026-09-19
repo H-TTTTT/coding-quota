@@ -581,8 +581,7 @@ mod imp {
         let mut pixels = vec![0u8; size * size * 4];
         for py in 0..size {
             for px in 0..size {
-                let (mut acc_b, mut acc_g, mut acc_r, mut acc_a) =
-                    (0f32, 0f32, 0f32, 0f32);
+                let (mut acc_b, mut acc_g, mut acc_r, mut acc_a) = (0f32, 0f32, 0f32, 0f32);
                 for sy in 0..SS {
                     for sx in 0..SS {
                         let x = px as f32 + (sx as f32 + 0.5) / SS as f32;
@@ -611,14 +610,12 @@ mod imp {
                             while ang < 0.0 {
                                 ang += std::f32::consts::TAU;
                             }
-                            let in_cap1 = ((x - cap1.0) * (x - cap1.0)
-                                + (y - cap1.1) * (y - cap1.1))
-                                .sqrt()
-                                <= half_t;
-                            let in_cap2 = ((x - cap2.0) * (x - cap2.0)
-                                + (y - cap2.1) * (y - cap2.1))
-                                .sqrt()
-                                <= half_t;
+                            let in_cap1 =
+                                ((x - cap1.0) * (x - cap1.0) + (y - cap1.1) * (y - cap1.1)).sqrt()
+                                    <= half_t;
+                            let in_cap2 =
+                                ((x - cap2.0) * (x - cap2.0) + (y - cap2.1) * (y - cap2.1)).sqrt()
+                                    <= half_t;
                             let (cr, cg, cb, alpha) = if ang <= sweep || in_cap1 || in_cap2 {
                                 (arc.0, arc.1, arc.2, ring_cov)
                             } else {
@@ -673,7 +670,14 @@ mod imp {
             }],
         };
         let mut bits: *mut c_void = std::ptr::null_mut();
-        let color = CreateDIBSection(std::ptr::null_mut(), &info, 0, &mut bits, std::ptr::null_mut(), 0);
+        let color = CreateDIBSection(
+            std::ptr::null_mut(),
+            &info,
+            0,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        );
         if color.is_null() || bits.is_null() {
             return std::ptr::null_mut();
         }

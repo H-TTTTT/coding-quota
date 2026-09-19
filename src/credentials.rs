@@ -150,7 +150,10 @@ fn wsl_db_via_wsl_exe() -> Option<PathBuf> {
 
 fn path_looks_remote(path: &Path) -> bool {
     let raw = path.to_string_lossy();
-    raw.starts_with(r"\\") || raw.starts_with("//") || raw.contains("wsl.localhost") || raw.contains(r"wsl$")
+    raw.starts_with(r"\\")
+        || raw.starts_with("//")
+        || raw.contains("wsl.localhost")
+        || raw.contains(r"wsl$")
 }
 
 /// 只读打开的凭据库。远程/锁定场景会落到临时副本，ReadonlyDb 在 Drop 时
@@ -194,7 +197,12 @@ fn open_sqlite_readonly(path: &Path) -> Result<ReadonlyDb> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     if !path_looks_remote(path) {
         match Connection::open_with_flags(path, flags) {
-            Ok(conn) => return Ok(ReadonlyDb { conn: Some(conn), tmp: None }),
+            Ok(conn) => {
+                return Ok(ReadonlyDb {
+                    conn: Some(conn),
+                    tmp: None,
+                })
+            }
             Err(err) if !is_lock_error(&err) => {
                 return Err(err).with_context(|| format!("open {}", path.display()));
             }
@@ -210,7 +218,9 @@ fn open_sqlite_readonly(path: &Path) -> Result<ReadonlyDb> {
             if src.is_file() {
                 let dest = tmp.with_file_name(format!(
                     "{}{suffix}",
-                    tmp.file_name().and_then(|n| n.to_str()).unwrap_or("agent.db")
+                    tmp.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("agent.db")
                 ));
                 let _ = std::fs::copy(&src, dest);
             }
@@ -281,7 +291,10 @@ fn load_from_sqlite(path: &Path, set: &mut CredentialSet) -> Result<()> {
 
 fn parse_cred(provider: &str, credential_type: &str, identity_key: &str, data: &str) -> StoredCred {
     let value: Value = serde_json::from_str(data).unwrap_or(Value::Null);
-    let access = first_string(&value, &["access", "access_token", "key", "apiKey", "api_key"]);
+    let access = first_string(
+        &value,
+        &["access", "access_token", "key", "apiKey", "api_key"],
+    );
     let refresh = first_string(&value, &["refresh", "refresh_token"]);
     let expires_ms = first_i64(&value, &["expires", "expiresAt", "expires_at"]);
     let account_id = first_string(&value, &["accountId", "account_id"]);
@@ -308,7 +321,10 @@ fn pretty_identity(identity_key: &str, email: Option<&str>) -> String {
     }
     identity_key
         .split('|')
-        .find_map(|part| part.strip_prefix("email:").or_else(|| part.strip_prefix("account:")))
+        .find_map(|part| {
+            part.strip_prefix("email:")
+                .or_else(|| part.strip_prefix("account:"))
+        })
         .unwrap_or(identity_key)
         .to_string()
 }
@@ -339,7 +355,9 @@ fn first_i64(value: &Value, keys: &[&str]) -> Option<i64> {
 }
 
 fn apply_env_overrides(set: &mut CredentialSet) {
-    if let Ok(key) = std::env::var("ZHIPU_API_KEY").or_else(|_| std::env::var("ZHIPU_CODING_PLAN_API_KEY")) {
+    if let Ok(key) =
+        std::env::var("ZHIPU_API_KEY").or_else(|_| std::env::var("ZHIPU_CODING_PLAN_API_KEY"))
+    {
         if !key.trim().is_empty() {
             set.glm = Some(api_key_cred(&key));
         }
@@ -375,7 +393,11 @@ pub fn secret_from_omp(provider: &str, force_refresh: bool) -> Option<String> {
     if force_refresh {
         shell.push_str(" --force-refresh");
     }
-    token_from_output(hidden_command("wsl.exe").args(["-e", "sh", "-c", &shell]).output())
+    token_from_output(
+        hidden_command("wsl.exe")
+            .args(["-e", "sh", "-c", &shell])
+            .output(),
+    )
 }
 
 fn token_from_output(output: std::io::Result<std::process::Output>) -> Option<String> {
@@ -393,20 +415,30 @@ fn token_from_output(output: std::io::Result<std::process::Output>) -> Option<St
 
 pub fn chatgpt_account_id(token: &str, fallback: Option<&str>) -> Option<String> {
     jwt_claim(token, "https://api.openai.com/auth")
-        .and_then(|v| v.get("chatgpt_account_id").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("chatgpt_account_id")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        })
         .or_else(|| fallback.map(|s| s.to_string()))
 }
 
 pub fn jwt_email(token: &str) -> Option<String> {
-    jwt_claim(token, "https://api.openai.com/profile")
-        .and_then(|v| v.get("email").and_then(|x| x.as_str()).map(|s| s.to_string()))
+    jwt_claim(token, "https://api.openai.com/profile").and_then(|v| {
+        v.get("email")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+    })
 }
 
 fn jwt_claim(token: &str, key: &str) -> Option<Value> {
     let payload = token.split('.').nth(1)?;
-    let decoded = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
-        .or_else(|_| base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE, payload))
-        .ok()?;
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
+            .or_else(|_| {
+                base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE, payload)
+            })
+            .ok()?;
     let json: Value = serde_json::from_slice(&decoded).ok()?;
     json.get(key).cloned()
 }
@@ -468,8 +500,14 @@ mod tests {
             )?;
             let mut logged_out = CredentialSet::default();
             load_from_sqlite(&path, &mut logged_out)?;
-            assert!(logged_out.grok.is_none(), "soft-deleted credentials must not authorize Grok");
-            assert!(logged_out.kimi.is_some(), "other active providers must remain available");
+            assert!(
+                logged_out.grok.is_none(),
+                "soft-deleted credentials must not authorize Grok"
+            );
+            assert!(
+                logged_out.kimi.is_some(),
+                "other active providers must remain available"
+            );
 
             db.execute(
                 "UPDATE auth_credentials SET disabled_cause = NULL WHERE provider = 'xai-oauth'",

@@ -197,7 +197,6 @@ mod win32 {
         let corner = DWMWCP_ROUND;
         DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, 4);
     }
-
 }
 
 #[cfg(windows)]
@@ -446,7 +445,9 @@ impl eframe::App for DesktopApp {
         // 记录窗口位置：拖动中限频落盘，关闭时由 on_exit 兜底
         if let Some(outer) = ctx.input(|input| {
             let v = input.viewport();
-            (v.minimized != Some(true)).then_some(v.outer_rect).flatten()
+            (v.minimized != Some(true))
+                .then_some(v.outer_rect)
+                .flatten()
         }) {
             if !self.pos_guard_done {
                 self.pos_guard_done = true;
@@ -809,18 +810,13 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                         });
                     ui.add(bar);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(extra)
-                                .size(11.0)
-                                .color(main),
-                        );
+                        ui.label(egui::RichText::new(extra).size(11.0).color(main));
                     });
                 });
                 ui.add_space(2.0);
             }
         });
 }
-
 
 fn remaining_color(remaining: f32) -> egui::Color32 {
     if remaining <= 0.10 {

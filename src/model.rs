@@ -53,7 +53,12 @@ pub struct QuotaWindow {
 }
 
 impl QuotaWindow {
-    pub fn from_used_percent(id: &str, label: &str, used_percent: f64, reset_at: Option<DateTime<Utc>>) -> Self {
+    pub fn from_used_percent(
+        id: &str,
+        label: &str,
+        used_percent: f64,
+        reset_at: Option<DateTime<Utc>>,
+    ) -> Self {
         Self {
             id: id.to_string(),
             label: label.to_string(),
@@ -73,7 +78,11 @@ impl QuotaWindow {
         unit: &str,
         reset_at: Option<DateTime<Utc>>,
     ) -> Self {
-        let used_fraction = if limit > 0.0 { (used / limit).clamp(0.0, 1.0) } else { 0.0 };
+        let used_fraction = if limit > 0.0 {
+            (used / limit).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         Self {
             id: id.to_string(),
             label: label.to_string(),

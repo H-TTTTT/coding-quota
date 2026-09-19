@@ -9,7 +9,11 @@ use std::time::Duration;
 const UA: &str = "coding-quota/0.1";
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-pub async fn fetch_all(creds: &CredentialSet, only: Option<ProviderId>, skip: &[ProviderId]) -> Snapshot {
+pub async fn fetch_all(
+    creds: &CredentialSet,
+    only: Option<ProviderId>,
+    skip: &[ProviderId],
+) -> Snapshot {
     let client = match reqwest::Client::builder().timeout(TIMEOUT).build() {
         Ok(client) => client,
         Err(err) => {
@@ -38,7 +42,13 @@ pub async fn fetch_all(creds: &CredentialSet, only: Option<ProviderId>, skip: &[
         maybe_fetch(&client, ProviderId::Grok, creds.grok.clone(), only, skip),
         maybe_fetch(&client, ProviderId::Glm, creds.glm.clone(), only, skip),
         maybe_fetch(&client, ProviderId::Kimi, creds.kimi.clone(), only, skip),
-        maybe_fetch(&client, ProviderId::Cursor, creds.cursor.clone(), only, skip),
+        maybe_fetch(
+            &client,
+            ProviderId::Cursor,
+            creds.cursor.clone(),
+            only,
+            skip
+        ),
         maybe_devin(only, skip),
     );
 
@@ -79,8 +89,7 @@ async fn maybe_fetch(
     })
 }
 
-type FetchFuture<'a> =
-    std::pin::Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
+type FetchFuture<'a> = std::pin::Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
 
 /// Resolves a token, runs the request, and on HTTP 401 force-refreshes the
 /// token through omp and retries once.
@@ -165,22 +174,39 @@ fn parse_glm(identity: Option<String>, body: Value) -> ProviderReport {
         if let Some(window) = glm_count_window(id, label, limit, reset) {
             windows.push(window);
         } else {
-            windows.push(QuotaWindow::from_used_percent(id, label, used_percent, reset));
+            windows.push(QuotaWindow::from_used_percent(
+                id,
+                label,
+                used_percent,
+                reset,
+            ));
         }
     }
     if windows.is_empty() {
         return ProviderReport::err(ProviderId::Glm, identity, "no quota windows");
     }
-    ProviderReport::ok(ProviderId::Glm, "Zhipu Coding Plan", identity, plan, windows)
+    ProviderReport::ok(
+        ProviderId::Glm,
+        "Zhipu Coding Plan",
+        identity,
+        plan,
+        windows,
+    )
 }
 
-fn glm_count_window(id: &str, label: &str, limit: &Value, reset: Option<DateTime<Utc>>) -> Option<QuotaWindow> {
+fn glm_count_window(
+    id: &str,
+    label: &str,
+    limit: &Value,
+    reset: Option<DateTime<Utc>>,
+) -> Option<QuotaWindow> {
     let used = number(limit.get("currentValue")).or_else(|| number(limit.get("usage")))?;
-    let total = number(limit.get("number")).or_else(|| {
-        number(limit.get("remaining")).map(|remain| used + remain)
-    })?;
+    let total = number(limit.get("number"))
+        .or_else(|| number(limit.get("remaining")).map(|remain| used + remain))?;
     if total > 1.0 {
-        Some(QuotaWindow::from_used_limit(id, label, used, total, "count", reset))
+        Some(QuotaWindow::from_used_limit(
+            id, label, used, total, "count", reset,
+        ))
     } else {
         None
     }
@@ -189,7 +215,11 @@ fn glm_count_window(id: &str, label: &str, limit: &Value, reset: Option<DateTime
 async fn fetch_kimi(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
     let identity = cred.identity.clone();
     match fetch_with_refresh(client, &cred, "kimi-code", |client, token| {
-        Box::pin(get_json(client, "https://api.kimi.com/coding/v1/usages", bearer(token)))
+        Box::pin(get_json(
+            client,
+            "https://api.kimi.com/coding/v1/usages",
+            bearer(token),
+        ))
     })
     .await
     {
@@ -299,12 +329,19 @@ fn kimi_window_label(item: &Value, idx: usize) -> String {
 fn usage_row(id: &str, data: &Value, default_label: &str) -> Option<QuotaWindow> {
     let limit = number(data.get("limit"));
     let used = number(data.get("used")).or_else(|| {
-        number(data.get("remaining")).zip(limit).map(|(remain, limit)| (limit - remain).max(0.0))
+        number(data.get("remaining"))
+            .zip(limit)
+            .map(|(remain, limit)| (limit - remain).max(0.0))
     });
     let reset = parse_reset(data);
-    let label = data.get("name").and_then(|v| v.as_str()).unwrap_or(default_label);
+    let label = data
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(default_label);
     match (used, limit) {
-        (Some(used), Some(limit)) => Some(QuotaWindow::from_used_limit(id, label, used, limit, "count", reset)),
+        (Some(used), Some(limit)) => Some(QuotaWindow::from_used_limit(
+            id, label, used, limit, "count", reset,
+        )),
         (Some(used), None) => Some(QuotaWindow::from_used_percent(id, label, used, reset)),
         _ => None,
     }
@@ -314,9 +351,16 @@ async fn fetch_grok(client: &reqwest::Client, cred: StoredCred) -> ProviderRepor
     let identity = cred.identity.clone();
     match fetch_with_refresh(client, &cred, "xai-oauth", |client, token| {
         let mut headers = bearer(token);
-        headers.insert("x-grok-client-surface", HeaderValue::from_static("grok-build"));
+        headers.insert(
+            "x-grok-client-surface",
+            HeaderValue::from_static("grok-build"),
+        );
         headers.insert("x-grok-client-version", HeaderValue::from_static("1.0.0"));
-        Box::pin(get_json(client, "https://cli-chat-proxy.grok.com/v1/billing?format=credits", headers))
+        Box::pin(get_json(
+            client,
+            "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+            headers,
+        ))
     })
     .await
     {
@@ -330,7 +374,11 @@ fn parse_grok(identity: Option<String>, body: Value) -> ProviderReport {
     let period = config.get("currentPeriod").cloned().unwrap_or(Value::Null);
     let used_percent = number(config.get("creditUsagePercent")).unwrap_or(0.0);
     let reset = parse_iso(period.get("end")).or_else(|| parse_iso(config.get("billingPeriodEnd")));
-    let kind = period.get("type").and_then(|v| v.as_str()).unwrap_or("").to_ascii_uppercase();
+    let kind = period
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_uppercase();
     let label = if kind.contains("WEEK") {
         "Weekly credits"
     } else if kind.contains("MONTH") {
@@ -343,7 +391,12 @@ fn parse_grok(identity: Option<String>, body: Value) -> ProviderReport {
         "xAI Grok",
         identity,
         None,
-        vec![QuotaWindow::from_used_percent("grok-credits", label, used_percent, reset)],
+        vec![QuotaWindow::from_used_percent(
+            "grok-credits",
+            label,
+            used_percent,
+            reset,
+        )],
     )
 }
 
@@ -352,12 +405,18 @@ async fn fetch_codex(client: &reqwest::Client, cred: StoredCred) -> ProviderRepo
     let account_fallback = cred.account_id.clone();
     let result = fetch_with_refresh(client, &cred, "openai-codex", move |client, token| {
         let mut headers = bearer(token);
-        if let Some(account_id) = credentials::chatgpt_account_id(token, account_fallback.as_deref()) {
+        if let Some(account_id) =
+            credentials::chatgpt_account_id(token, account_fallback.as_deref())
+        {
             if let Ok(value) = HeaderValue::from_str(&account_id) {
                 headers.insert("ChatGPT-Account-Id", value);
             }
         }
-        Box::pin(get_json(client, "https://chatgpt.com/backend-api/wham/usage", headers))
+        Box::pin(get_json(
+            client,
+            "https://chatgpt.com/backend-api/wham/usage",
+            headers,
+        ))
     })
     .await;
     match result {
@@ -386,8 +445,13 @@ fn parse_codex(identity: Option<String>, plan: Option<String>, body: Value) -> P
     if windows.is_empty() {
         return ProviderReport::err(ProviderId::Codex, identity, "no quota windows");
     }
-    let mut report =
-        ProviderReport::ok(ProviderId::Codex, "OpenAI Codex", identity, plan_label, windows);
+    let mut report = ProviderReport::ok(
+        ProviderId::Codex,
+        "OpenAI Codex",
+        identity,
+        plan_label,
+        windows,
+    );
     report.resets_left =
         number(body.pointer("/rate_limit_reset_credits/available_count")).map(|value| value as i64);
     report
@@ -395,7 +459,9 @@ fn parse_codex(identity: Option<String>, plan: Option<String>, body: Value) -> P
 
 fn push_codex_window(windows: &mut Vec<QuotaWindow>, raw: Option<&Value>, review: bool) {
     let Some(window) = raw else { return };
-    let Some(used_percent) = number(window.get("used_percent")) else { return };
+    let Some(used_percent) = number(window.get("used_percent")) else {
+        return;
+    };
     let seconds = number(window.get("limit_window_seconds")).unwrap_or(0.0) as i64;
     let (mut id, mut label) = match seconds {
         18000 => ("codex-5h", "5h"),
@@ -412,10 +478,19 @@ fn push_codex_window(windows: &mut Vec<QuotaWindow>, raw: Option<&Value>, review
     }
     let reset = unix_to_dt(number(window.get("reset_at")))
         .or_else(|| seconds_from_now(number(window.get("reset_after_seconds"))));
-    windows.push(QuotaWindow::from_used_percent(id, label, used_percent, reset));
+    windows.push(QuotaWindow::from_used_percent(
+        id,
+        label,
+        used_percent,
+        reset,
+    ));
 }
 
-async fn get_json(client: &reqwest::Client, url: &str, headers: HeaderMap) -> Result<Value, String> {
+async fn get_json(
+    client: &reqwest::Client,
+    url: &str,
+    headers: HeaderMap,
+) -> Result<Value, String> {
     let response = client
         .get(url)
         .headers(headers)
@@ -430,7 +505,11 @@ async fn get_json(client: &reqwest::Client, url: &str, headers: HeaderMap) -> Re
     serde_json::from_str(&text).map_err(|_| "invalid JSON".to_string())
 }
 
-async fn post_json(client: &reqwest::Client, url: &str, mut headers: HeaderMap) -> Result<Value, String> {
+async fn post_json(
+    client: &reqwest::Client,
+    url: &str,
+    mut headers: HeaderMap,
+) -> Result<Value, String> {
     headers.insert("Content-Type", HeaderValue::from_static("application/json"));
     let response = client
         .post(url)
@@ -512,7 +591,9 @@ fn parse_reset(data: &Value) -> Option<DateTime<Utc>> {
                 return Some(dt.with_timezone(&Utc));
             }
         }
-        if let Some(dt) = unix_to_dt(number(data.get(key))).or_else(|| millis_to_dt(number(data.get(key)))) {
+        if let Some(dt) =
+            unix_to_dt(number(data.get(key))).or_else(|| millis_to_dt(number(data.get(key))))
+        {
             return Some(dt);
         }
     }
@@ -605,22 +686,25 @@ fn fetch_devin_banner() -> ProviderReport {
     if let Some(trusted) = devin_trusted_cwd() {
         command.current_dir(trusted);
     }
-    let Ok(mut child) = command
-        .spawn()
-    else {
+    let Ok(mut child) = command.spawn() else {
         return ProviderReport::err(ProviderId::Devin, None, "无法启动 devin.exe");
     };
     let mut stdout = child.stdout.take();
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         use std::io::Read;
-        let Some(stream) = stdout.as_mut() else { return };
+        let Some(stream) = stdout.as_mut() else {
+            return;
+        };
         let mut chunk = [0u8; 8192];
         loop {
             match stream.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if tx.send(String::from_utf8_lossy(&chunk[..n]).into_owned()).is_err() {
+                    if tx
+                        .send(String::from_utf8_lossy(&chunk[..n]).into_owned())
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -666,13 +750,14 @@ fn fetch_devin_banner() -> ProviderReport {
                     windows.extend(cached.windows.into_iter().filter(|w| w.id == "daily"));
                 }
             }
-            windows.push(QuotaWindow::from_used_percent("weekly", "Weekly", used, reset_at));
+            windows.push(QuotaWindow::from_used_percent(
+                "weekly", "Weekly", used, reset_at,
+            ));
             ProviderReport::ok(ProviderId::Devin, "Devin", None, Some(plan), windows)
         }
         None => ProviderReport::err(ProviderId::Devin, None, "未从 devin 横幅捕获到额度"),
     }
 }
-
 
 /// 从 user_status 缓存读额度。缓存是 JSON 包 base64 的 protobuf，f13 内关键字段：
 /// f1.2=套餐名，f14=日额度剩余%，f15=周额度剩余%，
@@ -684,9 +769,7 @@ fn parse_devin_cache() -> Option<ProviderReport> {
 
 fn parse_devin_cache_inner() -> Option<ProviderReport> {
     let local = std::env::var_os("LOCALAPPDATA")?;
-    let dir = std::path::PathBuf::from(local)
-        .join("devin")
-        .join("cli");
+    let dir = std::path::PathBuf::from(local).join("devin").join("cli");
     let newest = std::fs::read_dir(&dir)
         .ok()?
         .filter_map(Result::ok)
@@ -821,7 +904,6 @@ fn proto_varint_at(data: &[u8], start: usize) -> Option<(u64, usize)> {
     }
     None
 }
-
 
 fn proto_string(data: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(data).into_owned())

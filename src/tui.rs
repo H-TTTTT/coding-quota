@@ -1,12 +1,10 @@
+use anyhow::Result;
+use chrono::Utc;
 use coding_quota::cache;
 use coding_quota::credentials::{self, CredentialSet};
 use coding_quota::fetch;
 use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
-use coding_quota::render::{
-    ago_cn, bar_parts, compact_until_cn, label_cn, status_color, title_cn,
-};
-use anyhow::Result;
-use chrono::Utc;
+use coding_quota::render::{ago_cn, bar_parts, compact_until_cn, label_cn, status_color, title_cn};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -33,7 +31,6 @@ const TUI_MIN_ROWS: u16 = 8;
 const TUI_MAX_ROWS: u16 = 48;
 const CHROME_ROWS: u16 = 5;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
 
 const FG_MUTED: Color = Color::DarkGray;
 const FG_ACCENT: Color = Color::Cyan;
@@ -144,9 +141,7 @@ mod native_drag {
     fn watch_drag(stop: Arc<AtomicBool>) {
         unsafe {
             const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
-            SetThreadDpiAwarenessContext(
-                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 as *mut c_void,
-            );
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 as *mut c_void);
         }
         let Some(hwnd) = find_terminal_window(&stop) else {
             return;
@@ -231,22 +226,12 @@ mod native_drag {
             const WS_OVERLAPPEDWINDOW: isize = 0x00CF_0000;
             const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
             const DWMWCP_DONOTROUND: u32 = 1;
-            DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_WINDOW_CORNER_PREFERENCE,
-                &DWMWCP_DONOTROUND,
-                4,
-            );
+            DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &DWMWCP_DONOTROUND, 4);
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
             SetWindowLongPtrW(hwnd, GWL_STYLE, style & !WS_OVERLAPPEDWINDOW);
             const DWMWA_NCRENDERING_POLICY: u32 = 2;
             const DWMNCRP_DISABLED: u32 = 1;
-            DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_NCRENDERING_POLICY,
-                &DWMNCRP_DISABLED,
-                4,
-            );
+            DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &DWMNCRP_DISABLED, 4);
             const DWMWA_BORDER_COLOR: u32 = 34;
             const NO_BORDER: u32 = 0xFFFF_FFFE;
             DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &NO_BORDER, 4);
@@ -262,11 +247,7 @@ mod native_drag {
                 0,
                 0,
                 0,
-                SWP_NOSIZE
-                    | SWP_NOMOVE
-                    | SWP_NOZORDER
-                    | SWP_NOACTIVATE
-                    | SWP_FRAMECHANGED,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
             thread::sleep(Duration::from_millis(50));
             clip_to_client(hwnd);
@@ -457,7 +438,12 @@ fn demo_snapshot() -> Snapshot {
         "OpenAI Codex",
         Some("demo@example.com".into()),
         Some("pro".into()),
-        vec![QuotaWindow::from_used_percent("7d", "7 days", 76.0, days(4))],
+        vec![QuotaWindow::from_used_percent(
+            "7d",
+            "7 days",
+            76.0,
+            days(4),
+        )],
     );
     codex.resets_left = Some(2);
     let reports = vec![
@@ -467,7 +453,12 @@ fn demo_snapshot() -> Snapshot {
             "xAI Grok",
             Some("demo@example.com".into()),
             None,
-            vec![QuotaWindow::from_used_percent("weekly", "Weekly credits", 8.0, days(3))],
+            vec![QuotaWindow::from_used_percent(
+                "weekly",
+                "Weekly credits",
+                8.0,
+                days(3),
+            )],
         ),
         ProviderReport::ok(
             ProviderId::Glm,
@@ -537,7 +528,10 @@ fn draw(frame: &mut Frame, snapshot: Option<&Snapshot>, spin: Option<usize>) {
         ));
     }
     let title_width = chunks[1].width as usize;
-    let right_width: usize = right_spans.iter().map(|s| display_width(s.content.as_ref())).sum();
+    let right_width: usize = right_spans
+        .iter()
+        .map(|s| display_width(s.content.as_ref()))
+        .sum();
     let used = TUI_LEFT_GUTTER + display_width("编程额度") + right_width;
     let pad = title_width.saturating_sub(used + 2);
     let mut title = vec![
@@ -562,7 +556,10 @@ fn draw(frame: &mut Frame, snapshot: Option<&Snapshot>, spin: Option<usize>) {
             Span::styled("[Q]", Style::default().fg(FG_ACCENT)),
             Span::styled(" 关闭  ", Style::default().add_modifier(Modifier::DIM)),
             Span::styled("[R]", Style::default().fg(FG_ACCENT)),
-            Span::styled(" 刷新  每 2 分钟自动刷新", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(
+                " 刷新  每 2 分钟自动刷新",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
         ])),
         chunks[5],
     );
@@ -611,11 +608,7 @@ fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<
         .iter()
         .map(|window| window.used_fraction)
         .fold(0.0_f64, f64::max);
-    let dot_color = if stale {
-        FG_MUTED
-    } else {
-        status_color(worst)
-    };
+    let dot_color = if stale { FG_MUTED } else { status_color(worst) };
 
     let title = report_title(report);
     let identity = report.identity.clone().unwrap_or_default();
@@ -661,9 +654,8 @@ fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<
     for window in &report.windows {
         let label = label_cn(&window.label);
         let reset = reset_text(window);
-        let label_pad = width.saturating_sub(
-            TUI_LEFT_GUTTER + display_width(&label) + display_width(&reset),
-        );
+        let label_pad =
+            width.saturating_sub(TUI_LEFT_GUTTER + display_width(&label) + display_width(&reset));
         lines.push(Line::from(vec![
             Span::raw(format!("{}{label}", " ".repeat(TUI_LEFT_GUTTER))),
             Span::raw(" ".repeat(label_pad)),
@@ -752,7 +744,6 @@ fn error_line(report: &ProviderReport) -> Option<String> {
     })
 }
 
-
 fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
@@ -766,5 +757,3 @@ fn resize_terminal(terminal: &mut AppTerminal, columns: u16, rows: u16) {
     }
     native_drag::end_resize();
 }
-
-

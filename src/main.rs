@@ -111,8 +111,7 @@ mod terminal_profile {
         let Some(directory) = fragment.parent() else {
             return false;
         };
-        std::fs::create_dir_all(directory).is_ok()
-            && std::fs::write(fragment, FRAGMENT).is_ok()
+        std::fs::create_dir_all(directory).is_ok() && std::fs::write(fragment, FRAGMENT).is_ok()
     }
 
     fn install_active_settings(local_app_data: &Path) -> Option<(bool, bool)> {
@@ -146,14 +145,19 @@ mod terminal_profile {
             let needs_padding = !settings.contains(r#""padding": "0, 2""#);
             if needs_padding {
                 let start = settings.find(GUID).unwrap_or(0);
-                let legacy = settings[start..].find(r#""padding": "0""#).map(|i| start + i);
+                let legacy = settings[start..]
+                    .find(r#""padding": "0""#)
+                    .map(|i| start + i);
                 if let Some(index) = legacy {
                     let backup = path.with_file_name("settings.json.coding-quota-backup");
                     if !backup.exists() && std::fs::copy(path, &backup).is_err() {
                         return (false, false);
                     }
                     let mut updated = settings;
-                    updated.replace_range(index..index + r#""padding": "0""#.len(), r#""padding": "0, 2""#);
+                    updated.replace_range(
+                        index..index + r#""padding": "0""#.len(),
+                        r#""padding": "0, 2""#,
+                    );
                     return (std::fs::write(path, updated).is_ok(), true);
                 }
             }
@@ -162,7 +166,9 @@ mod terminal_profile {
         let Some(profiles) = settings.find("\"profiles\"") else {
             return (false, false);
         };
-        let Some(list) = settings[profiles..].find("\"list\"").map(|index| profiles + index)
+        let Some(list) = settings[profiles..]
+            .find("\"list\"")
+            .map(|index| profiles + index)
         else {
             return (false, false);
         };
@@ -325,7 +331,6 @@ fn launch_focused_tui() -> bool {
         return false;
     };
 
-
     std::env::set_var(HOSTED, "1");
     let size = format!("{},{}", tui::TUI_COLUMNS, tui::TUI_ROWS);
     let mut command = std::process::Command::new("wt.exe");
@@ -337,11 +342,7 @@ fn launch_focused_tui() -> bool {
         command.args(["--profile", terminal_profile::NAME]);
     }
     let launched = command
-        .args([
-            "--suppressApplicationTitle",
-            "--title",
-            "编程额度",
-        ])
+        .args(["--suppressApplicationTitle", "--title", "编程额度"])
         .arg(executable)
         .args(std::env::args_os().skip(1))
         .spawn()
@@ -362,10 +363,9 @@ async fn main() -> Result<()> {
     enable_windows_console();
     let cli = Cli::parse();
     let only = match cli.provider.as_deref() {
-        Some(raw) => Some(
-            ProviderId::parse_filter(raw)
-                .ok_or_else(|| anyhow::anyhow!("unknown provider `{raw}` (codex|grok|glm|kimi|cursor|devin)"))?,
-        ),
+        Some(raw) => Some(ProviderId::parse_filter(raw).ok_or_else(|| {
+            anyhow::anyhow!("unknown provider `{raw}` (codex|grok|glm|kimi|cursor|devin)")
+        })?),
         None => None,
     };
     let interactive = !cli.json && !cli.snapshot && cli.watch.is_none();
@@ -396,7 +396,9 @@ async fn main() -> Result<()> {
         }
         print!("{}", render::snapshot_text(&snapshot));
         match cli.watch {
-            Some(secs) if secs > 0 => tokio::time::sleep(std::time::Duration::from_secs(secs)).await,
+            Some(secs) if secs > 0 => {
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await
+            }
             _ => break,
         }
     }

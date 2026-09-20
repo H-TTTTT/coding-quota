@@ -643,7 +643,12 @@ async fn maybe_devin(only: Option<ProviderId>, skip: &[ProviderId]) -> Option<Pr
     if only.is_some_and(|wanted| wanted != ProviderId::Devin) || skip.contains(&ProviderId::Devin) {
         return None;
     }
-    Some(fetch_devin())
+    // fetch_devin 是同步阻塞（等横幅最长 25s）：在 tokio::join! 里直接调用会
+    // 冻结同任务的其他 provider，全部跟着超时。挪到 blocking 线程池。
+    let report = tokio::task::spawn_blocking(fetch_devin)
+        .await
+        .unwrap_or_else(|_| ProviderReport::err(ProviderId::Devin, None, "devin 刷新线程异常"));
+    Some(report)
 }
 
 fn devin_executable() -> Option<std::path::PathBuf> {

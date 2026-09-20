@@ -1012,12 +1012,23 @@ fn parse_devin_banner(text: &str) -> Option<(String, f64, Option<String>)> {
         if plan.is_empty() {
             continue;
         }
-        // 无头 conhost 会把「Unsupported terminal」警告挤进横幅同一行，
-        // 形如「…for the best experience Pro · 0% remaining …」，剥掉已知噪声前缀。
+        // 无头 conhost 会把 TUI 提示挤进横幅同一行：模型选择器
+        // 「SWE-2 Max … Press alt+m to switch between available models」、
+        // 「clipboard」图标文字、「Unsupported terminal」警告等，且常与套餐名
+        // 无空格粘连（clipboardPro）。套餐名取行尾已知套餐词的后缀匹配。
+        let plan = plan
+            .rsplit_once("available models")
+            .map(|(_, tail)| tail.trim())
+            .unwrap_or(plan);
         let plan = plan
             .rsplit_once("best experience")
             .map(|(_, tail)| tail.trim())
             .unwrap_or(plan);
+        let plan = ["Enterprise", "Team", "Free", "Pro", "Max", "Core"]
+            .iter()
+            .find(|name| plan.ends_with(*name))
+            .map(|name| *name)
+            .unwrap_or_else(|| plan.split_whitespace().last().unwrap_or(plan));
         let reset = reset_part.trim();
         return Some((
             plan.to_string(),

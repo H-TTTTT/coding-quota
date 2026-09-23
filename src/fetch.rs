@@ -224,25 +224,57 @@ fn glm_count_window(
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 
+/// 套餐名很少变：进程内按账号记住 6 小时，避免每轮刷新都多查一次 profile。
+/// usage 接口限流很紧（与 omp / Claude Code 共用同一账号额度，omp 遇到 429 也不重试）。
+const CLAUDE_PLAN_TTL: Duration = Duration::from_secs(6 * 3600);
+type ClaudePlanMemo = Option<(Option<String>, String, std::time::Instant)>;
+static CLAUDE_PLAN: std::sync::Mutex<ClaudePlanMemo> = std::sync::Mutex::new(None);
+
+fn remembered_claude_plan(identity: Option<&str>) -> Option<String> {
+    let memo = CLAUDE_PLAN.lock().ok()?;
+    let (who, plan, at) = memo.as_ref()?;
+    (who.as_deref() == identity && at.elapsed() < CLAUDE_PLAN_TTL).then(|| plan.clone())
+}
+
+fn remember_claude_plan(identity: Option<&str>, plan: &str) {
+    if let Ok(mut memo) = CLAUDE_PLAN.lock() {
+        *memo = Some((
+            identity.map(str::to_string),
+            plan.to_string(),
+            std::time::Instant::now(),
+        ));
+    }
+}
+
 /// Claude 订阅（Pro / Max）额度：Claude Code `/usage` 用的同一个 OAuth 接口。
 /// profile 只用来识别套餐，失败不影响额度显示；两者用同一 token，401 时一起刷新重试。
 async fn fetch_claude(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
     let identity = cred.identity.clone();
-    match fetch_with_refresh(client, &cred, "anthropic", |client, token| {
+    let remembered = remembered_claude_plan(identity.as_deref());
+    let need_profile = remembered.is_none();
+    match fetch_with_refresh(client, &cred, "anthropic", move |client, token| {
         Box::pin(async move {
-            let (usage, profile) = tokio::join!(
-                get_json(client, CLAUDE_USAGE_URL, claude_headers(token)),
-                get_json(client, CLAUDE_PROFILE_URL, claude_headers(token)),
-            );
-            Ok(serde_json::json!({
-                "usage": usage?,
-                "profile": profile.unwrap_or(Value::Null),
-            }))
+            let usage = get_json(client, CLAUDE_USAGE_URL, claude_headers(token));
+            let (usage, profile) = if need_profile {
+                let profile = get_json(client, CLAUDE_PROFILE_URL, claude_headers(token));
+                let (usage, profile) = tokio::join!(usage, profile);
+                (usage, profile.unwrap_or(Value::Null))
+            } else {
+                (usage.await, Value::Null)
+            };
+            Ok(serde_json::json!({ "usage": usage?, "profile": profile }))
         })
     })
     .await
     {
-        Ok((_, body)) => parse_claude(identity, &body["usage"], &body["profile"]),
+        Ok((_, body)) => {
+            let plan = remembered.or_else(|| {
+                let plan = claude_plan(&body["profile"])?;
+                remember_claude_plan(identity.as_deref(), &plan);
+                Some(plan)
+            });
+            parse_claude(identity, &body["usage"], plan)
+        }
         Err(err) => ProviderReport::err(ProviderId::Claude, identity, err),
     }
 }
@@ -250,7 +282,7 @@ async fn fetch_claude(client: &reqwest::Client, cred: StoredCred) -> ProviderRep
 /// 旧字段 five_hour / seven_day / seven_day_{opus,sonnet} 与新版 limits 数组
 /// （kind = session / weekly_all / weekly_scoped）并存、正在迁移：旧字段优先，
 /// 缺失时回落到 limits（与 omp 取法一致）。utilization / percent 都是 0–100 的已用百分比。
-fn parse_claude(identity: Option<String>, usage: &Value, profile: &Value) -> ProviderReport {
+fn parse_claude(identity: Option<String>, usage: &Value, plan: Option<String>) -> ProviderReport {
     let limits = usage
         .get("limits")
         .and_then(Value::as_array)
@@ -303,13 +335,7 @@ fn parse_claude(identity: Option<String>, usage: &Value, profile: &Value) -> Pro
     if windows.is_empty() {
         return ProviderReport::err(ProviderId::Claude, identity, "no quota windows");
     }
-    ProviderReport::ok(
-        ProviderId::Claude,
-        "Claude",
-        identity,
-        claude_plan(profile),
-        windows,
-    )
+    ProviderReport::ok(ProviderId::Claude, "Claude", identity, plan, windows)
 }
 
 fn claude_window(id: &str, label: &str, bucket: Option<&Value>) -> Option<QuotaWindow> {
@@ -649,7 +675,7 @@ async fn get_json(
     let status = response.status();
     let text = response.text().await.map_err(|err| brief(&err))?;
     if !status.is_success() {
-        return Err(format!("HTTP {status}: {}", snippet(&text)));
+        return Err(http_error(status, &text));
     }
     serde_json::from_str(&text).map_err(|_| "invalid JSON".to_string())
 }
@@ -670,7 +696,7 @@ async fn post_json(
     let status = response.status();
     let text = response.text().await.map_err(|err| brief(&err))?;
     if !status.is_success() {
-        return Err(format!("HTTP {status}: {}", snippet(&text)));
+        return Err(http_error(status, &text));
     }
     serde_json::from_str(&text).map_err(|_| "invalid JSON".to_string())
 }
@@ -785,6 +811,16 @@ fn snippet(text: &str) -> String {
     sanitize(&flat)
 }
 
+/// HTTP 错误压成一行。429 的响应体（各家都是一大段 JSON）对用户没有信息量，
+/// 原样塞进挂件会把窗口撑到最大宽度，只说限流即可。
+fn http_error(status: reqwest::StatusCode, text: &str) -> String {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        "HTTP 429 请求过于频繁，稍后自动重试".to_string()
+    } else {
+        format!("HTTP {status}: {}", snippet(text))
+    }
+}
+
 fn sanitize(text: &str) -> String {
     let mut out = text.to_string();
     for key in ["Bearer ", "eyJ"] {
@@ -821,8 +857,8 @@ fn devin_executable() -> Option<std::path::PathBuf> {
 }
 
 fn fetch_devin() -> ProviderReport {
-    // 横幅是实时数据（周额度）。实测 devin 运行中并行拉起互不影响
-    // （用户日常就高频多开；清理用 PID 树精确终止，不留孤儿）。
+    // 横幅是实时数据（日/周中更紧的那个，见 merge_devin_banner）。实测 devin
+    // 运行中并行拉起互不影响（用户日常就高频多开；清理用 PID 树精确终止，不留孤儿）。
     // 横幅失败再退回 user_status 缓存兜底。
     let report = fetch_devin_banner();
     if report.error.is_some() {
@@ -901,25 +937,72 @@ fn fetch_devin_banner() -> ProviderReport {
 
     match banner {
         Some((plan, remaining, reset_in)) => {
+            let now = Utc::now();
             let reset_at = reset_in
                 .as_deref()
                 .and_then(parse_devin_reset)
-                .map(|secs| Utc::now() + chrono::Duration::seconds(secs));
-            let used = 100.0 - remaining;
-            let mut windows = Vec::new();
-            // 日额度只在 user_status 缓存里（横幅和我们拉起的实例都不写/不含它）；
-            // 同账号时把缓存里的日额度行带上，周额度用横幅的实时值。
-            if let Some(cached) = parse_devin_cache() {
-                if cached.plan.as_deref() == Some(plan.as_str()) {
-                    windows.extend(cached.windows.into_iter().filter(|w| w.id == "daily"));
-                }
-            }
-            windows.push(QuotaWindow::from_used_percent(
-                "weekly", "Weekly", used, reset_at,
-            ));
+                .map(|secs| now + chrono::Duration::seconds(secs));
+            // 缓存只在同账号（同套餐名）时可用
+            let cached = parse_devin_cache()
+                .filter(|cached| cached.plan.as_deref() == Some(plan.as_str()))
+                .map(|cached| cached.windows)
+                .unwrap_or_default();
+            let windows = merge_devin_banner(100.0 - remaining, reset_at, &cached, now);
             ProviderReport::ok(ProviderId::Devin, "Devin", None, Some(plan), windows)
         }
         None => ProviderReport::err(ProviderId::Devin, None, "未从 devin 横幅捕获到额度"),
+    }
+}
+
+/// devin 横幅只显示日/周额度里「更紧」的那一个：09-18 实测「9% · resets in 2d 4h」是
+/// 周额度（当时日额度 100%），09-23「15% · resets in 5h 17m」是日额度（周额度 58%）。
+/// 按重置时间认领：超过 1 天才重置的只能是周额度；与缓存里周额度的重置时刻（整周不变）
+/// 对得上的是周额度，否则是日额度。每周最后一天日/周同一时刻重置、两者都对得上时，
+/// 取缓存里用得更多的那个。横幅值是实时的，另一个额度只能取缓存（真实 devin 会话
+/// 启动时才刷新）。
+fn merge_devin_banner(
+    used_percent: f64,
+    reset_at: Option<DateTime<Utc>>,
+    cached: &[QuotaWindow],
+    now: DateTime<Utc>,
+) -> Vec<QuotaWindow> {
+    // 横幅超过 1 天时只精确到小时（「2d 4h」）；日/周重置时刻要么相同要么相差整天，
+    // 2 小时余量足够区分。
+    const TOLERANCE_SECS: i64 = 2 * 3600;
+    let daily = cached.iter().find(|window| window.id == "daily");
+    let weekly = cached.iter().find(|window| window.id == "weekly");
+    let matches = |window: Option<&QuotaWindow>| match (reset_at, window.and_then(|w| w.reset_at)) {
+        (Some(banner), Some(cached)) => (banner - cached).num_seconds().abs() <= TOLERANCE_SECS,
+        _ => false,
+    };
+    let banner_is_weekly = match reset_at {
+        None => None,
+        Some(at) if (at - now).num_seconds() > 24 * 3600 + TOLERANCE_SECS => Some(true),
+        Some(_) => match (matches(weekly), matches(daily)) {
+            (true, true) => weekly
+                .zip(daily)
+                .map(|(weekly, daily)| weekly.used_fraction >= daily.used_fraction),
+            (true, false) => Some(true),
+            (false, _) if !cached.is_empty() => Some(false),
+            (false, _) => None,
+        },
+    };
+    let banner =
+        |id: &str, label: &str| QuotaWindow::from_used_percent(id, label, used_percent, reset_at);
+    match banner_is_weekly {
+        Some(true) => daily
+            .cloned()
+            .into_iter()
+            .chain([banner("weekly", "Weekly")])
+            .collect(),
+        Some(false) => [banner("daily", "Daily")]
+            .into_iter()
+            .chain(weekly.cloned())
+            .collect(),
+        // 认不出来（无缓存且 1 天内重置，或横幅没给重置时间）：有缓存用缓存，
+        // 否则如实标成「当前额度」，不硬套日/周。
+        None if !cached.is_empty() => cached.to_vec(),
+        None => vec![banner("current", "Current limit")],
     }
 }
 
@@ -1242,7 +1325,7 @@ mod tests {
                 "rate_limit_tier": "default_claude_max_20x"
             }
         });
-        let report = parse_claude(None, &usage, &profile);
+        let report = parse_claude(None, &usage, claude_plan(&profile));
         assert!(report.error.is_none(), "{:?}", report.error);
         assert_eq!(report.plan.as_deref(), Some("Max 20x"));
         let rows: Vec<(&str, f64)> = report
@@ -1270,5 +1353,51 @@ mod tests {
             assert_eq!(pct, 0.0);
             assert!(reset.is_some());
         }
+    }
+
+    /// 横幅只显示日/周里更紧的那个额度，必须按重置时间认领，不能一律当周额度
+    /// （09-23 实测：横幅「15% · resets in 5h 17m」是日额度，周额度实为 58%）。
+    #[test]
+    fn devin_banner_is_attributed_by_reset_time() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 23, 2, 42, 0).unwrap();
+        let at =
+            |hours: i64, minutes: i64| Some(now + chrono::Duration::minutes(hours * 60 + minutes));
+        let cached = |id: &str, remaining: f64, reset: Option<DateTime<Utc>>| {
+            QuotaWindow::from_used_percent(id, id, 100.0 - remaining, reset)
+        };
+        let summary = |windows: Vec<QuotaWindow>| -> Vec<String> {
+            windows
+                .iter()
+                .map(|w| format!("{}={:.0}", w.id, (1.0 - w.used_fraction) * 100.0))
+                .collect()
+        };
+
+        // 日额度更紧：横幅归日额度，周额度取缓存
+        let cache = [
+            cached("daily", 20.0, at(5, 18)),
+            cached("weekly", 58.0, at(101, 18)),
+        ];
+        let merged = merge_devin_banner(85.0, at(5, 17), &cache, now);
+        assert_eq!(summary(merged), ["daily=15", "weekly=58"]);
+
+        // 周最后一天且周额度更紧（日额度未动用，缓存里没有日重置时间）：横幅归周额度
+        let cache = [
+            cached("daily", 100.0, None),
+            cached("weekly", 12.0, at(5, 10)),
+        ];
+        let merged = merge_devin_banner(91.0, at(5, 0), &cache, now);
+        assert_eq!(summary(merged), ["daily=100", "weekly=9"]);
+
+        // 日/周同一时刻重置：横幅是缓存里用得更多的那个
+        let cache = [
+            cached("daily", 60.0, at(3, 0)),
+            cached("weekly", 25.0, at(3, 0)),
+        ];
+        let merged = merge_devin_banner(80.0, at(3, 0), &cache, now);
+        assert_eq!(summary(merged), ["daily=60", "weekly=20"]);
+
+        // 无缓存且 1 天内重置：认不出日/周，如实标成当前额度
+        let merged = merge_devin_banner(50.0, at(3, 0), &[], now);
+        assert_eq!(summary(merged), ["current=50"]);
     }
 }

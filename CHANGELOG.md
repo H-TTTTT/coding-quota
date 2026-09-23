@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Added
+
+- Claude provider card for Claude Pro / Max subscriptions, read from the omp `anthropic` OAuth login: 5-hour and weekly windows (plus per-model weekly windows when the plan has them) from the same `/api/oauth/usage` endpoint Claude Code's `/usage` uses, with the plan name (Pro / Max 5x / Max 20x) from `/api/oauth/profile`. Falls back to the newer `limits` array when the legacy `five_hour` / `seven_day` fields are absent. Console API-key logins have no subscription quota and are treated as unsubscribed.
+
+### Fixed
+
+- Refresh rounds no longer fail en masse with `请求超时`: the blocking Devin banner fetch (up to 25s) ran inside `tokio::join!` and stalled every other provider's request until they all hit the 20s timeout. It now runs on the blocking thread pool.
+- The Devin plan name no longer picks up TUI noise from the headless console (model selector `SWE-2 Max`, `Press alt+m to switch between available models`, `clipboard` glued to `Pro`); the plan is matched as a known plan-name suffix.
+
 ## 0.3.0 - 2026-09-19
 
 ### Added

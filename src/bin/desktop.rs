@@ -353,6 +353,7 @@ impl DesktopApp {
                             fetched_at: chrono::Utc::now(),
                             reports: [
                                 ProviderId::Codex,
+                                ProviderId::Claude,
                                 ProviderId::Grok,
                                 ProviderId::Glm,
                                 ProviderId::Kimi,

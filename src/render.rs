@@ -136,6 +136,8 @@ pub fn label_cn(label: &str) -> String {
                 format!("{hours} 小时限额")
             } else if let Some(days) = other.strip_suffix("d limit") {
                 format!("{days} 天限额")
+            } else if let Some(model) = other.strip_prefix("Weekly · ") {
+                format!("每周额度 · {model}")
             } else {
                 other.to_string()
             }

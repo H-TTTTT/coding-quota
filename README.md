@@ -1,6 +1,6 @@
 # coding-quota
 
-See the remaining quota of six AI coding plans in one place: **OpenAI Codex, xAI Grok, Zhipu GLM Coding Plan, Kimi Code, Cursor, and Devin**.
+See the remaining quota of seven AI coding plans in one place: **OpenAI Codex, Claude (Pro / Max), xAI Grok, Zhipu GLM Coding Plan, Kimi Code, Cursor, and Devin**.
 
 ![TUI screenshot](assets/tui.jpg)
 

@@ -12,7 +12,7 @@ use std::io::IsTerminal;
 #[command(
     name = "coding-quota-tui",
     version,
-    about = "Show Codex, Grok, GLM, Kimi, Cursor, and Devin coding-plan quotas in one place"
+    about = "Show Codex, Claude, Grok, GLM, Kimi, Cursor, and Devin coding-plan quotas in one place"
 )]
 struct Cli {
     /// Machine-readable JSON
@@ -23,7 +23,7 @@ struct Cli {
     #[arg(long)]
     snapshot: bool,
 
-    /// Only query one provider: codex, grok, glm, kimi, cursor, devin
+    /// Only query one provider: codex, claude, grok, glm, kimi, cursor, devin
     #[arg(long, short = 'p')]
     provider: Option<String>,
 
@@ -364,7 +364,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let only = match cli.provider.as_deref() {
         Some(raw) => Some(ProviderId::parse_filter(raw).ok_or_else(|| {
-            anyhow::anyhow!("unknown provider `{raw}` (codex|grok|glm|kimi|cursor|devin)")
+            anyhow::anyhow!("unknown provider `{raw}` (codex|claude|grok|glm|kimi|cursor|devin)")
         })?),
         None => None,
     };

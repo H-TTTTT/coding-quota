@@ -35,6 +35,7 @@ pub struct StoredCred {
 pub struct CredentialSet {
     pub db_path: Option<PathBuf>,
     pub codex: Option<StoredCred>,
+    pub claude: Option<StoredCred>,
     pub grok: Option<StoredCred>,
     pub glm: Option<StoredCred>,
     pub kimi: Option<StoredCred>,
@@ -267,6 +268,9 @@ fn load_from_sqlite(path: &Path, set: &mut CredentialSet) -> Result<()> {
                     set.codex = Some(cred);
                 }
             }
+            // 订阅额度只对 OAuth 登录有意义；Console API key 没有 5h/周额度，
+            // 当作未订阅，避免挂一张永远 401 的卡片。
+            "anthropic" if credential_type == "oauth" => set.claude = Some(cred),
             "xai-oauth" | "xai" => {
                 if set.grok.is_none() || provider == "xai-oauth" {
                     set.grok = Some(cred);

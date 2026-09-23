@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderId {
     Codex,
+    Claude,
     Grok,
     Glm,
     Kimi,
@@ -16,6 +17,7 @@ impl ProviderId {
     pub fn title(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
+            Self::Claude => "Claude",
             Self::Grok => "Grok",
             Self::Glm => "GLM",
             Self::Kimi => "Kimi",
@@ -27,6 +29,7 @@ impl ProviderId {
     pub fn parse_filter(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "codex" | "openai" | "openai-codex" | "chatgpt" => Some(Self::Codex),
+            "claude" | "anthropic" | "claude-code" => Some(Self::Claude),
             "grok" | "xai" | "xai-oauth" => Some(Self::Grok),
             "glm" | "zhipu" | "zhipu-coding-plan" | "zai" => Some(Self::Glm),
             "kimi" | "kimi-code" | "kimi-for-coding" => Some(Self::Kimi),

@@ -21,8 +21,9 @@ pub fn set_widget_hwnd(hwnd: isize) {
     WIDGET_HWND.store(hwnd, Ordering::Relaxed);
 }
 
-pub const PROVIDERS: [(ProviderId, &str); 6] = [
+pub const PROVIDERS: [(ProviderId, &str); 7] = [
     (ProviderId::Codex, "OpenAI Codex"),
+    (ProviderId::Claude, "Claude"),
     (ProviderId::Grok, "xAI Grok"),
     (ProviderId::Glm, "智谱 Coding Plan"),
     (ProviderId::Kimi, "Kimi Code"),
@@ -33,6 +34,7 @@ pub const PROVIDERS: [(ProviderId, &str); 6] = [
 fn provider_key(provider: ProviderId) -> &'static str {
     match provider {
         ProviderId::Codex => "codex",
+        ProviderId::Claude => "claude",
         ProviderId::Grok => "grok",
         ProviderId::Glm => "glm",
         ProviderId::Kimi => "kimi",

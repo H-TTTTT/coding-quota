@@ -19,6 +19,7 @@ pub async fn fetch_all(
         Err(err) => {
             let reports = [
                 ProviderId::Codex,
+                ProviderId::Claude,
                 ProviderId::Grok,
                 ProviderId::Glm,
                 ProviderId::Kimi,
@@ -37,8 +38,15 @@ pub async fn fetch_all(
         }
     };
 
-    let (codex, grok, glm, kimi, cursor, devin) = tokio::join!(
+    let (codex, claude, grok, glm, kimi, cursor, devin) = tokio::join!(
         maybe_fetch(&client, ProviderId::Codex, creds.codex.clone(), only, skip),
+        maybe_fetch(
+            &client,
+            ProviderId::Claude,
+            creds.claude.clone(),
+            only,
+            skip
+        ),
         maybe_fetch(&client, ProviderId::Grok, creds.grok.clone(), only, skip),
         maybe_fetch(&client, ProviderId::Glm, creds.glm.clone(), only, skip),
         maybe_fetch(&client, ProviderId::Kimi, creds.kimi.clone(), only, skip),
@@ -54,7 +62,7 @@ pub async fn fetch_all(
 
     Snapshot {
         fetched_at: Utc::now(),
-        reports: [codex, grok, glm, kimi, cursor, devin]
+        reports: [codex, claude, grok, glm, kimi, cursor, devin]
             .into_iter()
             .flatten()
             .collect(),
@@ -78,6 +86,7 @@ async fn maybe_fetch(
     Some(match cred {
         Some(cred) => match provider {
             ProviderId::Codex => fetch_codex(client, cred).await,
+            ProviderId::Claude => fetch_claude(client, cred).await,
             ProviderId::Grok => fetch_grok(client, cred).await,
             ProviderId::Glm => fetch_glm(client, cred).await,
             ProviderId::Kimi => fetch_kimi(client, cred).await,
@@ -207,6 +216,146 @@ fn glm_count_window(
         Some(QuotaWindow::from_used_limit(
             id, label, used, total, "count", reset,
         ))
+    } else {
+        None
+    }
+}
+
+const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+
+/// Claude 订阅（Pro / Max）额度：Claude Code `/usage` 用的同一个 OAuth 接口。
+/// profile 只用来识别套餐，失败不影响额度显示；两者用同一 token，401 时一起刷新重试。
+async fn fetch_claude(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
+    let identity = cred.identity.clone();
+    match fetch_with_refresh(client, &cred, "anthropic", |client, token| {
+        Box::pin(async move {
+            let (usage, profile) = tokio::join!(
+                get_json(client, CLAUDE_USAGE_URL, claude_headers(token)),
+                get_json(client, CLAUDE_PROFILE_URL, claude_headers(token)),
+            );
+            Ok(serde_json::json!({
+                "usage": usage?,
+                "profile": profile.unwrap_or(Value::Null),
+            }))
+        })
+    })
+    .await
+    {
+        Ok((_, body)) => parse_claude(identity, &body["usage"], &body["profile"]),
+        Err(err) => ProviderReport::err(ProviderId::Claude, identity, err),
+    }
+}
+
+/// 旧字段 five_hour / seven_day / seven_day_{opus,sonnet} 与新版 limits 数组
+/// （kind = session / weekly_all / weekly_scoped）并存、正在迁移：旧字段优先，
+/// 缺失时回落到 limits（与 omp 取法一致）。utilization / percent 都是 0–100 的已用百分比。
+fn parse_claude(identity: Option<String>, usage: &Value, profile: &Value) -> ProviderReport {
+    let limits = usage
+        .get("limits")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let limit_of = |kind: &str| {
+        limits
+            .iter()
+            .find(|item| item.get("kind").and_then(Value::as_str) == Some(kind))
+    };
+    let mut windows = Vec::new();
+    for (id, label, legacy, kind) in [
+        ("claude-5h", "5h window", "five_hour", "session"),
+        ("claude-week", "Weekly", "seven_day", "weekly_all"),
+    ] {
+        if let Some(window) = claude_window(id, label, usage.get(legacy))
+            .or_else(|| claude_window(id, label, limit_of(kind)))
+        {
+            windows.push(window);
+        }
+    }
+    // 按模型单列的周额度（Max 套餐常见）：旧字段在前，limits 里同名模型不重复列出。
+    let scoped = [
+        ("Opus", usage.get("seven_day_opus")),
+        ("Sonnet", usage.get("seven_day_sonnet")),
+    ]
+    .into_iter()
+    .map(|(name, bucket)| (name.to_string(), bucket))
+    .chain(
+        limits
+            .iter()
+            .filter(|item| item.get("kind").and_then(Value::as_str) == Some("weekly_scoped"))
+            .filter_map(|item| {
+                let name = item.pointer("/scope/model/display_name")?.as_str()?.trim();
+                (!name.is_empty()).then(|| (name.to_string(), Some(item)))
+            }),
+    );
+    let mut seen: Vec<String> = Vec::new();
+    for (name, bucket) in scoped {
+        let key = name.to_ascii_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        let id = format!("claude-week-{key}");
+        if let Some(window) = claude_window(&id, &format!("Weekly · {name}"), bucket) {
+            seen.push(key);
+            windows.push(window);
+        }
+    }
+    if windows.is_empty() {
+        return ProviderReport::err(ProviderId::Claude, identity, "no quota windows");
+    }
+    ProviderReport::ok(
+        ProviderId::Claude,
+        "Claude",
+        identity,
+        claude_plan(profile),
+        windows,
+    )
+}
+
+fn claude_window(id: &str, label: &str, bucket: Option<&Value>) -> Option<QuotaWindow> {
+    let bucket = bucket?;
+    let used = number(bucket.get("utilization")).or_else(|| number(bucket.get("percent")))?;
+    Some(QuotaWindow::from_used_percent(
+        id,
+        label,
+        used,
+        parse_iso(bucket.get("resets_at")),
+    ))
+}
+
+/// 套餐取自 profile：rate_limit_tier 区分 Max 5x / 20x，organization_type 形如
+/// claude_pro / claude_max。omp 凭据里的 orgName 是组织名（「xxx's Organization」），不是套餐。
+fn claude_plan(profile: &Value) -> Option<String> {
+    let org = profile.get("organization");
+    let field = |key: &str| org.and_then(|org| org.get(key)).and_then(Value::as_str);
+    let tier = field("rate_limit_tier").unwrap_or_default();
+    if let Some((_, name)) = [("max_20x", "Max 20x"), ("max_5x", "Max 5x")]
+        .into_iter()
+        .find(|(marker, _)| tier.contains(marker))
+    {
+        return Some(name.to_string());
+    }
+    if let Some(kind) = field("organization_type").and_then(|kind| kind.strip_prefix("claude_")) {
+        let mut chars = kind.chars();
+        if let Some(first) = chars.next() {
+            return Some(
+                first
+                    .to_uppercase()
+                    .chain(chars)
+                    .collect::<String>()
+                    .replace('_', " "),
+            );
+        }
+    }
+    let flag = |key: &str| {
+        profile
+            .pointer(&format!("/account/{key}"))
+            .and_then(Value::as_bool)
+    };
+    if flag("has_claude_max") == Some(true) {
+        Some("Max".into())
+    } else if flag("has_claude_pro") == Some(true) {
+        Some("Pro".into())
     } else {
         None
     }
@@ -543,6 +692,16 @@ fn bearer(token: &str) -> HeaderMap {
         headers.insert(AUTHORIZATION, value);
     }
     headers.insert("Accept", HeaderValue::from_static("application/json"));
+    headers
+}
+
+/// 与 Claude Code / omp 一致带上 OAuth beta 头：目前服务端不强制，防日后收紧。
+fn claude_headers(token: &str) -> HeaderMap {
+    let mut headers = bearer(token);
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("oauth-2025-04-20"),
+    );
     headers
 }
 
@@ -1025,9 +1184,8 @@ fn parse_devin_banner(text: &str) -> Option<(String, f64, Option<String>)> {
             .map(|(_, tail)| tail.trim())
             .unwrap_or(plan);
         let plan = ["Enterprise", "Team", "Free", "Pro", "Max", "Core"]
-            .iter()
-            .find(|name| plan.ends_with(*name))
-            .map(|name| *name)
+            .into_iter()
+            .find(|name| plan.ends_with(name))
             .unwrap_or_else(|| plan.split_whitespace().last().unwrap_or(plan));
         let reset = reset_part.trim();
         return Some((
@@ -1057,4 +1215,60 @@ fn parse_devin_reset(text: &str) -> Option<i64> {
         matched = true;
     }
     matched.then_some(seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Anthropic 正把额度从 five_hour / seven_day 迁到 limits 数组：旧字段为 null 时
+    /// 必须回落到 limits，否则整张卡片退化成「no quota windows」。
+    #[test]
+    fn claude_usage_falls_back_to_limits_array() {
+        let usage = serde_json::json!({
+            "five_hour": null,
+            "seven_day": null,
+            "seven_day_opus": null,
+            "limits": [
+                {"kind": "session", "percent": 40, "resets_at": "2026-09-23T06:59:59.752087+00:00"},
+                {"kind": "weekly_all", "percent": 10, "resets_at": "2026-09-28T03:59:59+00:00"},
+                {"kind": "weekly_scoped", "percent": 70, "resets_at": null,
+                 "scope": {"model": {"display_name": "Opus"}}}
+            ]
+        });
+        let profile = serde_json::json!({
+            "organization": {
+                "organization_type": "claude_max",
+                "rate_limit_tier": "default_claude_max_20x"
+            }
+        });
+        let report = parse_claude(None, &usage, &profile);
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(report.plan.as_deref(), Some("Max 20x"));
+        let rows: Vec<(&str, f64)> = report
+            .windows
+            .iter()
+            .map(|window| (window.label.as_str(), window.used_fraction))
+            .collect();
+        assert_eq!(
+            rows,
+            [("5h window", 0.4), ("Weekly", 0.1), ("Weekly · Opus", 0.7)]
+        );
+        assert!(report.windows[0].reset_at.is_some());
+    }
+
+    /// 无头 conhost 把模型选择器、按键提示、clipboard 图标文字挤进横幅同一行，
+    /// 且与套餐名无空格粘连（两行均取自实际抓到的横幅）；套餐名只能剩套餐词。
+    #[test]
+    fn devin_banner_plan_ignores_tui_noise() {
+        for line in [
+            "SWE-2 Max        Press alt+m to switch between available modelsPro · 0% remaining (resets in 5h)",
+            "clipboardPro · 0% remaining (resets in 4h 30m)",
+        ] {
+            let (plan, pct, reset) = parse_devin_banner(line).expect("banner line must parse");
+            assert_eq!(plan, "Pro", "{line}");
+            assert_eq!(pct, 0.0);
+            assert!(reset.is_some());
+        }
+    }
 }

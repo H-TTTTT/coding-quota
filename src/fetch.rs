@@ -1,36 +1,73 @@
+use crate::backoff::Backoff;
 use crate::credentials::{self, CredentialSet, StoredCred};
 use crate::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
 use chrono::{DateTime, TimeZone, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
 use serde_json::Value;
 use std::future::Future;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 const UA: &str = "coding-quota/0.1";
 const TIMEOUT: Duration = Duration::from_secs(20);
+/// 失败的平台先按 5 分钟退避（与挂件的刷新节奏一致），连续失败翻倍，1 小时封顶。
+const BACKOFF_BASE: Duration = Duration::from_secs(300);
+const BACKOFF_MAX: Duration = Duration::from_secs(3600);
 
-pub async fn fetch_all(
+/// 复用同一个 HTTP client：连接与 TLS 会话能跨轮复用，不必每轮重建连接池、重做握手。
+static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+
+fn http_client() -> Result<&'static reqwest::Client, String> {
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(TIMEOUT)
+                .build()
+                .map_err(|err| format!("http client: {err}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+/// 每个平台各自的失败退避状态：成功即清零，进程重启即重置。
+static BACKOFF: OnceLock<Mutex<Backoff>> = OnceLock::new();
+
+fn backoff() -> &'static Mutex<Backoff> {
+    BACKOFF.get_or_init(|| Mutex::new(Backoff::new(BACKOFF_BASE, BACKOFF_MAX)))
+}
+
+/// 还在退避中的平台：本轮不发请求，只回一条说明（旧额度由缓存回填，界面照常显示）。
+fn deferred_report(provider: ProviderId, identity: Option<String>) -> Option<ProviderReport> {
+    let (failures, wait) = backoff().lock().ok()?.deferred(provider)?;
+    Some(ProviderReport::err(
+        provider,
+        identity,
+        format!("连续 {failures} 次失败（{}后自动重试）", minutes_cn(wait)),
+    ))
+}
+
+fn minutes_cn(wait: Duration) -> String {
+    let minutes = (wait.as_secs_f64() / 60.0).ceil().max(1.0) as u64;
+    format!("{minutes} 分钟")
+}
+
+/// 取数一轮，每路完成立刻回调：界面不必等最慢的一路（Devin 横幅最长 25s）才有数据。
+/// 返回的 Snapshot 仍是本轮全部报表，顺序固定（见 `ProviderId::ALL`），供 CLI / TUI 使用。
+pub async fn fetch_all_streaming(
     creds: &CredentialSet,
     only: Option<ProviderId>,
     skip: &[ProviderId],
+    mut on_report: impl FnMut(ProviderReport),
 ) -> Snapshot {
-    let client = match reqwest::Client::builder().timeout(TIMEOUT).build() {
+    let client = match http_client() {
         Ok(client) => client,
         Err(err) => {
-            let reports = [
-                ProviderId::Codex,
-                ProviderId::Claude,
-                ProviderId::Grok,
-                ProviderId::Glm,
-                ProviderId::Kimi,
-                ProviderId::Cursor,
-                ProviderId::Devin,
-            ]
-            .into_iter()
-            .filter(|provider| only.is_none_or(|wanted| wanted == *provider))
-            .filter(|provider| !skip.contains(provider))
-            .map(|provider| ProviderReport::err(provider, None, format!("http client: {err}")))
-            .collect();
+            let reports: Vec<ProviderReport> = ProviderId::ALL
+                .into_iter()
+                .filter(|provider| only.is_none_or(|wanted| wanted == *provider))
+                .filter(|provider| !skip.contains(provider))
+                .map(|provider| ProviderReport::err(provider, None, err.clone()))
+                .collect();
             return Snapshot {
                 fetched_at: Utc::now(),
                 reports,
@@ -38,35 +75,53 @@ pub async fn fetch_all(
         }
     };
 
-    let (codex, claude, grok, glm, kimi, cursor, devin) = tokio::join!(
-        maybe_fetch(&client, ProviderId::Codex, creds.codex.clone(), only, skip),
-        maybe_fetch(
-            &client,
-            ProviderId::Claude,
-            creds.claude.clone(),
-            only,
-            skip
-        ),
-        maybe_fetch(&client, ProviderId::Grok, creds.grok.clone(), only, skip),
-        maybe_fetch(&client, ProviderId::Glm, creds.glm.clone(), only, skip),
-        maybe_fetch(&client, ProviderId::Kimi, creds.kimi.clone(), only, skip),
-        maybe_fetch(
-            &client,
-            ProviderId::Cursor,
-            creds.cursor.clone(),
-            only,
-            skip
-        ),
-        maybe_devin(only, skip),
-    );
+    let skip: Arc<[ProviderId]> = Arc::from(skip);
+    let mut tasks = tokio::task::JoinSet::new();
+    for (provider, cred) in [
+        (ProviderId::Codex, creds.codex.clone()),
+        (ProviderId::Claude, creds.claude.clone()),
+        (ProviderId::Grok, creds.grok.clone()),
+        (ProviderId::Glm, creds.glm.clone()),
+        (ProviderId::Kimi, creds.kimi.clone()),
+        (ProviderId::Cursor, creds.cursor.clone()),
+    ] {
+        let client = client.clone();
+        let skip = skip.clone();
+        tasks.spawn(async move { maybe_fetch(&client, provider, cred, only, &skip).await });
+    }
+    {
+        // Devin 走 CLI 横幅，不使用 CredentialSet 里的凭据；它本身是阻塞调用，
+        // 由 maybe_devin 挪到 blocking 线程池，不拖住其他平台。
+        let skip = skip.clone();
+        tasks.spawn(async move { maybe_devin(only, &skip).await });
+    }
 
+    let mut reports = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Some(report)) => {
+                on_report(report.clone());
+                reports.push(report);
+            }
+            Ok(None) => {}
+            // 任务 panic：只有这一路本轮没有数据，其他平台照常显示
+            Err(_) => {}
+        }
+    }
+    // 并行回来的是完成顺序，卡片位置要按平台固定顺序排，否则每轮跳位置
+    reports.sort_by_key(|report| report.provider.ordinal());
     Snapshot {
         fetched_at: Utc::now(),
-        reports: [codex, claude, grok, glm, kimi, cursor, devin]
-            .into_iter()
-            .flatten()
-            .collect(),
+        reports,
     }
+}
+
+pub async fn fetch_all(
+    creds: &CredentialSet,
+    only: Option<ProviderId>,
+    skip: &[ProviderId],
+) -> Snapshot {
+    fetch_all_streaming(creds, only, skip, |_| {}).await
 }
 
 async fn maybe_fetch(
@@ -83,19 +138,36 @@ async fn maybe_fetch(
     if skip.contains(&provider) {
         return None;
     }
-    Some(match cred {
-        Some(cred) => match provider {
-            ProviderId::Codex => fetch_codex(client, cred).await,
-            ProviderId::Claude => fetch_claude(client, cred).await,
-            ProviderId::Grok => fetch_grok(client, cred).await,
-            ProviderId::Glm => fetch_glm(client, cred).await,
-            ProviderId::Kimi => fetch_kimi(client, cred).await,
-            ProviderId::Cursor => fetch_cursor(client, cred).await,
-            // Devin 走 CLI 横幅，不使用 CredentialSet 里的凭据
-            ProviderId::Devin => fetch_devin(),
-        },
-        None => ProviderReport::missing(provider),
-    })
+    let Some(cred) = cred else {
+        // 没有凭据：不发请求，也不占着退避状态（重新登录后要能立刻取数）
+        if let Ok(mut state) = backoff().lock() {
+            state.succeed(provider);
+        }
+        return Some(ProviderReport::missing(provider));
+    };
+    // 连续失败、还在退避中的平台：本轮只回一条说明，旧额度由缓存回填
+    if let Some(report) = deferred_report(provider, cred.identity.clone()) {
+        return Some(report);
+    }
+    let report = match provider {
+        ProviderId::Codex => fetch_codex(client, cred).await,
+        ProviderId::Claude => fetch_claude(client, cred).await,
+        ProviderId::Grok => fetch_grok(client, cred).await,
+        ProviderId::Glm => fetch_glm(client, cred).await,
+        ProviderId::Kimi => fetch_kimi(client, cred).await,
+        ProviderId::Cursor => fetch_cursor(client, cred).await,
+        // Devin 走 CLI 横幅，不使用 CredentialSet 里的凭据
+        ProviderId::Devin => fetch_devin(),
+    };
+    // 成功清零、失败退避：下一轮不再按原节奏硬撞（Claude 的端点与 Claude Code 共享限流）
+    if let Ok(mut state) = backoff().lock() {
+        if report.error.is_none() {
+            state.succeed(provider);
+        } else {
+            state.fail(provider);
+        }
+    }
+    Some(report)
 }
 
 type FetchFuture<'a> = std::pin::Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
@@ -838,11 +910,22 @@ async fn maybe_devin(only: Option<ProviderId>, skip: &[ProviderId]) -> Option<Pr
     if only.is_some_and(|wanted| wanted != ProviderId::Devin) || skip.contains(&ProviderId::Devin) {
         return None;
     }
+    // 横幅连续抓不到时退避：省掉每轮最长 25s 的 devin.exe 拉起
+    if let Some(report) = deferred_report(ProviderId::Devin, None) {
+        return Some(report);
+    }
     // fetch_devin 是同步阻塞（等横幅最长 25s）：在 tokio::join! 里直接调用会
     // 冻结同任务的其他 provider，全部跟着超时。挪到 blocking 线程池。
     let report = tokio::task::spawn_blocking(fetch_devin)
         .await
         .unwrap_or_else(|_| ProviderReport::err(ProviderId::Devin, None, "devin 刷新线程异常"));
+    if let Ok(mut state) = backoff().lock() {
+        if report.error.is_none() {
+            state.succeed(ProviderId::Devin);
+        } else {
+            state.fail(ProviderId::Devin);
+        }
+    }
     Some(report)
 }
 

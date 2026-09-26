@@ -14,6 +14,14 @@ All notable changes to this project are documented in this file.
 - The Devin plan name no longer picks up TUI noise from the headless console (model selector `SWE-2 Max`, `Press alt+m to switch between available models`, `clipboard` glued to `Pro`); the plan is matched as a known plan-name suffix.
 - Devin's weekly line no longer sometimes repeats the daily value: the CLI banner shows only whichever quota is tighter (the daily one once it runs lower than the weekly), but it was always taken as the weekly quota. The live banner value is now attributed to the daily or weekly window by its reset time, and the other window comes from the `user_status` cache.
 - HTTP 429 responses are reported as one short line (`HTTP 429 请求过于频繁，稍后自动重试`) instead of the raw JSON body, which stretched the widget to its maximum width.
+- A transient credential-store read failure no longer turns Devin's card into an error line: Devin reads the CLI banner rather than the credential database, so its last good quota stays on screen while the other cards report the failure.
+- Cached quotas older than 24 hours are no longer shown as a fallback: the card keeps only the error instead of a multi-day-old value (Kimi had been displaying 09-20 numbers for five days).
+
+### Changed
+
+- The widget now draws each provider as soon as its data arrives instead of waiting for the slowest one: Codex / Cursor land in a second or two, while the Devin CLI banner (up to 25s) fills in its card afterwards. The refresh icon keeps spinning until the whole round is done, including rounds where every provider is skipped.
+- A provider that keeps failing is retried with exponential backoff (5 minutes, doubling to a 1-hour cap, reset by the first success) instead of being re-requested every round. While it is deferred the card keeps the last known quota and adds a line saying when it will retry, which matters for Claude because its usage endpoint shares a rate limit with Claude Code and omp.
+- The HTTP client is created once and reused across rounds, so connections and TLS sessions stay alive instead of being re-established each refresh.
 
 ## 0.3.0 - 2026-09-19
 

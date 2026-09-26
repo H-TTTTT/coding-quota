@@ -14,6 +14,31 @@ pub enum ProviderId {
 }
 
 impl ProviderId {
+    /// 展示顺序：各处的卡片顺序、`--snapshot` 与缓存的稳定落盘顺序都用它。
+    /// 并行取数回来的是完成顺序，不按它排序卡片会每轮跳位置。
+    pub const ALL: [ProviderId; 7] = [
+        Self::Codex,
+        Self::Claude,
+        Self::Grok,
+        Self::Glm,
+        Self::Kimi,
+        Self::Cursor,
+        Self::Devin,
+    ];
+
+    /// 在 `ALL` 里的下标，用作稳定排序键。
+    pub fn ordinal(self) -> usize {
+        match self {
+            Self::Codex => 0,
+            Self::Claude => 1,
+            Self::Grok => 2,
+            Self::Glm => 3,
+            Self::Kimi => 4,
+            Self::Cursor => 5,
+            Self::Devin => 6,
+        }
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             Self::Codex => "Codex",

@@ -1,3 +1,4 @@
+mod backoff;
 pub mod cache;
 pub mod credentials;
 pub mod fetch;

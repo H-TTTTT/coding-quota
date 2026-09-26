@@ -311,9 +311,23 @@ fn icon_button(ui: &mut egui::Ui, kind: IconKind, tip: &str, spin: f32) -> egui:
     response.on_hover_text(tip)
 }
 
+/// 把逐条到达的报表拼成一份完整快照：挂件每收到一份就整份重画，先到的平台先显示，
+/// 还没到的平台沿用上一轮的值。
+fn merged(latest: &[ProviderReport]) -> Snapshot {
+    Snapshot {
+        fetched_at: latest
+            .iter()
+            .map(|report| report.fetched_at)
+            .max()
+            .unwrap_or_else(chrono::Utc::now),
+        reports: latest.to_vec(),
+    }
+}
+
 struct DesktopApp {
     snapshot: Option<Snapshot>,
-    snap_rx: mpsc::Receiver<Snapshot>,
+    /// 逐平台增量到达的快照，附带「本轮是否已全部取完」；刷新图标据此停转。
+    snap_rx: mpsc::Receiver<(Snapshot, bool)>,
     cmd_tx: mpsc::Sender<Cmd>,
     tray_rx: mpsc::Receiver<tray::TrayCommand>,
     hidden_providers: Vec<String>,
@@ -331,44 +345,65 @@ struct DesktopApp {
 
 impl DesktopApp {
     fn new(ctx: egui::Context) -> Self {
-        let (snap_tx, snap_rx) = mpsc::channel::<Snapshot>();
+        let (snap_tx, snap_rx) = mpsc::channel::<(Snapshot, bool)>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
                 Err(_) => return,
             };
+            // 常驻内存的上一轮数据：按平台增量回填/落盘，不必每条报表都重读缓存文件
+            let mut cache = cache::Cache::load();
+            // 已显示的平台保留到新一轮结果到达为止（隐藏、退避期间卡片不会忽隐忽现）
+            let mut latest: Vec<ProviderReport> = Vec::new();
+            let mut alive = true;
             loop {
+                // 托盘里隐藏（退订）的平台：完全不取数，也不会失效凭据 401
+                let skip = tray::hidden_provider_ids();
+                // 隐藏期间不留旧卡片：重新勾选时等本轮真数据，而不是显示几天前的额度
+                latest.retain(|report| !skip.contains(&report.provider));
+                let mut publish = |mut report: ProviderReport| {
+                    // 失败/退避：额度照常显示旧值并附上错误；成功则落盘
+                    cache.backfill(&mut report);
+                    cache.save_report(&report);
+                    match latest
+                        .iter_mut()
+                        .find(|shown| shown.provider == report.provider)
+                    {
+                        Some(shown) => *shown = report,
+                        None => latest.push(report),
+                    }
+                    latest.sort_by_key(|report| report.provider.ordinal());
+                    alive = snap_tx.send((merged(&latest), false)).is_ok();
+                };
                 // Reload the database for every refresh. A transient UNC/SQLite
                 // failure must not leave the widget permanently credential-less.
-                let mut snapshot = match credentials::load() {
+                match credentials::load() {
                     Ok(creds) => {
-                        // 托盘里隐藏（退订）的平台：完全不取数，也不会失效凭据 401
-                        let skip = tray::hidden_provider_ids();
-                        rt.block_on(fetch::fetch_all(&creds, None, &skip))
+                        rt.block_on(fetch::fetch_all_streaming(
+                            &creds,
+                            None,
+                            &skip,
+                            &mut publish,
+                        ));
                     }
                     Err(err) => {
                         let message = format!("凭据读取失败：{err}");
-                        Snapshot {
-                            fetched_at: chrono::Utc::now(),
-                            reports: [
-                                ProviderId::Codex,
-                                ProviderId::Claude,
-                                ProviderId::Grok,
-                                ProviderId::Glm,
-                                ProviderId::Kimi,
-                                ProviderId::Cursor,
-                            ]
+                        // Devin 取的是 CLI 横幅，不依赖凭据库：SQLite/UNC 瞬时抖动时
+                        // 不该把它的好数据抹成一行「凭据读取失败」。
+                        for provider in ProviderId::ALL
                             .into_iter()
-                            .map(|provider| ProviderReport::err(provider, None, message.clone()))
-                            .collect(),
+                            .filter(|provider| *provider != ProviderId::Devin)
+                        {
+                            publish(ProviderReport::err(provider, None, message.clone()));
                         }
                     }
-                };
-                // 成功的先落盘，失败的用上一轮数据回填：报错但额度照常显示
-                cache::save(&snapshot);
-                cache::apply(&mut snapshot);
-                if snap_tx.send(snapshot).is_err() {
+                }
+                if !alive {
+                    return;
+                }
+                // 本轮取完：全部平台都退避/隐藏时不会有增量回调，界面靠这条停转刷新图标
+                if snap_tx.send((merged(&latest), true)).is_err() {
                     return;
                 }
                 match cmd_rx.recv_timeout(REFRESH_INTERVAL) {
@@ -413,9 +448,12 @@ impl eframe::App for DesktopApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        while let Ok(snapshot) = self.snap_rx.try_recv() {
+        // 逐平台增量到达：先到的平台先显示，最慢的一方（Devin 横幅最长 25s）不再拖住整屏
+        while let Ok((snapshot, round_done)) = self.snap_rx.try_recv() {
             self.snapshot = Some(snapshot);
-            self.refreshing = false;
+            if round_done {
+                self.refreshing = false;
+            }
         }
         #[cfg(windows)]
         if let Some(hwnd) = hwnd_of(frame) {

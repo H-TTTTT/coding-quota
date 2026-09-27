@@ -9,7 +9,7 @@ See the remaining quota of seven AI coding plans in one place: **OpenAI Codex, C
 | | `coding-quota-gui.exe` (desktop widget) | `coding-quota-tui.exe` (terminal TUI / CLI) |
 | --- | --- | --- |
 | UI | Borderless acrylic widget pinned to the desktop | Compact 48-column TUI in a frameless Windows Terminal window |
-| Interaction | Drag by the title bar, tray icon context menu | `R` refresh, `Q` quit, auto-refresh every 2 minutes |
+| Interaction | Drag by the title bar, tray icon context menu | `R` refresh, `Q` quit, auto-refresh every 5 minutes |
 | Extras | Launch with Windows, per-provider visibility, window position memory | `--snapshot` plain text, `--json` for scripts, `-p <provider>` to filter, `--demo` for a mock-data preview |
 
 ## Download
@@ -29,7 +29,7 @@ Zero configuration: the tool reads the existing omp credential store (`~/.omp/ag
 
 - Each quota window shows the remaining percentage, a usage-colored bar (green <70%, yellow ≥70%, red ≥90%), and its reset time
 - Codex additionally shows remaining rate-limit reset credits
-- Failed refreshes keep the last good values (cached in `%APPDATA%\coding-quota\last_good.json`), drawn dimmed with their age; `--json` / `--snapshot` always report the live result
+- Failed refreshes keep the last good values (cached in `%APPDATA%\coding-quota\last_good.json`), drawn dimmed with their age; values older than 24 hours are dropped rather than shown, and a provider that keeps failing is retried with backoff instead of every round. `--json` / `--snapshot` always report the live result
 - Both the widget and the TUI fit their size to the content
 
 ## Build from source

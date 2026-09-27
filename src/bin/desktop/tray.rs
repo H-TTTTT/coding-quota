@@ -117,6 +117,16 @@ where
 {
 }
 
+/// 开机自启路径自愈：exe 被移动或改名后，HKCU\...\Run 里的值还指着旧路径，
+/// 开机时会静默启动失败。只在「自启已开启」时改写该值，绝不替用户开启自启。
+#[cfg(windows)]
+pub fn heal_autostart_path() {
+    imp::heal_autostart_path();
+}
+
+#[cfg(not(windows))]
+pub fn heal_autostart_path() {}
+
 #[cfg(windows)]
 mod imp {
     use super::{is_hidden, load_hidden, toggle_hidden, TrayCommand, PROVIDERS, WIDGET_HWND};
@@ -856,32 +866,65 @@ mod imp {
         });
     }
 
+    /// 打开 HKCU 的 Run 键，调用方负责 RegCloseKey。
+    unsafe fn run_key(desired: u32) -> Option<*mut c_void> {
+        let subkey = wide(RUN_KEY);
+        let mut key: *mut c_void = std::ptr::null_mut();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, desired, &mut key) != 0 {
+            return None;
+        }
+        Some(key)
+    }
+
     pub fn autostart_enabled() -> bool {
         unsafe {
-            let subkey = wide(RUN_KEY);
-            let mut key: *mut c_void = std::ptr::null_mut();
-            if RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                subkey.as_ptr(),
-                0,
-                KEY_QUERY_VALUE,
-                &mut key,
-            ) != 0
-            {
-                return false;
+            match run_key(KEY_QUERY_VALUE) {
+                Some(key) => {
+                    let found = has_value(key, VALUE_NAME);
+                    RegCloseKey(key);
+                    found
+                }
+                None => false,
             }
-            let name = wide(VALUE_NAME);
-            let status = RegQueryValueExW(
-                key,
-                name.as_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
-            RegCloseKey(key);
-            status == 0
         }
+    }
+
+    pub fn heal_autostart_path() {
+        // read_run_command 要解释注册表返回的 UTF-16 缓冲，属于 unsafe FFI 调用。
+        let Some(command) = (unsafe { read_run_command() }) else {
+            return;
+        };
+        let Ok(executable) = std::env::current_exe() else {
+            return;
+        };
+        // 在压缩包里双击运行会解到 %TEMP% 再启动，这种路径不能写进自启。
+        if executable.starts_with(std::env::temp_dir()) {
+            return;
+        }
+        let wanted = format!("\"{}\"", executable.display());
+        // 注册表里的路径大小写可能来自旧的拷贝/重命名，比较时忽略大小写。
+        if command.trim().eq_ignore_ascii_case(wanted.trim()) {
+            return;
+        }
+        set_autostart(true);
+    }
+
+    unsafe fn read_run_command() -> Option<String> {
+        let subkey = wide(RUN_KEY);
+        let mut key: *mut c_void = std::ptr::null_mut();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        ) != 0
+        {
+            return None;
+        }
+        let command = read_string(key, VALUE_NAME);
+        RegCloseKey(key);
+        command
     }
 
     fn set_autostart(enable: bool) -> bool {

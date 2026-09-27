@@ -3,6 +3,9 @@
 // src/bin/*.rs 都会被 Cargo 当成独立 bin，托盘模块只能放在子目录里。
 #[path = "desktop/tray.rs"]
 mod tray;
+
+#[path = "desktop/instance.rs"]
+mod instance;
 use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
 use coding_quota::render::{ago_cn, compact_until_cn, label_cn, title_cn};
 use coding_quota::{cache, credentials, fetch};
@@ -29,6 +32,14 @@ enum Cmd {
 }
 
 fn main() -> eframe::Result<()> {
+    // 重复启动会多出一个托盘图标和一路 worker（还会重复拉起 Devin CLI），
+    // 已经有一个在跑就提示完退出，不去动先起来那个的窗口和托盘。
+    if !instance::acquire() {
+        return Ok(());
+    }
+    // exe 被挪过位置时，注册表里的自启路径还指着旧位置，会在开机时静默失败。
+    tray::heal_autostart_path();
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_decorations(false)
         .with_transparent(true)
@@ -352,6 +363,8 @@ impl DesktopApp {
                 Ok(rt) => rt,
                 Err(_) => return,
             };
+            // 上次进程被强杀可能留下临时凭据副本；放在后台线程扫，不挡首帧。
+            let _ = credentials::sweep_stale_db_copies();
             // 常驻内存的上一轮数据：按平台增量回填/落盘，不必每条报表都重读缓存文件
             let mut cache = cache::Cache::load();
             // 已显示的平台保留到新一轮结果到达为止（隐藏、退避期间卡片不会忽隐忽现）

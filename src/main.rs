@@ -376,25 +376,39 @@ async fn main() -> Result<()> {
     if cli.demo {
         return tui::run_demo().await;
     }
+    // 终端窗口被直接关掉时进程是被强杀的，来不及删掉只读凭据副本；启动时扫一次。
+    let _ = credentials::sweep_stale_db_copies();
     let want_tui = interactive && (hosted || std::io::stdout().is_terminal());
 
-    let creds = credentials::load()?;
     if cli.json {
+        let creds = credentials::load()?;
         let snapshot = fetch::fetch_all(&creds, only, &[]).await;
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
 
     if want_tui {
-        return tui::run(creds, only).await;
+        return tui::run(credentials::load()?, only).await;
     }
 
     loop {
-        let snapshot = fetch::fetch_all(&creds, only, &[]).await;
-        if cli.watch.is_some() {
-            print!("\x1B[2J\x1B[H");
+        // --watch 每轮重新读取凭据：登录、登出、token 轮换都不必重启进程。
+        // watch 模式下读不到凭据只跳过本轮（网络盘抖动、omp 正在写库都可能瞬时失败）；
+        // 单发 --snapshot 仍按原语义直接失败退出。
+        let snapshot = match credentials::load() {
+            Ok(creds) => Some(fetch::fetch_all(&creds, only, &[]).await),
+            Err(err) if cli.watch.is_some() => {
+                eprintln!("凭据读取失败，本轮跳过：{err:#}");
+                None
+            }
+            Err(err) => return Err(err),
+        };
+        if let Some(snapshot) = snapshot {
+            if cli.watch.is_some() {
+                print!("\x1B[2J\x1B[H");
+            }
+            print!("{}", render::snapshot_text(&snapshot));
         }
-        print!("{}", render::snapshot_text(&snapshot));
         match cli.watch {
             Some(secs) if secs > 0 => {
                 tokio::time::sleep(std::time::Duration::from_secs(secs)).await

@@ -3,6 +3,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 拉起子进程但不弹控制台窗口。GUI 是 windows 子系统程序，spawn 控制台程序
 /// （tasklist/taskkill 等）不加 CREATE_NO_WINDOW 就会闪一个黑色窗口。
@@ -40,6 +41,60 @@ pub struct CredentialSet {
     pub glm: Option<StoredCred>,
     pub kimi: Option<StoredCred>,
     pub cursor: Option<StoredCred>,
+}
+
+/// 临时凭据副本的文件名前缀，见 `copy_db` / `sweep_stale_db_copies`。
+const DB_COPY_PREFIX: &str = "coding-quota-";
+
+/// 进程被强杀时来不及执行 `Drop`，`%TEMP%` 里会留下只读凭据数据库的副本
+/// （连同 `-wal` / `-shm`）。启动时清扫一次，跳过其他进程刚创建的副本。
+pub fn sweep_stale_db_copies() -> Result<usize> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(std::env::temp_dir())? {
+        // 临时目录里可能有并发创建/删除的条目，单个读不到就跳过，不放弃整轮清扫。
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if is_db_copy(path.as_path()) && is_stale(path.as_path()) {
+            // 并发进程可能刚好删掉同一个文件，删不掉不是错误。
+            let _ = std::fs::remove_file(&path);
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// 判断是否为临时凭据副本：`coding-quota-<pid>-<时间戳>-agent.db`，含 `-wal` / `-shm` 伴生文件。
+fn is_db_copy(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(rest) = name.strip_prefix(DB_COPY_PREFIX) else {
+        return false;
+    };
+    rest.ends_with("-agent.db")
+        || rest.ends_with("-agent.db-wal")
+        || rest.ends_with("-agent.db-shm")
+}
+
+/// 修改时间超过 10 分钟才算「无人使用」：正常情况下副本只存在几毫秒，
+/// 10 分钟足够覆盖慢盘上的一次完整读取，又不会误删并发进程的副本。
+fn is_stale(path: &Path) -> bool {
+    let Ok(meta) = path.metadata() else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    match mtime.duration_since(UNIX_EPOCH) {
+        Ok(age) => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|now| now.as_secs().saturating_sub(age.as_secs()) > 600)
+            .unwrap_or(false),
+        // 时钟偏差导致 mtime 落在未来：宁可留着也不删。
+        Err(_) => false,
+    }
 }
 
 pub fn load() -> Result<CredentialSet> {
@@ -474,6 +529,34 @@ pub fn token_expiring(expires_ms: Option<i64>, token: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_removes_only_stale_database_copies() {
+        // 造两个副本：一个「刚创建」模拟并发进程，一个把 mtime 推到 11 分钟前。
+        let dir = std::env::temp_dir();
+        let tag = std::process::id();
+        let fresh = dir.join(format!("coding-quota-{tag}-1-agent.db"));
+        let stale = dir.join(format!("coding-quota-{tag}-2-agent.db-wal"));
+        let other = dir.join("coding-quota-notes.txt");
+        for path in [&fresh, &stale, &other] {
+            std::fs::write(path, b"probe").unwrap();
+        }
+        let file = std::fs::File::options().write(true).open(&stale).unwrap();
+        file.set_modified(SystemTime::now() - std::time::Duration::from_secs(11 * 60))
+            .unwrap();
+        drop(file);
+
+        let removed = sweep_stale_db_copies().unwrap();
+
+        assert!(!stale.exists(), "过期副本必须被清掉");
+        assert!(fresh.exists(), "并发进程刚建的副本不能删");
+        assert!(other.exists(), "同名前缀但非副本的文件不能碰");
+        assert!(removed >= 1);
+
+        for path in [fresh, other, stale] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 
     #[test]
     fn soft_logout_removes_provider_and_login_restores_it() -> Result<()> {

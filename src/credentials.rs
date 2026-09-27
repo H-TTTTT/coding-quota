@@ -65,7 +65,7 @@ pub fn sweep_stale_db_copies() -> Result<usize> {
     Ok(removed)
 }
 
-/// 判断是否为临时凭据副本：`coding-quota-<pid>-<时间戳>-agent.db`，含 `-wal` / `-shm` 伴生文件。
+/// 判断是否为临时凭据副本：`coding-quota-<pid>-agent.db`，含 `-wal` / `-shm` 伴生文件。
 fn is_db_copy(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;

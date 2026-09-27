@@ -11,6 +11,7 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Kimi 的「总额度」实际就是每周额度：卡片改为直接读官方 `usages.limit_5h` / `usages.limit_7d` 字段（used_ratio），标签修正为「5 小时限额」「每周额度」；`usages` 子对象缺失时逐条退回旧的 `limits[]` / `usage` 块。月额度不在 coding API 返回中（只在 kimi.com 会员页，需浏览器登录态），无法经 omp 凭据显示。
 - 把 exe 移动或改名之后，开机自启不再静默失效：启动时检查 `HKCU\...\Run` 里的路径（仅在自启已开启时），与实际位置不一致就改写为当前可执行文件，比较忽略大小写。
 - 进程被强杀（关掉终端窗口、结束任务）时来不及删除的只读凭据数据库副本（`%TEMP%\coding-quota-*-agent.db` 及其 `-wal` / `-shm`）现在会在启动时清扫；修改时间不足 10 分钟的副本视为并发进程正在使用，不会误删。
 

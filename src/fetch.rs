@@ -528,8 +528,15 @@ fn short_cursor_identity(raw: &str) -> String {
 
 fn parse_kimi(identity: Option<String>, body: Value) -> ProviderReport {
     let data = body.get("data").unwrap_or(&body);
+    let usages = data.get("usages");
     let mut windows = Vec::new();
-    if let Some(limits) = data.get("limits").and_then(|v| v.as_array()) {
+
+    // usages.limit_5h / limit_7d 是官方字段（used_ratio 为 0..1）。
+    // 旧块里 limits[] 装的是 5 小时限额、usage 块是周额度（历史上误标为
+    // Total quota）；usages 子对象缺失时逐条退回旧块。月额度不在 coding API 里。
+    if let Some(window) = kimi_ratio_window(usages, "limit_5h", "kimi-5h", "5h limit") {
+        windows.push(window);
+    } else if let Some(limits) = data.get("limits").and_then(|v| v.as_array()) {
         for (idx, item) in limits.iter().enumerate() {
             let detail = item.get("detail").unwrap_or(item);
             let label = item
@@ -543,8 +550,10 @@ fn parse_kimi(identity: Option<String>, body: Value) -> ProviderReport {
             }
         }
     }
-    if let Some(usage) = data.get("usage") {
-        if let Some(window) = usage_row("kimi-usage", usage, "Total quota") {
+    if let Some(window) = kimi_ratio_window(usages, "limit_7d", "kimi-week", "Weekly") {
+        windows.push(window);
+    } else if let Some(usage) = data.get("usage") {
+        if let Some(window) = usage_row("kimi-usage", usage, "Weekly") {
             windows.push(window);
         }
     }
@@ -552,6 +561,17 @@ fn parse_kimi(identity: Option<String>, body: Value) -> ProviderReport {
         return ProviderReport::err(ProviderId::Kimi, identity, "no quota windows");
     }
     ProviderReport::ok(ProviderId::Kimi, "Kimi Code", identity, None, windows)
+}
+
+fn kimi_ratio_window(usages: Option<&Value>, key: &str, id: &str, label: &str) -> Option<QuotaWindow> {
+    let entry = usages?.get(key)?;
+    let ratio = number(entry.get("used_ratio"))?;
+    Some(QuotaWindow::from_used_percent(
+        id,
+        label,
+        ratio * 100.0,
+        parse_reset(entry),
+    ))
 }
 
 fn kimi_window_label(item: &Value, idx: usize) -> String {

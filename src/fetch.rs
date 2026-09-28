@@ -1139,33 +1139,42 @@ fn parse_devin_cache_inner() -> Option<ProviderReport> {
         .and_then(|bytes| proto_string(&bytes))
         .unwrap_or_else(|| "Unknown".into());
     let weekly = proto_varint_field(&quota, 15).unwrap_or(0);
-    let weekly_reset = proto_varint_field(&quota, 18)
-        .filter(|secs| *secs > 1_600_000_000)
-        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0));
     if !(0..=100).contains(&weekly) {
         return None;
     }
-    let mut windows = Vec::new();
     // proto3 省略零值字段：额度耗尽时 f14/f15 干脆不出现，按 0% 剩余处理，
     // 否则用尽期间日/周额度行会整行消失。
     let daily = proto_varint_field(&quota, 14).unwrap_or(0);
-    if (0..=100).contains(&daily) {
-        let daily_reset = proto_varint_field(&quota, 17)
-            .filter(|secs| *secs > Utc::now().timestamp())
-            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0));
-        windows.push(QuotaWindow::from_used_percent(
-            "daily",
-            "Daily",
-            100.0 - daily as f64,
-            daily_reset,
-        ));
+    let daily_reset_raw = proto_varint_field(&quota, 17);
+    let weekly_reset_raw = proto_varint_field(&quota, 18);
+    // f17/f18 实测语义：额度没动过时是「过去的老锚点」，有消费后才是当前窗口的重置时刻。
+    // 因此：剩余 100% 与窗口边界无关，照常显示（不展示过期锚点）；
+    // 有消费但重置时刻已过，说明缓存属于已过期窗口（比如跨过了 16 点日重置），值不可信，整行不显示。
+    let now = Utc::now().timestamp();
+    let mut windows = Vec::new();
+    let mut push = |id: &str, label: &str, remaining: i64, reset_raw: Option<i64>| {
+        if !(0..=100).contains(&remaining) {
+            return;
+        }
+        if remaining < 100 {
+            match reset_raw {
+                Some(secs) if secs > now => windows.push(QuotaWindow::from_used_percent(
+                    id,
+                    label,
+                    100.0 - remaining as f64,
+                    chrono::DateTime::from_timestamp(secs, 0),
+                )),
+                _ => {}
+            }
+        } else {
+            windows.push(QuotaWindow::from_used_percent(id, label, 0.0, None));
+        }
+    };
+    push("daily", "Daily", daily, daily_reset_raw);
+    push("weekly", "Weekly", weekly, weekly_reset_raw);
+    if windows.is_empty() {
+        return None;
     }
-    windows.push(QuotaWindow::from_used_percent(
-        "weekly",
-        "Weekly",
-        100.0 - weekly as f64,
-        weekly_reset,
-    ));
     Some(ProviderReport::ok(
         ProviderId::Devin,
         "Devin",

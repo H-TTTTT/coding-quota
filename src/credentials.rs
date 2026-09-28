@@ -30,6 +30,9 @@ pub struct StoredCred {
     pub expires_ms: Option<i64>,
     pub account_id: Option<String>,
     pub plan: Option<String>,
+    /// omp 凭据类型（"oauth" / "api_key"）：Devin 的 token 进 protobuf metadata
+    /// 时 OAuth 需要加 devin-session-token$ 前缀，API key 不加。
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -41,6 +44,7 @@ pub struct CredentialSet {
     pub glm: Option<StoredCred>,
     pub kimi: Option<StoredCred>,
     pub cursor: Option<StoredCred>,
+    pub devin: Option<StoredCred>,
 }
 
 /// 临时凭据副本的文件名前缀，见 `copy_db` / `sweep_stale_db_copies`。
@@ -341,7 +345,7 @@ fn load_from_sqlite(path: &Path, set: &mut CredentialSet) -> Result<()> {
                     set.kimi = Some(cred);
                 }
             }
-            "cursor" => set.cursor = Some(cred),
+            "devin" => set.devin = Some(cred),
             _ => {}
         }
     }
@@ -364,13 +368,14 @@ fn parse_cred(provider: &str, credential_type: &str, identity_key: &str, data: &
     } else {
         email.clone()
     };
-    let _ = (provider, credential_type, refresh, email);
+    let _ = (provider, refresh, email);
     StoredCred {
         identity,
         access,
         expires_ms,
         account_id,
         plan,
+        kind: Some(credential_type.trim().to_string()),
     }
 }
 
@@ -435,6 +440,7 @@ fn api_key_cred(key: &str) -> StoredCred {
         expires_ms: None,
         account_id: None,
         plan: None,
+        kind: Some("api_key".into()),
     }
 }
 

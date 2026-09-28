@@ -90,10 +90,11 @@ pub async fn fetch_all_streaming(
         tasks.spawn(async move { maybe_fetch(&client, provider, cred, only, &skip).await });
     }
     {
-        // Devin 走 CLI 横幅，不使用 CredentialSet 里的凭据；它本身是阻塞调用，
-        // 由 maybe_devin 挪到 blocking 线程池，不拖住其他平台。
+        // Devin 首选 seat-management 接口（日/周都实时）；无凭据或失败时退回
+        // CLI 横幅（阻塞调用，由 maybe_devin 挪到 blocking 线程池）。
         let skip = skip.clone();
-        tasks.spawn(async move { maybe_devin(only, &skip).await });
+        let cred = creds.devin.clone();
+        tasks.spawn(async move { maybe_devin(client, cred, only, &skip).await });
     }
 
     let mut reports = Vec::new();
@@ -563,7 +564,12 @@ fn parse_kimi(identity: Option<String>, body: Value) -> ProviderReport {
     ProviderReport::ok(ProviderId::Kimi, "Kimi Code", identity, None, windows)
 }
 
-fn kimi_ratio_window(usages: Option<&Value>, key: &str, id: &str, label: &str) -> Option<QuotaWindow> {
+fn kimi_ratio_window(
+    usages: Option<&Value>,
+    key: &str,
+    id: &str,
+    label: &str,
+) -> Option<QuotaWindow> {
     let entry = usages?.get(key)?;
     let ratio = number(entry.get("used_ratio"))?;
     Some(QuotaWindow::from_used_percent(
@@ -923,19 +929,33 @@ fn sanitize(text: &str) -> String {
     out
 }
 
-/// Devin CLI 没有公开额度 API：横幅里那行「Pro · 9% remaining (resets in 2d 4h)」
-/// 是它启动时自己调 GetUserStatus 拿到的实时数据。这里无窗口拉起 devin.exe、
-/// 从 stdout 抓这一行，抓到即杀进程。
-async fn maybe_devin(only: Option<ProviderId>, skip: &[ProviderId]) -> Option<ProviderReport> {
+/// Devin 首选官方 seat-management 接口（omp 同款）：日/周两个窗口的实时剩余与
+/// 重置时刻一次拿全。失败或无凭据时退回 CLI 横幅 + user_status 缓存。
+async fn maybe_devin(
+    client: &reqwest::Client,
+    cred: Option<StoredCred>,
+    only: Option<ProviderId>,
+    skip: &[ProviderId],
+) -> Option<ProviderReport> {
     if only.is_some_and(|wanted| wanted != ProviderId::Devin) || skip.contains(&ProviderId::Devin) {
         return None;
     }
-    // 横幅连续抓不到时退避：省掉每轮最长 25s 的 devin.exe 拉起
+    // 连续失败退避：跳过本轮（无论走接口还是横幅）
     if let Some(report) = deferred_report(ProviderId::Devin, None) {
         return Some(report);
     }
-    // fetch_devin 是同步阻塞（等横幅最长 25s）：在 tokio::join! 里直接调用会
-    // 冻结同任务的其他 provider，全部跟着超时。挪到 blocking 线程池。
+    // 首选 seat-management 接口：日/周两个窗口都是实时值
+    if let Some(cred) = cred {
+        let report = fetch_devin_api(client, cred).await;
+        if report.error.is_none() {
+            if let Ok(mut state) = backoff().lock() {
+                state.succeed(ProviderId::Devin);
+            }
+            return Some(report);
+        }
+    }
+    // 回退：CLI 横幅（实时，但只有更紧的那条）+ user_status 缓存补另一条。
+    // 横幅是同步阻塞（最长 25s），挪到 blocking 线程池，不拖住其他平台。
     let report = tokio::task::spawn_blocking(fetch_devin)
         .await
         .unwrap_or_else(|_| ProviderReport::err(ProviderId::Devin, None, "devin 刷新线程异常"));
@@ -947,6 +967,143 @@ async fn maybe_devin(only: Option<ProviderId>, skip: &[ProviderId]) -> Option<Pr
         }
     }
     Some(report)
+}
+
+const DEVIN_USER_STATUS_URL: &str =
+    "https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus";
+/// OAuth token 放进 protobuf metadata 的 apiKey 字段时要加这个前缀
+/// （omp 的 Yat/F0o 同款）；api_key 类凭据不加。
+const DEVIN_SESSION_PREFIX: &str = "devin-session-token$";
+
+async fn fetch_devin_api(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
+    let identity = cred.identity.clone();
+    let Some(token) = resolve_secret(&cred, "devin") else {
+        return ProviderReport::err(ProviderId::Devin, identity, "missing token (devin)");
+    };
+    let result = post_devin_user_status(client, &token, cred.kind.as_deref()).await;
+    // 与 fetch_with_refresh 同语义：401 才强制刷新重试一次
+    let result = match result {
+        Err(err) if err.starts_with("HTTP 401") => {
+            match credentials::secret_from_omp("devin", true) {
+                Some(fresh) if fresh != token => {
+                    post_devin_user_status(client, &fresh, cred.kind.as_deref()).await
+                }
+                _ => Err(err),
+            }
+        }
+        other => other,
+    };
+    match result {
+        Ok(bytes) => parse_devin_response(&bytes, identity),
+        Err(err) => ProviderReport::err(ProviderId::Devin, identity, err),
+    }
+}
+
+async fn post_devin_user_status(
+    client: &reqwest::Client,
+    token: &str,
+    kind: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    // OAuth token 需要前缀，api_key 原样；已带前缀的不重复加（omp F0o 同款）
+    let api_key = if kind == Some("api_key") || token.starts_with(DEVIN_SESSION_PREFIX) {
+        token.to_string()
+    } else {
+        format!("{DEVIN_SESSION_PREFIX}{token}")
+    };
+    let response = client
+        .post(DEVIN_USER_STATUS_URL)
+        .header("content-type", "application/proto")
+        .header("connect-protocol-version", "1")
+        .header("accept", "*/*")
+        .body(devin_user_status_request(&api_key))
+        .send()
+        .await
+        .map_err(|err| brief(&err))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|err| brief(&err))
+}
+
+/// GetUserStatusRequest { 1: Metadata }，Metadata 只填 omp 实际发送的那组字段
+/// （1=ideName, 2=extensionVersion, 3=apiKey, 4=locale, 5=os, 7=ideVersion,
+/// 12=extensionName, 28=ideType），服务端只认 apiKey。
+fn devin_user_status_request(api_key: &str) -> Vec<u8> {
+    let mut metadata = Vec::new();
+    proto_put_str(&mut metadata, 1, "devin-cli");
+    proto_put_str(&mut metadata, 2, "3000.11.3");
+    proto_put_str(&mut metadata, 3, api_key);
+    proto_put_str(&mut metadata, 4, "en");
+    proto_put_str(&mut metadata, 5, "linux");
+    proto_put_str(&mut metadata, 7, "3000.11.3");
+    proto_put_str(&mut metadata, 12, "chisel");
+    proto_put_str(&mut metadata, 28, "chisel");
+    let mut body = Vec::new();
+    proto_put_bytes(&mut body, 1, &metadata);
+    body
+}
+
+/// 响应 GetUserStatusResponse { 1: userStatus{ 7: email, 13: planStatus{ 1:
+/// planInfo{2: planName}, 14: 日剩余%, 15: 周剩余%, 17/18: 重置 unix 秒 } } }。
+/// 字段号与 2026-09-28 实测响应及 user_status 缓存一致。
+fn parse_devin_response(bytes: &[u8], fallback_identity: Option<String>) -> ProviderReport {
+    let Some(user_status) = proto_field(bytes, 1) else {
+        return ProviderReport::err(ProviderId::Devin, fallback_identity, "响应缺少 userStatus");
+    };
+    let Some(plan_status) = proto_field(&user_status, 13) else {
+        return ProviderReport::err(ProviderId::Devin, fallback_identity, "响应缺少 planStatus");
+    };
+    let now = Utc::now();
+    let plan = proto_field(&plan_status, 1)
+        .and_then(|plan_info| proto_field(&plan_info, 2))
+        .and_then(|bytes| proto_string(&bytes));
+    let identity = proto_field(&user_status, 7)
+        .and_then(|bytes| proto_string(&bytes))
+        .or(fallback_identity);
+    // proto3 省略零值字段：剩余 0% 时 f14/f15 缺席，按 0 处理
+    let mut windows = Vec::new();
+    for (id, label, remaining_field, reset_field) in [
+        ("daily", "Daily", 14_u64, 17_u64),
+        ("weekly", "Weekly", 15, 18),
+    ] {
+        let remaining = proto_varint_field(&plan_status, remaining_field).unwrap_or(0);
+        let reset_at = proto_varint_field(&plan_status, reset_field)
+            .filter(|secs| *secs > 1_600_000_000 && *secs > now.timestamp())
+            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0));
+        windows.push(QuotaWindow::from_used_percent(
+            id,
+            label,
+            100.0 - remaining as f64,
+            reset_at,
+        ));
+    }
+    ProviderReport::ok(ProviderId::Devin, "Devin", identity, plan, windows)
+}
+
+fn proto_put_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        out.push(if value == 0 { byte } else { byte | 0x80 });
+        if value == 0 {
+            return;
+        }
+    }
+}
+
+fn proto_put_str(out: &mut Vec<u8>, field: u64, value: &str) {
+    proto_put_bytes(out, field, value.as_bytes());
+}
+
+fn proto_put_bytes(out: &mut Vec<u8>, field: u64, value: &[u8]) {
+    proto_put_varint(out, (field << 3) | 2);
+    proto_put_varint(out, value.len() as u64);
+    out.extend_from_slice(value);
 }
 
 fn devin_executable() -> Option<std::path::PathBuf> {
@@ -1511,5 +1668,63 @@ mod tests {
         // 无缓存且 1 天内重置：认不出日/周，如实标成当前额度
         let merged = merge_devin_banner(50.0, at(3, 0), &[], now);
         assert_eq!(summary(merged), ["current=50"]);
+    }
+
+    /// seat-management 接口响应：日/周两个窗口的实时剩余 + 重置时刻一次拿全
+    /// （字段布局与 2026-09-28 实测响应一致）。
+    #[test]
+    fn devin_user_status_response_parses_both_windows() {
+        let now = Utc::now();
+        let mut plan_info = Vec::new();
+        proto_put_str(&mut plan_info, 2, "Pro");
+        let mut plan_status = Vec::new();
+        proto_put_bytes(&mut plan_status, 1, &plan_info);
+        let put_varint_field = |out: &mut Vec<u8>, field: u64, value: u64| {
+            proto_put_varint(out, field << 3);
+            proto_put_varint(out, value);
+        };
+        put_varint_field(&mut plan_status, 14, 11);
+        put_varint_field(
+            &mut plan_status,
+            17,
+            (now + chrono::Duration::hours(22)).timestamp() as u64,
+        );
+        put_varint_field(&mut plan_status, 15, 6);
+        put_varint_field(
+            &mut plan_status,
+            18,
+            (now + chrono::Duration::days(6)).timestamp() as u64,
+        );
+        let mut user_status = Vec::new();
+        proto_put_str(&mut user_status, 7, "h68886@gmail.com");
+        proto_put_bytes(&mut user_status, 13, &plan_status);
+        let mut response = Vec::new();
+        proto_put_bytes(&mut response, 1, &user_status);
+
+        let report = parse_devin_response(&response, None);
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(report.plan.as_deref(), Some("Pro"));
+        assert_eq!(report.identity.as_deref(), Some("h68886@gmail.com"));
+        let rows: Vec<(&str, f64, bool)> = report
+            .windows
+            .iter()
+            .map(|window| {
+                (
+                    window.id.as_str(),
+                    (1.0 - window.used_fraction) * 100.0,
+                    window.reset_at.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(rows.len(), 2);
+        for (window, id, expected) in [(rows[0], "daily", 11.0), (rows[1], "weekly", 6.0)] {
+            assert_eq!(window.0, id);
+            assert!(window.2, "{id} 应带重置时间");
+            assert!(
+                (window.1 - expected).abs() < 0.01,
+                "{id} 剩余 {word}%, 期望 {expected}%",
+                word = window.1
+            );
+        }
     }
 }

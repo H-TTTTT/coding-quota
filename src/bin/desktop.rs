@@ -7,7 +7,7 @@ mod tray;
 #[path = "desktop/instance.rs"]
 mod instance;
 use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
-use coding_quota::render::{ago_cn, compact_until_cn, label_cn, title_cn};
+use coding_quota::render::{ago_cn, compact_until_cn, credit_balance_cn, label_cn, title_cn};
 use coding_quota::{cache, credentials, fetch};
 use eframe::egui;
 #[cfg(windows)]
@@ -761,6 +761,9 @@ fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
             small.clone(),
         ));
     }
+    if let Some(credits) = report.credit_balance {
+        width = width.max(text_width(ui, &credit_balance_cn(credits), small.clone()));
+    }
     if report.error.is_some() {
         width = width.max(text_width(ui, &error_text(report), small.clone()));
     }
@@ -770,6 +773,13 @@ fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
             row += gap + text_width(ui, &compact_until_cn(reset), label_mono.clone());
         }
         width = width.max(row);
+        if let Some(resets) = window.resets_left {
+            width = width.max(text_width(
+                ui,
+                &format!("重置卡：剩余 {resets} 次"),
+                small.clone(),
+            ));
+        }
         // 额度条行：条至少 MIN_BAR_WIDTH，右侧固定留 QUOTA_VALUE_WIDTH 给剩余量
         width = width.max(
             MIN_BAR_WIDTH + gap + text_width(ui, &remaining_text(report, window), value.clone()),
@@ -804,6 +814,13 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
             if let Some(resets) = report.resets_left {
                 ui.label(
                     egui::RichText::new(format!("限流重置：剩余 {resets} 次"))
+                        .small()
+                        .color(egui::Color32::from_rgb(160, 160, 160)),
+                );
+            }
+            if let Some(credits) = report.credit_balance {
+                ui.label(
+                    egui::RichText::new(credit_balance_cn(credits))
                         .small()
                         .color(egui::Color32::from_rgb(160, 160, 160)),
                 );
@@ -865,6 +882,13 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                         ui.label(egui::RichText::new(extra).size(11.0).color(main));
                     });
                 });
+                if let Some(resets) = window.resets_left {
+                    ui.label(
+                        egui::RichText::new(format!("重置卡：剩余 {resets} 次"))
+                            .small()
+                            .color(dim),
+                    );
+                }
                 ui.add_space(2.0);
             }
         });

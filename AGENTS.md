@@ -46,6 +46,8 @@ On the current Windows workstation, Rust is available in WSL Ubuntu-24.04. Use `
 - UI state belongs to the TUI loop / `DesktopApp`; communicate background results through existing task/channel boundaries. Never block the input loop on HTTP.
 - Reuse shared labels/time formatters in `render.rs`. Keep measured content, visible-provider filtering and drawn content consistent so dynamic height does not reserve space for hidden cards.
 - Quota reset time, subscription expiry, token expiry and manual reset-credit inventory are different concepts. Never derive one from another or invent a missing count/date.
+- GLM manual reset inventory comes from the read-only `/api/biz/customer-package-reset/list?targetType=PERSONAL` endpoint using the same raw API-key auth as quota usage. Count only `available: true` in `fiveHourResets` / `weekResets` and store each count in `QuotaWindow.resets_left`; missing inventory is unknown, not zero. Never call `/use` from this viewer.
+- Codex `credits.balance` / `credits.unlimited` map to `ProviderReport.credit_balance`, independently of report-level `resets_left` (rate-limit reset credits). GUI/TUI share `render::credit_balance_cn`; snapshot/JSON and stale-cache backfill must preserve the same balance, including zero and unlimited states.
 - Windows integration uses handwritten FFI under `cfg(windows)` with non-Windows alternatives. Preserve handle ownership, thread shutdown and platform guards.
 
 ## Important Files

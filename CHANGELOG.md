@@ -15,6 +15,8 @@ All notable changes to this project are documented in this file.
 - 把 exe 移动或改名之后，开机自启不再静默失效：启动时检查 `HKCU\...\Run` 里的路径（仅在自启已开启时），与实际位置不一致就改写为当前可执行文件，比较忽略大小写。
 - 进程被强杀（关掉终端窗口、结束任务）时来不及删除的只读凭据数据库副本（`%TEMP%\coding-quota-*-agent.db` 及其 `-wal` / `-shm`）现在会在启动时清扫；修改时间不足 10 分钟的副本视为并发进程正在使用，不会误删。
 - Devin 的日/周额度现在都是实时值：卡片优先走 omp 同款的 seat-management 接口（`server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus`，用 omp 里的 `devin` 登录授权），不再出现「非更紧窗口停在旧值、与网页对不上」的情况；无该凭据或请求失败时仍回退 CLI 横幅 + `user_status` 缓存。
+- 智谱重置卡不再遗漏：用现有 Coding Plan API key 只读查询 `/api/biz/customer-package-reset/list?targetType=PERSONAL`，按官网的 `available: true` 分别统计 5 小时和周重置卡；GUI、TUI、文本快照和 JSON 均显示对应窗口的剩余次数。不可用记录不计数，查询失败保留正常额度，不伪造零次；不调用消耗重置卡的接口。
+- Codex（含 Pro 套餐）现在显示 `/wham/usage` 的 `credits.balance` 积分余额，与限流重置次数分开；保留小数，零余额、无限积分和未返回余额明确区分，刷新失败时按已有缓存规则保留上次的余额。GUI/TUI 的尺寸测量包含新增行，`--snapshot` / `--json` 同步输出。
 
 ## 0.3.1 - 2026-09-26
 

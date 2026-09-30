@@ -4,7 +4,9 @@ use coding_quota::cache;
 use coding_quota::credentials::{self, CredentialSet};
 use coding_quota::fetch;
 use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
-use coding_quota::render::{ago_cn, bar_parts, compact_until_cn, label_cn, status_color, title_cn};
+use coding_quota::render::{
+    ago_cn, bar_parts, compact_until_cn, credit_balance_cn, label_cn, status_color, title_cn,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -633,6 +635,15 @@ fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<
             ),
         ]));
     }
+    if let Some(credits) = report.credit_balance {
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
+            Span::styled(
+                credit_balance_cn(credits),
+                Style::default().fg(if stale { FG_MUTED } else { FG_ACCENT }),
+            ),
+        ]));
+    }
 
     if let Some(text) = error_line(report) {
         lines.push(Line::from(Span::styled(
@@ -683,6 +694,15 @@ fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<
             ),
             Span::raw(" ".repeat(pad)),
         ]));
+        if let Some(resets) = window.resets_left {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
+                Span::styled(
+                    format!("重置卡：剩余 {resets} 次"),
+                    Style::default().fg(if stale { FG_MUTED } else { FG_ACCENT }),
+                ),
+            ]));
+        }
     }
     lines
 }

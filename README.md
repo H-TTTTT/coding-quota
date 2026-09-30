@@ -28,7 +28,9 @@ Zero configuration: the tool reads the existing omp credential store (`~/.omp/ag
 ## Features
 
 - Each quota window shows the remaining percentage, a usage-colored bar (green <70%, yellow ≥70%, red ≥90%), and its reset time
-- Codex additionally shows remaining rate-limit reset credits
+- Codex additionally shows remaining rate-limit reset credits and its credit balance (including Pro plans); finite balances retain decimals, unlimited credits are labelled explicitly, and unavailable balances are not shown as zero
+- Zhipu shows available reset cards separately for the 5-hour and weekly windows; only records marked available are counted, and a reset-inventory query failure does not hide regular usage. Inventory queries are read-only: this tool never spends reset cards
+- `--json` exposes Codex `credit_balance` (`kind: limited` with `balance`, or `kind: unlimited`) and each Zhipu window's optional `resets_left`; missing fields mean unknown, while a known empty reset-card inventory is zero
 - Failed refreshes keep the last good values (cached in `%APPDATA%\coding-quota\last_good.json`), drawn dimmed with their age; values older than 24 hours are dropped rather than shown, and a provider that keeps failing is retried with backoff instead of every round. `--json` / `--snapshot` always report the live result
 - Both the widget and the TUI fit their size to the content
 

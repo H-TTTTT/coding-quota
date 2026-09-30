@@ -78,6 +78,9 @@ pub struct QuotaWindow {
     pub unit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_at: Option<DateTime<Utc>>,
+    /// 当前额度窗口可用的手动重置卡次数；未查询到库存时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_left: Option<i64>,
 }
 
 impl QuotaWindow {
@@ -95,6 +98,7 @@ impl QuotaWindow {
             limit: None,
             unit: Some("percent".into()),
             reset_at,
+            resets_left: None,
         }
     }
 
@@ -119,8 +123,17 @@ impl QuotaWindow {
             limit: Some(limit),
             unit: Some(unit.into()),
             reset_at,
+            resets_left: None,
         }
     }
+}
+
+/// Codex 的额外积分余额，不是限流窗口的剩余百分比或重置次数。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "balance", rename_all = "snake_case")]
+pub enum CreditBalance {
+    Limited(f64),
+    Unlimited,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +147,8 @@ pub struct ProviderReport {
     /// 剩余限流重置次数（目前只有 Codex 提供）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resets_left: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_balance: Option<CreditBalance>,
     pub windows: Vec<QuotaWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -154,6 +169,7 @@ impl ProviderReport {
             identity,
             plan,
             resets_left: None,
+            credit_balance: None,
             windows,
             error: None,
             fetched_at: Utc::now(),
@@ -167,6 +183,7 @@ impl ProviderReport {
             identity,
             plan: None,
             resets_left: None,
+            credit_balance: None,
             windows: Vec::new(),
             error: Some(error.into()),
             fetched_at: Utc::now(),

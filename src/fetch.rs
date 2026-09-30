@@ -1,6 +1,6 @@
 use crate::backoff::Backoff;
 use crate::credentials::{self, CredentialSet, StoredCred};
-use crate::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
+use crate::model::{CreditBalance, ProviderId, ProviderReport, QuotaWindow, Snapshot};
 use chrono::{DateTime, TimeZone, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
 use serde_json::Value;
@@ -217,20 +217,31 @@ async fn fetch_glm(client: &reqwest::Client, cred: StoredCred) -> ProviderReport
         return ProviderReport::err(ProviderId::Glm, cred.identity, "missing API key");
     };
     let urls = [
-        "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
-        "https://bigmodel.cn/api/monitor/usage/quota/limit",
+        (
+            "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+            "https://open.bigmodel.cn/api/biz/customer-package-reset/list?targetType=PERSONAL",
+        ),
+        (
+            "https://bigmodel.cn/api/monitor/usage/quota/limit",
+            "https://bigmodel.cn/api/biz/customer-package-reset/list?targetType=PERSONAL",
+        ),
     ];
     let mut last_err = "no endpoint responded".to_string();
-    for url in urls {
-        match get_json(client, url, raw_auth(&key)).await {
-            Ok(body) => return parse_glm(cred.identity.clone(), body),
+    for (quota_url, reset_url) in urls {
+        match get_json(client, quota_url, raw_auth(&key)).await {
+            Ok(body) => {
+                // 官网的重置管理单独查询库存；只读 list，不调用消耗重置卡的 use。
+                // 库存不可用时不伪造零次，也不让正常额度查询失败。
+                let resets = get_json(client, reset_url, raw_auth(&key)).await.ok();
+                return parse_glm(cred.identity, body, resets.as_ref());
+            }
             Err(err) => last_err = err,
         }
     }
     ProviderReport::err(ProviderId::Glm, cred.identity, last_err)
 }
 
-fn parse_glm(identity: Option<String>, body: Value) -> ProviderReport {
+fn parse_glm(identity: Option<String>, body: Value, reset_body: Option<&Value>) -> ProviderReport {
     let data = body.get("data").unwrap_or(&body);
     let plan = data
         .get("level")
@@ -238,6 +249,22 @@ fn parse_glm(identity: Option<String>, body: Value) -> ProviderReport {
         .map(|s| format!("Coding Plan {}", s.to_ascii_uppercase()));
     let Some(limits) = data.get("limits").and_then(|v| v.as_array()) else {
         return ProviderReport::err(ProviderId::Glm, identity, "invalid quota payload");
+    };
+    let reset_data = reset_body
+        .filter(|body| {
+            body.get("code").and_then(Value::as_i64) == Some(200)
+                && body.get("success").and_then(Value::as_bool) == Some(true)
+        })
+        .and_then(|body| body.get("data"));
+    let available_resets = |field: &str| -> Option<i64> {
+        let cards = reset_data?.get(field)?.as_array()?;
+        // 与官网一致以 available 为准，不能把过期/不可用记录算进库存。
+        Some(
+            cards
+                .iter()
+                .filter(|card| card.get("available").and_then(Value::as_bool) == Some(true))
+                .count() as i64,
+        )
     };
 
     let mut windows = Vec::new();
@@ -253,16 +280,14 @@ fn parse_glm(identity: Option<String>, body: Value) -> ProviderReport {
             ("TOKENS_LIMIT" | "CREDIT_LIMIT", _) => ("glm-credit", "Credits"),
             _ => continue,
         };
-        if let Some(window) = glm_count_window(id, label, limit, reset) {
-            windows.push(window);
-        } else {
-            windows.push(QuotaWindow::from_used_percent(
-                id,
-                label,
-                used_percent,
-                reset,
-            ));
-        }
+        let mut window = glm_count_window(id, label, limit, reset)
+            .unwrap_or_else(|| QuotaWindow::from_used_percent(id, label, used_percent, reset));
+        window.resets_left = match id {
+            "glm-5h" => available_resets("fiveHourResets"),
+            "glm-week" => available_resets("weekResets"),
+            _ => None,
+        };
+        windows.push(window);
     }
     if windows.is_empty() {
         return ProviderReport::err(ProviderId::Glm, identity, "no quota windows");
@@ -727,6 +752,15 @@ fn parse_codex(identity: Option<String>, plan: Option<String>, body: Value) -> P
     );
     report.resets_left =
         number(body.pointer("/rate_limit_reset_credits/available_count")).map(|value| value as i64);
+    report.credit_balance = body.get("credits").and_then(|credits| {
+        if credits.get("unlimited").and_then(Value::as_bool) == Some(true) {
+            Some(CreditBalance::Unlimited)
+        } else {
+            number(credits.get("balance"))
+                .filter(|balance| balance.is_finite())
+                .map(CreditBalance::Limited)
+        }
+    });
     report
 }
 
@@ -1572,6 +1606,140 @@ fn parse_devin_reset(text: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_credit_balance_is_separate_from_usage_and_reset_count() {
+        for (credits, expected) in [
+            (
+                serde_json::json!({"unlimited": false, "balance": "62500.5"}),
+                CreditBalance::Limited(62500.5),
+            ),
+            (
+                serde_json::json!({"has_credits": false, "unlimited": false, "balance": 0}),
+                CreditBalance::Limited(0.0),
+            ),
+            (
+                serde_json::json!({"unlimited": true, "balance": "0"}),
+                CreditBalance::Unlimited,
+            ),
+        ] {
+            let report = parse_codex(
+                None,
+                None,
+                serde_json::json!({
+                    "plan_type": "pro",
+                    "rate_limit": {"primary_window": {
+                        "used_percent": 40, "limit_window_seconds": 18000
+                    }},
+                    "rate_limit_reset_credits": {"available_count": 2},
+                    "credits": credits
+                }),
+            );
+            assert_eq!(report.credit_balance, Some(expected));
+            assert_eq!(report.resets_left, Some(2));
+            assert_eq!(report.windows[0].used_fraction, 0.4);
+        }
+    }
+
+    #[test]
+    fn codex_unavailable_credit_balance_does_not_invent_zero() {
+        for credits in [
+            Value::Null,
+            serde_json::json!({"has_credits": true}),
+            serde_json::json!({"balance": "NaN"}),
+        ] {
+            let report = parse_codex(
+                None,
+                None,
+                serde_json::json!({
+                    "rate_limit": {"primary_window": {
+                        "used_percent": 20, "limit_window_seconds": 18000
+                    }},
+                    "credits": credits
+                }),
+            );
+            assert_eq!(report.credit_balance, None);
+            assert_eq!(report.windows[0].used_fraction, 0.2);
+            assert!(report.error.is_none(), "{:?}", report.error);
+        }
+    }
+
+    fn glm_quota_fixture() -> Value {
+        serde_json::json!({
+            "data": {
+                "level": "pro",
+                "limits": [
+                    {"type": "TOKENS_LIMIT", "unit": 3, "percentage": 20},
+                    {"type": "CREDIT_LIMIT", "unit": 6, "percentage": 60},
+                    {"type": "TIME_LIMIT", "unit": 5, "usage": 10, "number": 100}
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn glm_reset_cards_count_only_available_records_per_window() {
+        let resets = serde_json::json!({
+            "code": 200,
+            "success": true,
+            "data": {
+                "fiveHourResets": [
+                    {"available": true},
+                    {"available": false},
+                    {"available": true},
+                    {"available": "true"},
+                    {}
+                ],
+                "weekResets": [{"available": true}, {"available": false}]
+            }
+        });
+        let report = parse_glm(None, glm_quota_fixture(), Some(&resets));
+        assert!(report.error.is_none(), "{:?}", report.error);
+        let windows: Vec<_> = report
+            .windows
+            .iter()
+            .map(|window| (window.id.as_str(), window.used_fraction, window.resets_left))
+            .collect();
+        assert_eq!(
+            windows,
+            [
+                ("glm-5h", 0.2, Some(2)),
+                ("glm-week", 0.6, Some(1)),
+                ("glm-mcp", 0.1, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn glm_reset_inventory_distinguishes_zero_from_unknown() {
+        for resets in [
+            None,
+            Some(serde_json::json!({"code": 401, "success": false, "data": {
+                "fiveHourResets": [], "weekResets": []
+            }})),
+            Some(serde_json::json!({"code": 200, "success": true, "data": {
+                "fiveHourResets": null, "weekResets": {}
+            }})),
+        ] {
+            let report = parse_glm(None, glm_quota_fixture(), resets.as_ref());
+            assert_eq!(report.windows[0].used_fraction, 0.2);
+            assert_eq!(report.windows[1].used_fraction, 0.6);
+            assert!(report
+                .windows
+                .iter()
+                .all(|window| window.resets_left.is_none()));
+            assert!(report.error.is_none(), "{:?}", report.error);
+        }
+        let empty = serde_json::json!({
+            "code": 200, "success": true, "data": {
+                "fiveHourResets": [], "weekResets": [{"available": false}]
+            }
+        });
+        let report = parse_glm(None, glm_quota_fixture(), Some(&empty));
+        assert_eq!(report.windows[0].resets_left, Some(0));
+        assert_eq!(report.windows[1].resets_left, Some(0));
+        assert_eq!(report.windows[2].resets_left, None);
+    }
 
     /// Anthropic 正把额度从 five_hour / seven_day 迁到 limits 数组：旧字段为 null 时
     /// 必须回落到 limits，否则整张卡片退化成「no quota windows」。

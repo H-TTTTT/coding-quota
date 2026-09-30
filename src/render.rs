@@ -1,5 +1,6 @@
-use crate::model::{ProviderReport, QuotaWindow, Snapshot};
+use crate::model::{CreditBalance, ProviderReport, QuotaWindow, Snapshot};
 use chrono::{DateTime, Utc};
+use std::fmt::Write;
 
 pub fn snapshot_text(snapshot: &Snapshot) -> String {
     let mut out = String::new();
@@ -28,6 +29,12 @@ fn provider_block(report: &ProviderReport) -> String {
     if let Some(resets) = report.resets_left {
         lines.push(format!("  rate-limit resets left: {resets}"));
     }
+    if let Some(credits) = report.credit_balance {
+        lines.push(match credits {
+            CreditBalance::Limited(balance) => format!("  credits left: {balance}"),
+            CreditBalance::Unlimited => "  credits: unlimited".into(),
+        });
+    }
     if let Some(error) = &report.error {
         lines.push(format!("  ○ {error}"));
         return lines.join("\n");
@@ -54,14 +61,18 @@ fn format_window(window: &QuotaWindow) -> String {
     };
     let reset = window.reset_at.map(compact_until).unwrap_or_default();
     let pad = (ROW_WIDTH - 2).saturating_sub(window.label.chars().count() + reset.chars().count());
-    format!(
+    let mut out = format!(
         "  {}{}{}\n  {}  {}",
         window.label,
         " ".repeat(pad),
         reset,
         bar(remaining, BAR_WIDTH),
         extra,
-    )
+    );
+    if let Some(resets) = window.resets_left {
+        write!(out, "\n  reset cards left: {resets}").expect("writing to a String cannot fail");
+    }
+    out
 }
 
 pub fn bar(fraction: f64, width: usize) -> String {
@@ -111,6 +122,13 @@ pub fn title_cn(title: &str) -> &str {
     match title {
         "Zhipu Coding Plan" => "智谱 Coding Plan",
         other => other,
+    }
+}
+
+pub fn credit_balance_cn(credits: CreditBalance) -> String {
+    match credits {
+        CreditBalance::Limited(balance) => format!("积分：剩余 {balance}"),
+        CreditBalance::Unlimited => "积分：无限".into(),
     }
 }
 

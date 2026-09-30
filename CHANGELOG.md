@@ -17,6 +17,7 @@ All notable changes to this project are documented in this file.
 - Devin 的日/周额度现在都是实时值：卡片优先走 omp 同款的 seat-management 接口（`server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus`，用 omp 里的 `devin` 登录授权），不再出现「非更紧窗口停在旧值、与网页对不上」的情况；无该凭据或请求失败时仍回退 CLI 横幅 + `user_status` 缓存。
 - 智谱重置卡不再遗漏：用现有 Coding Plan API key 只读查询 `/api/biz/customer-package-reset/list?targetType=PERSONAL`，按官网的 `available: true` 分别统计 5 小时和周重置卡；GUI、TUI、文本快照和 JSON 均显示对应窗口的剩余次数。不可用记录不计数，查询失败保留正常额度，不伪造零次；不调用消耗重置卡的接口。
 - Codex（含 Pro 套餐）现在显示 `/wham/usage` 的 `credits.balance` 积分余额，与限流重置次数分开；保留小数，零余额、无限积分和未返回余额明确区分，刷新失败时按已有缓存规则保留上次的余额。GUI/TUI 的尺寸测量包含新增行，`--snapshot` / `--json` 同步输出。
+- MCP 每月额度现在显示剩余次数：智谱接口里 MCP 行的 `number=1` 是套餐标志位不是总量，之前 75/4000 被当成 1% 的百分比条。修正为按 `currentValue`（已用）+ `remaining`（剩余）计算总量，GUI、TUI、快照与 JSON 一致显示 `剩余 3925/4000` 这样的次数。
 
 ## 0.3.1 - 2026-09-26
 

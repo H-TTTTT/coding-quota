@@ -308,7 +308,10 @@ fn glm_count_window(
     reset: Option<DateTime<Utc>>,
 ) -> Option<QuotaWindow> {
     let used = number(limit.get("currentValue")).or_else(|| number(limit.get("usage")))?;
+    // `number` 只有在不小于已用量时才是总量：MCP 行的 number=1 是套餐标志位，
+    // 真实总量在 currentValue + remaining（官网也按次数显示 MCP 月度额度）。
     let total = number(limit.get("number"))
+        .filter(|total| *total >= used)
         .or_else(|| number(limit.get("remaining")).map(|remain| used + remain))?;
     if total > 1.0 {
         Some(QuotaWindow::from_used_limit(
@@ -1675,6 +1678,26 @@ mod tests {
                 ]
             }
         })
+    }
+
+    /// MCP 行的 `number` 是标志位（1）不是总量；真实总量 = currentValue + remaining
+    /// （实测 number=1 / usage=4000 / currentValue=75 / remaining=3925）。
+    /// 之前 75/4000 会被当成 1% 的百分比条，剩余次数根本显示不出来。
+    #[test]
+    fn glm_mcp_window_shows_remaining_counts_not_the_flag_number() {
+        let body = serde_json::json!({
+            "data": {"limits": [{
+                "type": "TIME_LIMIT", "unit": 5,
+                "number": 1, "usage": 4000, "currentValue": 75, "remaining": 3925
+            }]}
+        });
+        let report = parse_glm(None, body, None);
+        let window = &report.windows[0];
+        assert_eq!(window.id, "glm-mcp");
+        assert_eq!(window.used, Some(75.0));
+        assert_eq!(window.limit, Some(4000.0));
+        assert!((window.used_fraction - 75.0 / 4000.0).abs() < 1e-9);
+        assert_eq!(window.resets_left, None);
     }
 
     #[test]

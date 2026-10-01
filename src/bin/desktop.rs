@@ -641,32 +641,39 @@ impl eframe::App for DesktopApp {
                         content_width = rect.width();
                     }
                     Some(snapshot) => {
-                        // 不用 ScrollArea：窗口高度已跟随内容，滚动条只会在
-                        // 高度切换的瞬态帧里闪现。内容超高时由 max_h 兜底裁剪。
-                        let start = ui.cursor().top();
+                        // 卡片区放在纵向 ScrollArea 里：窗口高度仍按内容自适应
+                        //（target_h 超过 max_h 时被压到 max_h），短屏幕、卡片多时
+                        // 内容超出视口可以滚动，最后一张卡（Antigravity）不会被裁到
+                        // 够不着。auto_shrink(false) 让内容撑满可用宽度，绘制与
+                        // measure_report_width 的量宽口径保持一致。
                         let mut shown = 0;
                         let mut widest: f32 = 0.0;
-                        for report in &snapshot.reports {
-                            // omp 中没有授权的、以及托盘里取消勾选的平台都不显示
-                            if report.is_missing()
-                                || tray::is_hidden(&self.hidden_providers, report.provider)
-                            {
-                                continue;
-                            }
-                            // 先量宽度再绘制：内容超出可用宽度时 egui 会直接裁掉右侧，
-                            // 画完再量只能量到被裁后的尺寸。
-                            widest = widest.max(measure_report_width(ui, report));
-                            draw_report(ui, report);
-                            ui.add_space(6.0);
-                            shown += 1;
-                        }
-                        if shown == 0 {
-                            ui.label(
-                                egui::RichText::new("无可显示平台")
-                                    .color(egui::Color32::from_rgb(218, 218, 218)),
-                            );
-                        }
-                        content_height = ui.cursor().top() - start;
+                        let scroll = egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for report in &snapshot.reports {
+                                    // omp 中没有授权的、以及托盘里取消勾选的平台都不显示
+                                    if report.is_missing()
+                                        || tray::is_hidden(&self.hidden_providers, report.provider)
+                                    {
+                                        continue;
+                                    }
+                                    // 先量宽度再绘制：内容超出可用宽度时 egui 会直接裁掉右侧，
+                                    // 画完再量只能量到被裁后的尺寸。
+                                    widest = widest.max(measure_report_width(ui, report));
+                                    draw_report(ui, report);
+                                    ui.add_space(6.0);
+                                    shown += 1;
+                                }
+                                if shown == 0 {
+                                    ui.label(
+                                        egui::RichText::new("无可显示平台")
+                                            .color(egui::Color32::from_rgb(218, 218, 218)),
+                                    );
+                                }
+                            });
+                        // 高度用 ScrollArea 量到的完整内容高度（不是被视口截短后的）。
+                        content_height = scroll.content_size.y;
                         content_width = widest;
                     }
                 }

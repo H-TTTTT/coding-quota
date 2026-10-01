@@ -30,6 +30,7 @@ pub const TUI_COLUMNS: u16 = 48;
 pub const TUI_LEFT_GUTTER: usize = 2;
 pub const TUI_ROWS: u16 = 34;
 const TUI_MIN_ROWS: u16 = 8;
+/// 物理窗口高度上限保持原值：内容装不下时靠 ↑↓ 滚动到达末张卡片，不撑高终端。
 const TUI_MAX_ROWS: u16 = 48;
 const CHROME_ROWS: u16 = 5;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -345,6 +346,12 @@ async fn run_with(creds: CredentialSet, only: Option<ProviderId>, demo: bool) ->
     resize_terminal(&mut terminal, TUI_COLUMNS, TUI_ROWS);
     let _drag_watcher = native_drag::Watcher::start();
     let mut snapshot: Option<Snapshot> = demo.then(demo_snapshot);
+    // 内容行数（未截断）与滚动偏移：视口装不下全部卡片时用 ↑↓ 翻到最后一张。
+    let mut content_rows: u16 = snapshot
+        .as_ref()
+        .map(|snap| body_paragraph(snap, TUI_COLUMNS).line_count(TUI_COLUMNS) as u16)
+        .unwrap_or(0);
+    let mut scroll: u16 = 0;
     let mut last_rows = TUI_ROWS;
     if demo {
         // 演示模式没有刷新回调，启动时直接按内容收一次高度。
@@ -364,6 +371,10 @@ async fn run_with(creds: CredentialSet, only: Option<ProviderId>, demo: bool) ->
         if inflight.as_ref().is_some_and(|handle| handle.is_finished()) {
             if let Some(handle) = inflight.take() {
                 if let Ok(snap) = handle.await {
+                    content_rows =
+                        body_paragraph(&snap, TUI_COLUMNS).line_count(TUI_COLUMNS) as u16;
+                    // 内容变短时收回超出的滚动，末张卡片始终可达。
+                    scroll = scroll.min(max_scroll(content_rows));
                     snapshot = Some(snap);
                     last_refresh = Instant::now();
                     let rows = needed_rows(snapshot.as_ref());
@@ -376,7 +387,14 @@ async fn run_with(creds: CredentialSet, only: Option<ProviderId>, demo: bool) ->
         }
 
         let loading = inflight.is_some();
-        terminal.draw(|frame| draw(frame, snapshot.as_ref(), loading.then_some(spin_frame)))?;
+        terminal.draw(|frame| {
+            draw(
+                frame,
+                snapshot.as_ref(),
+                loading.then_some(spin_frame),
+                scroll,
+            )
+        })?;
         if loading {
             spin_frame = spin_frame.wrapping_add(1);
         }
@@ -393,6 +411,19 @@ async fn run_with(creds: CredentialSet, only: Option<ProviderId>, demo: bool) ->
                     KeyCode::Char('r') if inflight.is_none() && !demo => {
                         inflight = Some(spawn_refresh(creds.clone(), only));
                     }
+                    KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        scroll = scroll.saturating_add(1).min(max_scroll(content_rows));
+                    }
+                    KeyCode::PageUp => {
+                        scroll = scroll.saturating_sub(body_viewport_rows().max(1));
+                    }
+                    KeyCode::PageDown => {
+                        let page = body_viewport_rows().max(1);
+                        scroll = scroll.saturating_add(page).min(max_scroll(content_rows));
+                    }
+                    KeyCode::Home => scroll = 0,
+                    KeyCode::End => scroll = max_scroll(content_rows),
                     _ => {}
                 },
                 _ => {}
@@ -434,6 +465,7 @@ fn now() -> chrono::DateTime<chrono::Utc> {
 }
 
 /// 固定的演示数据：身份一律为 example.com / demo 占位，用量覆盖绿黄红三档。
+/// Antigravity 演示 Gemini 和平台内 Claude/GPT 共享额度的四个窗口。
 fn demo_snapshot() -> Snapshot {
     let mut codex = ProviderReport::ok(
         ProviderId::Codex,
@@ -494,6 +526,38 @@ fn demo_snapshot() -> Snapshot {
                 QuotaWindow::from_used_percent("total", "Included total", 44.0, days(2)),
             ],
         ),
+        ProviderReport::ok(
+            ProviderId::Antigravity,
+            "Google Antigravity",
+            Some("demo@example.com".into()),
+            None,
+            vec![
+                QuotaWindow::from_used_percent(
+                    "antigravity-gemini-5h",
+                    "Gemini · 5h window",
+                    18.0,
+                    hours(3),
+                ),
+                QuotaWindow::from_used_percent(
+                    "antigravity-gemini-weekly",
+                    "Gemini · Weekly",
+                    74.0,
+                    days(2),
+                ),
+                QuotaWindow::from_used_percent(
+                    "antigravity-3p-5h",
+                    "Claude & GPT (shared) · 5h window",
+                    93.0,
+                    hours(1),
+                ),
+                QuotaWindow::from_used_percent(
+                    "antigravity-3p-weekly",
+                    "Claude & GPT (shared) · Weekly",
+                    45.0,
+                    days(5),
+                ),
+            ],
+        ),
     ];
     Snapshot {
         fetched_at: now() - chrono::Duration::minutes(1),
@@ -501,7 +565,7 @@ fn demo_snapshot() -> Snapshot {
     }
 }
 
-fn draw(frame: &mut Frame, snapshot: Option<&Snapshot>, spin: Option<usize>) {
+fn draw(frame: &mut Frame, snapshot: Option<&Snapshot>, spin: Option<usize>, scroll: u16) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -544,27 +608,36 @@ fn draw(frame: &mut Frame, snapshot: Option<&Snapshot>, spin: Option<usize>) {
     title.extend(right_spans);
     frame.render_widget(Paragraph::new(Line::from(title)), chunks[1]);
 
+    let mut overflow = false;
     if let Some(snapshot) = snapshot {
-        let width = (chunks[3].width as usize).saturating_sub(TUI_LEFT_GUTTER);
-        frame.render_widget(
-            Paragraph::new(body_lines(snapshot, width)).wrap(Wrap { trim: false }),
-            chunks[3],
-        );
+        let paragraph = body_paragraph(snapshot, chunks[3].width);
+        let max = (paragraph.line_count(chunks[3].width) as u16).saturating_sub(chunks[3].height);
+        overflow = max > 0;
+        frame.render_widget(paragraph.scroll((scroll.min(max), 0)), chunks[3]);
     }
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
-            Span::styled("[Q]", Style::default().fg(FG_ACCENT)),
-            Span::styled(" 关闭  ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled("[R]", Style::default().fg(FG_ACCENT)),
-            Span::styled(
-                " 刷新  每 2 分钟自动刷新",
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ])),
-        chunks[5],
-    );
+    let mut footer = vec![
+        Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
+        Span::styled("[Q]", Style::default().fg(FG_ACCENT)),
+        Span::styled(" 关闭  ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled("[R]", Style::default().fg(FG_ACCENT)),
+        Span::styled(
+            " 刷新  每 2 分钟自动刷新",
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ];
+    if overflow {
+        footer.push(Span::styled(
+            " ",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        footer.push(Span::styled("[↑↓]", Style::default().fg(FG_ACCENT)));
+        footer.push(Span::styled(
+            " 滚动",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(footer)), chunks[5]);
 }
 
 fn body_lines(snapshot: &Snapshot, width: usize) -> Vec<Line<'static>> {
@@ -598,9 +671,28 @@ fn body_lines(snapshot: &Snapshot, width: usize) -> Vec<Line<'static>> {
 }
 
 fn needed_rows(snapshot: Option<&Snapshot>) -> u16 {
-    let width = (TUI_COLUMNS as usize).saturating_sub(TUI_LEFT_GUTTER);
-    let content = snapshot.map_or(1, |snap| body_lines(snap, width).len());
+    let content = snapshot.map_or(1, |snap| {
+        body_paragraph(snap, TUI_COLUMNS).line_count(TUI_COLUMNS)
+    });
     (content as u16 + CHROME_ROWS).clamp(TUI_MIN_ROWS, TUI_MAX_ROWS)
+}
+
+/// 绘制、量高和滚动使用同一个自动换行口径，长错误行也不会截断末张卡片。
+fn body_paragraph(snapshot: &Snapshot, columns: u16) -> Paragraph<'static> {
+    let width = usize::from(columns).saturating_sub(TUI_LEFT_GUTTER);
+    Paragraph::new(body_lines(snapshot, width)).wrap(Wrap { trim: false })
+}
+
+/// 当前终端里正文区看得见的高度：布局里除正文外还有 CHROME_ROWS 行固定装饰。
+fn body_viewport_rows() -> u16 {
+    crossterm::terminal::size()
+        .map(|(_, rows)| rows.saturating_sub(CHROME_ROWS))
+        .unwrap_or(TUI_ROWS.saturating_sub(CHROME_ROWS))
+}
+
+/// 内容超出视口时允许滚动的最大行数（滚到末张卡片底部）。
+fn max_scroll(content_rows: u16) -> u16 {
+    content_rows.saturating_sub(body_viewport_rows())
 }
 
 fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<Line<'static>> {
@@ -776,4 +868,47 @@ fn resize_terminal(terminal: &mut AppTerminal, columns: u16, rows: u16) {
         let _ = terminal.clear();
     }
     native_drag::end_resize();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn scrolling_reaches_last_quota_after_wrapped_refresh_error() {
+        let mut snapshot = demo_snapshot();
+        snapshot.reports[0].error =
+            Some("quota request temporarily failed while showing cached data ".repeat(8));
+        let marker = "tail-quota-marker";
+        snapshot
+            .reports
+            .last_mut()
+            .unwrap()
+            .windows
+            .last_mut()
+            .unwrap()
+            .label = marker.into();
+        let mut terminal = Terminal::new(TestBackend::new(TUI_COLUMNS, 20)).unwrap();
+        let visible_text = |terminal: &Terminal<TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        terminal
+            .draw(|frame| draw(frame, Some(&snapshot), None, 0))
+            .unwrap();
+        assert!(!visible_text(&terminal).contains(marker));
+        terminal
+            .draw(|frame| draw(frame, Some(&snapshot), None, u16::MAX))
+            .unwrap();
+        assert!(
+            visible_text(&terminal).contains(marker),
+            "the last quota must remain reachable even when a cached-error row wraps"
+        );
+    }
 }

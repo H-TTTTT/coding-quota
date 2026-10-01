@@ -11,12 +11,13 @@ pub enum ProviderId {
     Kimi,
     Cursor,
     Devin,
+    Antigravity,
 }
 
 impl ProviderId {
     /// 展示顺序：各处的卡片顺序、`--snapshot` 与缓存的稳定落盘顺序都用它。
     /// 并行取数回来的是完成顺序，不按它排序卡片会每轮跳位置。
-    pub const ALL: [ProviderId; 7] = [
+    pub const ALL: [ProviderId; 8] = [
         Self::Codex,
         Self::Claude,
         Self::Grok,
@@ -24,6 +25,7 @@ impl ProviderId {
         Self::Kimi,
         Self::Cursor,
         Self::Devin,
+        Self::Antigravity,
     ];
 
     /// 在 `ALL` 里的下标，用作稳定排序键。
@@ -36,6 +38,7 @@ impl ProviderId {
             Self::Kimi => 4,
             Self::Cursor => 5,
             Self::Devin => 6,
+            Self::Antigravity => 7,
         }
     }
 
@@ -48,6 +51,7 @@ impl ProviderId {
             Self::Kimi => "Kimi",
             Self::Cursor => "Cursor",
             Self::Devin => "Devin",
+            Self::Antigravity => "Google Antigravity",
         }
     }
 
@@ -60,6 +64,7 @@ impl ProviderId {
             "kimi" | "kimi-code" | "kimi-for-coding" => Some(Self::Kimi),
             "cursor" => Some(Self::Cursor),
             "devin" | "devin-cli" | "cognition" => Some(Self::Devin),
+            "antigravity" | "google-antigravity" => Some(Self::Antigravity),
             _ => None,
         }
     }

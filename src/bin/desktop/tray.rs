@@ -21,7 +21,7 @@ pub fn set_widget_hwnd(hwnd: isize) {
     WIDGET_HWND.store(hwnd, Ordering::Relaxed);
 }
 
-pub const PROVIDERS: [(ProviderId, &str); 7] = [
+pub const PROVIDERS: [(ProviderId, &str); 8] = [
     (ProviderId::Codex, "OpenAI Codex"),
     (ProviderId::Claude, "Claude"),
     (ProviderId::Grok, "xAI Grok"),
@@ -29,6 +29,7 @@ pub const PROVIDERS: [(ProviderId, &str); 7] = [
     (ProviderId::Kimi, "Kimi Code"),
     (ProviderId::Cursor, "Cursor"),
     (ProviderId::Devin, "Devin"),
+    (ProviderId::Antigravity, "Google Antigravity"),
 ];
 
 fn provider_key(provider: ProviderId) -> &'static str {
@@ -40,6 +41,7 @@ fn provider_key(provider: ProviderId) -> &'static str {
         ProviderId::Kimi => "kimi",
         ProviderId::Cursor => "cursor",
         ProviderId::Devin => "devin",
+        ProviderId::Antigravity => "antigravity",
     }
 }
 fn hidden_file() -> Option<std::path::PathBuf> {

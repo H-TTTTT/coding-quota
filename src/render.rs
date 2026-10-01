@@ -146,6 +146,10 @@ pub fn label_cn(label: &str) -> String {
         "Included total" => "套餐内总量".into(),
         "5h window" => "5 小时窗口".into(),
         "5h limit" => "5 小时限额".into(),
+        "Gemini · 5h window" => "Gemini · 5 小时窗口".into(),
+        "Gemini · Weekly" => "Gemini · 每周额度".into(),
+        "Claude & GPT (shared) · 5h window" => "Claude&GPT 共享 · 5 小时窗口".into(),
+        "Claude & GPT (shared) · Weekly" => "Claude&GPT 共享 · 每周额度".into(),
         other => {
             if let Some(days) = other.strip_suffix(" days") {
                 format!("{days} 天窗口")

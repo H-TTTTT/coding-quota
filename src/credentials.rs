@@ -30,6 +30,9 @@ pub struct StoredCred {
     pub expires_ms: Option<i64>,
     pub account_id: Option<String>,
     pub plan: Option<String>,
+    /// Antigravity 的 Google Cloud 项目 ID（data 里的 `projectId` / `project_id`），
+    /// 查询共享 Claude/GPT 桶时要用；其他平台没有这个概念。
+    pub project_id: Option<String>,
     /// omp 凭据类型（"oauth" / "api_key"）：Devin 的 token 进 protobuf metadata
     /// 时 OAuth 需要加 devin-session-token$ 前缀，API key 不加。
     pub kind: Option<String>,
@@ -45,6 +48,7 @@ pub struct CredentialSet {
     pub kimi: Option<StoredCred>,
     pub cursor: Option<StoredCred>,
     pub devin: Option<StoredCred>,
+    pub antigravity: Option<StoredCred>,
 }
 
 /// 临时凭据副本的文件名前缀，见 `copy_db` / `sweep_stale_db_copies`。
@@ -346,6 +350,8 @@ fn load_from_sqlite(path: &Path, set: &mut CredentialSet) -> Result<()> {
                 }
             }
             "devin" => set.devin = Some(cred),
+            // 订阅额度只对 OAuth 登录有意义；API key 行不授权（同 Claude 的理由）。
+            "google-antigravity" if credential_type == "oauth" => set.antigravity = Some(cred),
             _ => {}
         }
     }
@@ -363,6 +369,7 @@ fn parse_cred(provider: &str, credential_type: &str, identity_key: &str, data: &
     let account_id = first_string(&value, &["accountId", "account_id"]);
     let email = first_string(&value, &["email"]);
     let plan = first_string(&value, &["orgName", "plan"]);
+    let project_id = first_string(&value, &["projectId", "project_id"]);
     let identity = if !identity_key.is_empty() {
         Some(pretty_identity(identity_key, email.as_deref()))
     } else {
@@ -375,6 +382,7 @@ fn parse_cred(provider: &str, credential_type: &str, identity_key: &str, data: &
         expires_ms,
         account_id,
         plan,
+        project_id,
         kind: Some(credential_type.trim().to_string()),
     }
 }
@@ -440,6 +448,7 @@ fn api_key_cred(key: &str) -> StoredCred {
         expires_ms: None,
         account_id: None,
         plan: None,
+        project_id: None,
         kind: Some("api_key".into()),
     }
 }
@@ -609,6 +618,76 @@ mod tests {
             let mut logged_in = CredentialSet::default();
             load_from_sqlite(&path, &mut logged_in)?;
             assert!(logged_in.grok.is_some(), "login must restore the provider");
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn antigravity_extracts_project_and_only_oauth_authorizes() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "coding-quota-antigravity-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let result = (|| -> Result<()> {
+            let db = rusqlite::Connection::open(&path)?;
+            db.execute_batch(
+                "CREATE TABLE auth_credentials (
+                    provider TEXT, credential_type TEXT, identity_key TEXT,
+                    data TEXT, disabled_cause TEXT
+                 );
+                 INSERT INTO auth_credentials VALUES
+                    ('google-antigravity', 'oauth', 'email:ag-user@example.com',
+                     '{\"access\":\"ag-oauth-token\",\"projectId\":\"ag-proj-42\",\"expires\":1893456000000}', NULL),
+                    ('google-antigravity', 'api_key', '', '{\"key\":\"ag-api-key\"}', NULL),
+                    ('kimi-code', 'oauth', '', '{}', NULL);",
+            )?;
+            let mut before = CredentialSet::default();
+            load_from_sqlite(&path, &mut before)?;
+            let cred = before
+                .antigravity
+                .as_ref()
+                .expect("active OAuth row must authorize Antigravity");
+            assert_eq!(cred.access.as_deref(), Some("ag-oauth-token"));
+            assert_eq!(
+                cred.project_id.as_deref(),
+                Some("ag-proj-42"),
+                "projectId 必须提取到 StoredCred.project_id"
+            );
+            assert_eq!(cred.kind.as_deref(), Some("oauth"));
+            assert!(before.kimi.is_some());
+
+            // 软登出 OAuth 行：剩下的 api_key 行仍处于启用状态，但不得授权。
+            db.execute(
+                "UPDATE auth_credentials SET disabled_cause = 'deleted by user'
+                 WHERE provider = 'google-antigravity' AND credential_type = 'oauth'",
+                [],
+            )?;
+            let mut logged_out = CredentialSet::default();
+            load_from_sqlite(&path, &mut logged_out)?;
+            assert!(
+                logged_out.antigravity.is_none(),
+                "软删除 OAuth 行后，仍在启用的 api_key 行也不得授权 Antigravity"
+            );
+            assert!(
+                logged_out.kimi.is_some(),
+                "other active providers must remain available"
+            );
+
+            db.execute(
+                "UPDATE auth_credentials SET disabled_cause = NULL
+                 WHERE provider = 'google-antigravity' AND credential_type = 'oauth'",
+                [],
+            )?;
+            let mut logged_in = CredentialSet::default();
+            load_from_sqlite(&path, &mut logged_in)?;
+            let cred = logged_in
+                .antigravity
+                .as_ref()
+                .expect("login must restore the provider");
+            assert_eq!(cred.project_id.as_deref(), Some("ag-proj-42"));
             Ok(())
         })();
         let _ = std::fs::remove_file(&path);

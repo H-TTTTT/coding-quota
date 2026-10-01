@@ -1,6 +1,6 @@
 # coding-quota
 
-See the remaining quota of seven AI coding plans in one place: **OpenAI Codex, Claude (Pro / Max), xAI Grok, Zhipu GLM Coding Plan, Kimi Code, Cursor, and Devin**.
+See the remaining quota of eight AI coding plans in one place: **OpenAI Codex, Claude (Pro / Max), xAI Grok, Zhipu GLM Coding Plan, Kimi Code, Cursor, Devin, and Google Antigravity**.
 
 ![TUI screenshot](assets/tui.jpg)
 
@@ -9,7 +9,7 @@ See the remaining quota of seven AI coding plans in one place: **OpenAI Codex, C
 | | `coding-quota-gui.exe` (desktop widget) | `coding-quota-tui.exe` (terminal TUI / CLI) |
 | --- | --- | --- |
 | UI | Borderless acrylic widget pinned to the desktop | Compact 48-column TUI in a frameless Windows Terminal window |
-| Interaction | Drag by the title bar, tray icon context menu | `R` refresh, `Q` quit, auto-refresh every 5 minutes |
+| Interaction | Drag by the title bar, scroll overflowing cards, tray icon context menu | `R` refresh, `Q` quit, `↑↓` / `PgUp` / `PgDn` / `Home` / `End` scroll, auto-refresh every 2 minutes |
 | Extras | Launch with Windows, per-provider visibility, window position memory | `--snapshot` plain text, `--json` for scripts, `-p <provider>` to filter, `--demo` for a mock-data preview |
 
 ## Download
@@ -30,6 +30,7 @@ Zero configuration: the tool reads the existing omp credential store (`~/.omp/ag
 - Each quota window shows the remaining percentage, a usage-colored bar (green <70%, yellow ≥70%, red ≥90%), and its reset time
 - Codex additionally shows remaining rate-limit reset credits and its credit balance (including Pro plans); finite balances retain decimals, unlimited credits are labelled explicitly, and unavailable balances are not shown as zero
 - Zhipu shows available reset cards separately for the 5-hour and weekly windows; only records marked available are counted, and a reset-inventory query failure does not hide regular usage. Inventory queries are read-only: this tool never spends reset cards. The monthly MCP/tool quota shows remaining counts (`剩余 3925/4000`), not just a percentage
+- Antigravity shows Gemini and shared Claude/GPT quotas, each with 5-hour and weekly windows, remaining percentages and reset times. The Claude/GPT buckets belong to Antigravity, not standalone Claude or Codex subscriptions; each shared bucket is displayed once. The existing active omp `google-antigravity` OAuth login supplies the token and project; use `--provider antigravity` or `--provider google-antigravity` to filter it
 - `--json` exposes Codex `credit_balance` (`kind: limited` with `balance`, or `kind: unlimited`) and each Zhipu window's optional `resets_left`; missing fields mean unknown, while a known empty reset-card inventory is zero
 - Failed refreshes keep the last good values (cached in `%APPDATA%\coding-quota\last_good.json`), drawn dimmed with their age; values older than 24 hours are dropped rather than shown, and a provider that keeps failing is retried with backoff instead of every round. `--json` / `--snapshot` always report the live result
 - Both the widget and the TUI fit their size to the content

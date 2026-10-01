@@ -84,6 +84,7 @@ pub async fn fetch_all_streaming(
         (ProviderId::Glm, creds.glm.clone()),
         (ProviderId::Kimi, creds.kimi.clone()),
         (ProviderId::Cursor, creds.cursor.clone()),
+        (ProviderId::Antigravity, creds.antigravity.clone()),
     ] {
         let client = client.clone();
         let skip = skip.clone();
@@ -157,6 +158,7 @@ async fn maybe_fetch(
         ProviderId::Glm => fetch_glm(client, cred).await,
         ProviderId::Kimi => fetch_kimi(client, cred).await,
         ProviderId::Cursor => fetch_cursor(client, cred).await,
+        ProviderId::Antigravity => fetch_antigravity(client, cred).await,
         // Devin 走 CLI 横幅，不使用 CredentialSet 里的凭据
         ProviderId::Devin => fetch_devin(),
     };
@@ -210,6 +212,159 @@ fn resolve_secret(cred: &StoredCred, omp_provider: &str) -> Option<String> {
     cred.access
         .clone()
         .or_else(|| credentials::secret_from_omp(omp_provider, false))
+}
+
+const ANTIGRAVITY_QUOTA_URL: &str =
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+// 与 omp 的 Antigravity Hub 客户端标识一致；普通 coding-quota UA 会被此接口拒绝。
+const ANTIGRAVITY_UA: &str =
+    "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)";
+
+#[derive(serde::Serialize)]
+struct AntigravityProject<'a> {
+    project: &'a str,
+}
+
+async fn fetch_antigravity(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
+    let Some(project) = cred
+        .project_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return ProviderReport::err(
+            ProviderId::Antigravity,
+            cred.identity,
+            "missing Antigravity project id",
+        );
+    };
+    let result = fetch_with_refresh(client, &cred, "google-antigravity", |client, token| {
+        let mut headers = bearer(token);
+        headers.insert(USER_AGENT, HeaderValue::from_static(ANTIGRAVITY_UA));
+        // 序列化在创建 future 前完成，future 只拥有 RequestBuilder，不复制 project。
+        let request = client
+            .post(ANTIGRAVITY_QUOTA_URL)
+            .headers(headers)
+            .json(&AntigravityProject { project });
+        Box::pin(async move {
+            let response = request.send().await.map_err(|err| brief(&err))?;
+            let status = response.status();
+            let text = response.text().await.map_err(|err| brief(&err))?;
+            if !status.is_success() {
+                return Err(http_error(status, &text));
+            }
+            serde_json::from_str(&text).map_err(|_| "invalid JSON".to_string())
+        })
+    })
+    .await;
+    match result {
+        Ok((_, body)) => parse_antigravity(cred.identity, body),
+        Err(err) => ProviderReport::err(ProviderId::Antigravity, cred.identity, err),
+    }
+}
+
+fn parse_antigravity(identity: Option<String>, body: Value) -> ProviderReport {
+    let mut windows = Vec::new();
+    let groups = body.get("groups").and_then(Value::as_array);
+    let grouped = groups.is_some_and(|groups| {
+        groups.iter().any(|group| {
+            group
+                .get("buckets")
+                .and_then(Value::as_array)
+                .is_some_and(|buckets| !buckets.is_empty())
+        })
+    });
+    if grouped {
+        for group in groups.into_iter().flatten() {
+            let name = group.get("displayName").and_then(Value::as_str);
+            if let Some(buckets) = group.get("buckets").and_then(Value::as_array) {
+                for bucket in buckets {
+                    push_antigravity_bucket(&mut windows, bucket, name);
+                }
+            }
+        }
+    } else if let Some(buckets) = body.get("buckets").and_then(Value::as_array) {
+        for bucket in buckets {
+            push_antigravity_bucket(&mut windows, bucket, None);
+        }
+    }
+    if windows.is_empty() {
+        return ProviderReport::err(ProviderId::Antigravity, identity, "no quota windows");
+    }
+    // API 的周额度排在 5h 前；界面按模型组、短窗口→长窗口稳定展示。
+    windows.sort_by_key(|window| match window.id.as_str() {
+        "antigravity-gemini-5h" => 0,
+        "antigravity-gemini-weekly" => 1,
+        "antigravity-3p-5h" => 2,
+        "antigravity-3p-weekly" => 3,
+        _ => 4,
+    });
+    ProviderReport::ok(
+        ProviderId::Antigravity,
+        "Google Antigravity",
+        identity,
+        None,
+        windows,
+    )
+}
+
+fn push_antigravity_bucket(
+    windows: &mut Vec<QuotaWindow>,
+    bucket: &Value,
+    group_name: Option<&str>,
+) {
+    if bucket.get("disabled").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
+    let Some(bucket_id) = bucket
+        .get("bucketId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    // 未返回额度不代表 100% 或 0%；只显示接口确实返回的有限数值。
+    let Some(remaining) =
+        number(bucket.get("remainingFraction")).filter(|fraction| fraction.is_finite())
+    else {
+        return;
+    };
+    let counter = if bucket_id.starts_with("gemini-") {
+        "Gemini"
+    } else if bucket_id.starts_with("3p-") {
+        "Claude & GPT (shared)"
+    } else {
+        group_name.unwrap_or("Usage")
+    };
+    let window = match bucket.get("window").and_then(Value::as_str) {
+        Some("5h") => "5h window",
+        Some("weekly" | "7d") => "Weekly",
+        Some("daily") => "Daily",
+        Some(other) if !other.is_empty() => other,
+        _ => bucket
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or("Quota"),
+    };
+    let id = format!("antigravity-{bucket_id}");
+    let reset = parse_iso(bucket.get("resetTime"));
+    let used_percent = (1.0 - remaining) * 100.0;
+    if let Some(existing) = windows.iter_mut().find(|window| window.id == id) {
+        // 同一 bucket 重复出现时只画一份，Claude/GPT 共用额度不能重复计数。
+        let used_fraction = (used_percent / 100.0).clamp(0.0, 1.0);
+        if used_fraction > existing.used_fraction {
+            existing.used_fraction = used_fraction;
+            existing.reset_at = reset.or(existing.reset_at);
+        } else if existing.reset_at.is_none() {
+            existing.reset_at = reset;
+        }
+        return;
+    }
+    windows.push(QuotaWindow::from_used_percent(
+        &id,
+        &format!("{counter} · {window}"),
+        used_percent,
+        reset,
+    ));
 }
 
 async fn fetch_glm(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
@@ -1609,6 +1764,124 @@ fn parse_devin_reset(text: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_groups_preserve_short_weekly_and_shared_quotas() {
+        let report = parse_antigravity(
+            None,
+            serde_json::json!({"groups": [
+                {"displayName": "Gemini Models", "buckets": [
+                    {"bucketId": "gemini-weekly", "window": "weekly",
+                     "remainingFraction": 0.95, "resetTime": "2026-10-08T04:41:19Z"},
+                    {"bucketId": "gemini-5h", "window": "5h",
+                     "remainingFraction": 0.7, "resetTime": "2026-10-01T09:41:19Z"}
+                ]},
+                {"displayName": "Claude and GPT models", "buckets": [
+                    {"bucketId": "3p-weekly", "window": "weekly",
+                     "remainingFraction": 0.8, "resetTime": "2026-10-08T04:49:48Z"},
+                    {"bucketId": "3p-5h", "window": "5h",
+                     "remainingFraction": 0.5, "resetTime": "2026-10-01T09:49:48Z"}
+                ]}
+            ]}),
+        );
+        let expected = [
+            (
+                "antigravity-gemini-5h",
+                "Gemini · 5h window",
+                0.3,
+                "2026-10-01T09:41:19Z",
+            ),
+            (
+                "antigravity-gemini-weekly",
+                "Gemini · Weekly",
+                0.05,
+                "2026-10-08T04:41:19Z",
+            ),
+            (
+                "antigravity-3p-5h",
+                "Claude & GPT (shared) · 5h window",
+                0.5,
+                "2026-10-01T09:49:48Z",
+            ),
+            (
+                "antigravity-3p-weekly",
+                "Claude & GPT (shared) · Weekly",
+                0.2,
+                "2026-10-08T04:49:48Z",
+            ),
+        ];
+        assert!(report.error.is_none(), "{:?}", report.error);
+        for (window, (id, label, used, reset)) in report.windows.iter().zip(expected) {
+            assert_eq!(window.id, id);
+            assert_eq!(window.label, label);
+            assert!((window.used_fraction - used).abs() < 1e-9);
+            assert_eq!(
+                window.reset_at,
+                Some(
+                    DateTime::parse_from_rfc3339(reset)
+                        .unwrap()
+                        .with_timezone(&Utc)
+                )
+            );
+        }
+        assert_eq!(report.windows.len(), expected.len());
+    }
+
+    #[test]
+    fn antigravity_shared_bucket_is_not_counted_twice() {
+        let report = parse_antigravity(
+            None,
+            serde_json::json!({"groups": [
+                {"displayName": "Claude", "buckets": [
+                    {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.8}
+                ]},
+                {"displayName": "GPT", "buckets": [
+                    {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.4,
+                     "resetTime": "2026-10-01T09:49:48Z"}
+                ]}
+            ]}),
+        );
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(report.windows.len(), 1);
+        let window = &report.windows[0];
+        assert_eq!(window.label, "Claude & GPT (shared) · 5h window");
+        assert!((window.used_fraction - 0.6).abs() < 1e-9);
+        assert_eq!(
+            window.reset_at,
+            Some(Utc.with_ymd_and_hms(2026, 10, 1, 9, 49, 48).unwrap())
+        );
+    }
+
+    #[test]
+    fn antigravity_flat_buckets_distinguish_zero_from_unknown() {
+        let report = parse_antigravity(
+            None,
+            serde_json::json!({"buckets": [
+                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0},
+                {"bucketId": "gemini-weekly", "window": "weekly"},
+                {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.9,
+                 "disabled": true},
+                {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": "NaN"}
+            ]}),
+        );
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].id, "antigravity-gemini-5h");
+        assert_eq!(report.windows[0].used_fraction, 1.0);
+    }
+
+    #[test]
+    fn antigravity_missing_quota_is_not_an_authorization_removal() {
+        let report = parse_antigravity(
+            None,
+            serde_json::json!({"groups": [{"buckets": [{
+                "bucketId": "gemini-5h", "window": "5h", "remainingAmount": "120"
+            }]}]}),
+        );
+        assert_eq!(report.error.as_deref(), Some("no quota windows"));
+        assert!(!report.is_missing());
+        assert!(report.windows.is_empty());
+    }
 
     #[test]
     fn codex_credit_balance_is_separate_from_usage_and_reset_count() {

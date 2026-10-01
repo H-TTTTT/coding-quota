@@ -191,6 +191,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn antigravity_backfill_preserves_gemini_and_shared_quota_age() {
+        let mut stale = report(ProviderId::Antigravity, 42.0, chrono::Duration::minutes(5));
+        stale.windows[0].id = "antigravity-gemini-5h".into();
+        stale.windows.push(QuotaWindow::from_used_percent(
+            "antigravity-3p-5h",
+            "Claude & GPT (shared) · 5h window",
+            0.0,
+            None,
+        ));
+        let fetched_at = stale.fetched_at;
+        let cache = cache_with(vec![stale]);
+        let mut failed = ProviderReport::err(ProviderId::Antigravity, None, "HTTP 500");
+        cache.backfill(&mut failed);
+        assert_eq!(failed.windows.len(), 2);
+        assert_eq!(failed.windows[0].id, "antigravity-gemini-5h");
+        assert!((failed.windows[0].used_fraction - 0.58).abs() < 1e-9);
+        assert_eq!(failed.windows[1].id, "antigravity-3p-5h");
+        assert_eq!(failed.windows[1].used_fraction, 0.0);
+        assert_eq!(failed.fetched_at, fetched_at);
+        assert_eq!(failed.error.as_deref(), Some("HTTP 500"));
+    }
+
     /// 失败平台的旧额度照常显示，且数据年龄必须如实（界面靠 fetched_at 标「x 分钟前」）。
     #[test]
     fn backfill_keeps_error_and_data_age() {

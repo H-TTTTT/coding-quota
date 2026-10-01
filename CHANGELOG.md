@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file.
 
 - 挂件加了单实例锁：重复启动 `coding-quota-gui.exe`（双击、开机自启 + 手动启动）不再出现第二个托盘图标和第二路后台刷新，只会弹一句「已经在运行」的提示后退出。锁按登录会话隔离，远程桌面会话里各开一个仍然允许。
 - `--watch` 每轮重新读取凭据库：登录、登出、token 轮换、换 `CODING_QUOTA_DB` 都不必重启进程；watch 期间凭据库临时读不到只跳过本轮并打印一行原因，不再让整个 watch 退出（单发 `--snapshot` 仍按原语义直接失败）。
+- 新增 Google Antigravity 额度卡片：读取 omp 的有效 `google-antigravity` OAuth 登录及 projectId，按 Antigravity Hub 请求规范查询实时额度；显示 Gemini 与平台内 Claude/GPT 共享额度的 5 小时、周窗口、剩余百分比及重置时间，共享 bucket 去重。这是 Antigravity 内的模型额度，不是独立 Claude/Codex 订阅额度。GUI、TUI、托盘开关、`--snapshot` / `--json` 和 `--provider antigravity` / `google-antigravity` 均已接入；登出后隐藏，失败沿用已有缓存及退避规则，401 沿用 omp token 刷新。
 
 ### Fixed
 
@@ -18,6 +19,7 @@ All notable changes to this project are documented in this file.
 - 智谱重置卡不再遗漏：用现有 Coding Plan API key 只读查询 `/api/biz/customer-package-reset/list?targetType=PERSONAL`，按官网的 `available: true` 分别统计 5 小时和周重置卡；GUI、TUI、文本快照和 JSON 均显示对应窗口的剩余次数。不可用记录不计数，查询失败保留正常额度，不伪造零次；不调用消耗重置卡的接口。
 - Codex（含 Pro 套餐）现在显示 `/wham/usage` 的 `credits.balance` 积分余额，与限流重置次数分开；保留小数，零余额、无限积分和未返回余额明确区分，刷新失败时按已有缓存规则保留上次的余额。GUI/TUI 的尺寸测量包含新增行，`--snapshot` / `--json` 同步输出。
 - MCP 每月额度现在显示剩余次数：智谱接口里 MCP 行的 `number=1` 是套餐标志位不是总量，之前 75/4000 被当成 1% 的百分比条。修正为按 `currentValue`（已用）+ `remaining`（剩余）计算总量，GUI、TUI、快照与 JSON 一致显示 `剩余 3925/4000` 这样的次数。
+- 卡片增多或屏幕较小时，GUI 正文现在可纵向滚动，TUI 支持方向键、PgUp/PgDn、Home/End，末张 Antigravity 卡片不再因高度上限不可达。TUI 的量高、滚动范围与实际自动换行使用同一口径；长错误提示换行后也能滚到最后一项。
 
 ## 0.3.1 - 2026-09-26
 

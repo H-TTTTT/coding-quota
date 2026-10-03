@@ -8,10 +8,11 @@ mod tray;
 mod instance;
 use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
 use coding_quota::render::{
-    ago_cn, compact_until_cn, credit_balance_cn, label_cn, title_cn, usage_blocks, usage_lines_cn,
+    ago_cn, compact_tokens_cn, compact_until_cn, credit_balance_cn, label_cn, title_cn,
+    usage_blocks, usage_lines_cn,
 };
 use coding_quota::usage;
-use coding_quota::{cache, credentials, fetch};
+use coding_quota::{alerts, cache, credentials, fetch};
 use eframe::egui;
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -370,8 +371,13 @@ impl DesktopApp {
             let _ = credentials::sweep_stale_db_copies();
             // 常驻内存的上一轮数据：按平台增量回填/落盘，不必每条报表都重读缓存文件
             let mut cache = cache::Cache::load();
+            // 告警状态用缓存播种：重启后已在低位的窗口不会回放历史告警，
+            // 只有运行期间真实发生的跨越（跌破/耗尽/重置回满）才弹通知。
+            let mut alerts = alerts::Tracker::new();
+            alerts.seed(&cache.snapshot());
             // 已显示的平台保留到新一轮结果到达为止（隐藏、退避期间卡片不会忽隐忽现）
             let mut latest: Vec<ProviderReport> = Vec::new();
+            let mut round_alerts: Vec<alerts::Alert> = Vec::new();
             let mut alive = true;
             loop {
                 // 托盘里隐藏（退订）的平台：完全不取数，也不会失效凭据 401
@@ -384,6 +390,7 @@ impl DesktopApp {
                     usage::attach(&mut report);
                     cache.backfill(&mut report);
                     cache.save_report(&report);
+                    round_alerts.extend(alerts.update(&report));
                     match latest
                         .iter_mut()
                         .find(|shown| shown.provider == report.provider)
@@ -424,6 +431,16 @@ impl DesktopApp {
                 if snap_tx.send((merged(&latest), true)).is_err() {
                     return;
                 }
+                // 跨阈值告警合并成一条气泡（Shell_NotifyIcon 同图标连发只显示最后一条）
+                if !round_alerts.is_empty() && tray::alerts_enabled() {
+                    let body = round_alerts
+                        .iter()
+                        .map(|alert| alert.body_cn())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    tray::notify("编程额度", &body);
+                }
+                round_alerts.clear();
                 match cmd_rx.recv_timeout(REFRESH_INTERVAL) {
                     Ok(Cmd::Refresh) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -949,15 +966,48 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                                 .small()
                                 .color(text_color),
                         );
-                        for (i, (period, val)) in block.items.iter().enumerate() {
+                        for (i, item) in block.items.iter().enumerate() {
                             if i > 0 {
                                 ui.label(egui::RichText::new("  ·  ").small().color(dot_color));
                             }
-                            ui.label(
-                                egui::RichText::new(format!("{period} {val}"))
+                            let label = ui.label(
+                                egui::RichText::new(format!("{} {}", item.period, item.value))
                                     .small()
                                     .color(text_color),
                             );
+                            if !item.models.is_empty() {
+                                let models = item.models.clone();
+                                let total = item.total_tokens;
+                                label.on_hover_ui(|ui| {
+                                    ui.set_min_width(190.0);
+                                    for (name, tokens) in &models {
+                                        let share =
+                                            if total > 0 { tokens * 100 / total } else { 0 };
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(name.clone())
+                                                    .small()
+                                                    .color(egui::Color32::from_rgb(210, 214, 220)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "{share}%  {}",
+                                                            compact_tokens_cn(*tokens)
+                                                        ))
+                                                        .small()
+                                                        .color(egui::Color32::from_rgb(
+                                                            160, 190, 225,
+                                                        )),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                    }
+                                });
+                            }
                         }
                     });
                 }

@@ -1,3 +1,4 @@
+pub mod alerts;
 mod backoff;
 pub mod cache;
 pub mod credentials;

@@ -108,6 +108,43 @@ where
 pub fn shutdown() {
     imp::shutdown();
 }
+/// Windows 原生气泡通知（托盘图标的 NIF_INFO 通道）。失败静默：通知是增值项。
+#[cfg(windows)]
+pub fn notify(title: &str, body: &str) {
+    imp::notify(title, body);
+}
+
+#[cfg(not(windows))]
+pub fn notify(_title: &str, _body: &str) {}
+
+/// 额度告警开关：文件缺失视为开启（默认要提醒），写 "0" 关闭。
+pub fn alerts_enabled() -> bool {
+    let Some(path) = alerts_file() else {
+        return true;
+    };
+    !std::fs::read_to_string(path)
+        .map(|text| text.trim() == "0")
+        .unwrap_or(false)
+}
+
+pub fn set_alerts(enabled: bool) {
+    let Some(path) = alerts_file() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, if enabled { "1" } else { "0" });
+}
+
+fn alerts_file() -> Option<std::path::PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    Some(
+        std::path::PathBuf::from(appdata)
+            .join("coding-quota")
+            .join("alerts_enabled.txt"),
+    )
+}
 
 #[cfg(not(windows))]
 pub fn shutdown() {}
@@ -146,7 +183,10 @@ mod imp {
     const WM_CONTEXTMENU: u32 = 0x007B;
 
     const NIM_ADD: u32 = 0;
+    const NIM_MODIFY: u32 = 1;
     const NIM_DELETE: u32 = 2;
+    const NIF_INFO: u32 = 0x10;
+    const NIIF_INFO: u32 = 0x1;
     const NIF_MESSAGE: u32 = 0x01;
     const NIF_ICON: u32 = 0x02;
     const NIF_TIP: u32 = 0x04;
@@ -176,6 +216,8 @@ mod imp {
     const ID_REFRESH: usize = 2;
     const ID_AUTOSTART: usize = 3;
     const ID_QUIT: usize = 4;
+    const ID_ALERTS: usize = 5;
+    const ID_NOTIFY_TEST: usize = 6;
     const ID_PROVIDER_BASE: usize = 100;
 
     const HKEY_CURRENT_USER: *mut c_void = 0x8000_0001_usize as *mut c_void;
@@ -533,6 +575,29 @@ mod imp {
             unsafe { remove_icon(hwnd) };
         }
     }
+    /// 托盘气泡通知：NIM_MODIFY + NIF_INFO，系统按 hwnd+uID 定位已注册的图标。
+    /// 任意线程可调（worker 刷新线程、托盘菜单线程都会用到）。
+    pub fn notify(title: &str, body: &str) {
+        let hwnd = TRAY_HWND.load(Ordering::Relaxed) as *mut c_void;
+        if hwnd.is_null() {
+            return;
+        }
+        let mut data: NotifyIconData = unsafe { std::mem::zeroed() };
+        data.cb_size = std::mem::size_of::<NotifyIconData>() as u32;
+        data.hwnd = hwnd;
+        data.id = TRAY_ICON_ID;
+        data.flags = NIF_INFO;
+        data.info_flags = NIIF_INFO;
+        let title_w = wide(title);
+        let title_len = title_w.len().saturating_sub(1).min(data.info_title.len());
+        data.info_title[..title_len].copy_from_slice(&title_w[..title_len]);
+        let body_w = wide(body);
+        let body_len = body_w.len().saturating_sub(1).min(data.info.len());
+        data.info[..body_len].copy_from_slice(&body_w[..body_len]);
+        unsafe {
+            Shell_NotifyIconW(NIM_MODIFY, &mut data);
+        }
+    }
 
     /// 托盘图标：优先运行时逐像素绘制，失败再回退到嵌入的 .ico 资源。
     unsafe fn app_icon(instance: *mut c_void) -> *mut c_void {
@@ -802,6 +867,14 @@ mod imp {
         };
         append(menu, autostart, ID_AUTOSTART, "开机自启");
 
+        let alerts = if super::alerts_enabled() {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        append(menu, alerts, ID_ALERTS, "额度告警");
+        append(menu, MF_STRING, ID_NOTIFY_TEST, "测试通知");
+
         let submenu = CreatePopupMenu();
         if !submenu.is_null() {
             for (index, (provider, label)) in PROVIDERS.iter().enumerate() {
@@ -849,6 +922,12 @@ mod imp {
             ID_QUIT => unsafe { request_quit() },
             ID_AUTOSTART => {
                 set_autostart(!autostart_enabled());
+            }
+            ID_ALERTS => {
+                super::set_alerts(!super::alerts_enabled());
+            }
+            ID_NOTIFY_TEST => {
+                notify("编程额度", "通知通道正常：额度告警将在这里弹出。");
             }
             id if (ID_PROVIDER_BASE..ID_PROVIDER_BASE + PROVIDERS.len()).contains(&id) => {
                 toggle_hidden(PROVIDERS[id - ID_PROVIDER_BASE].0);

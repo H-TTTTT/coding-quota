@@ -58,6 +58,10 @@ impl Cache {
     pub fn load() -> Self {
         Self { reports: read() }
     }
+    /// 当前缓存的所有报表（用于告警状态播种等一次性读取）。
+    pub fn snapshot(&self) -> Vec<ProviderReport> {
+        self.reports.values().cloned().collect()
+    }
 
     /// 失败或退避中的报表用旧值回填（错误信息与旧数据的 `fetched_at` 都保留，
     /// 界面上的「x 分钟前」才如实反映数据年龄）。没有凭据、或旧值已过期则不回填。

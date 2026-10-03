@@ -854,12 +854,12 @@ fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<
             Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
             Span::styled(format!("{}：", block.tag), tag_style),
         ];
-        for (i, item) in block.items.iter().enumerate() {
+        for (i, (period, val)) in block.items.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled("  ·  ", dot_style));
             }
-            spans.push(Span::styled(format!("{} ", item.period), period_style));
-            spans.push(Span::styled(item.value.clone(), val_style));
+            spans.push(Span::styled(format!("{period} "), period_style));
+            spans.push(Span::styled(val.clone(), val_style));
         }
         lines.push(Line::from(spans));
     }

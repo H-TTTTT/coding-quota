@@ -232,41 +232,12 @@ pub fn compact_tokens_cn(tokens: u64) -> String {
     }
 }
 
-/// 用量条目：一个周期档位的数值与该档位的模型明细（名称、token 数）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct UsageItem {
-    pub period: &'static str,
-    pub value: String,
-    pub total_tokens: u64,
-    /// 该周期内按用量降序的模型明细，悬浮气泡展示用；最多保留前 8 个。
-    pub models: Vec<(String, u64)>,
-}
-
-/// 结构化的用量显示块：每个块包含分类标签（"用量" / "官方" / "Gemini"…）
-/// 和按周期划分的条目列表。
+/// 结构化的用量显示块：每个块包含分类标签（"用量" / "官方"）
+/// 和按周期划分的 (周期标签, 格式化数值) 列表。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageBlock {
     pub tag: &'static str,
-    pub items: Vec<UsageItem>,
-}
-
-fn usage_item(id: &str, row: &crate::model::UsageRow) -> UsageItem {
-    let period = match id {
-        "1d" => "1天",
-        "7d" => "7天",
-        _ => "累计",
-    };
-    UsageItem {
-        period,
-        value: compact_tokens_cn(row.total_tokens),
-        total_tokens: row.total_tokens,
-        models: row
-            .models
-            .iter()
-            .take(8)
-            .map(|model| (model.name.clone(), model.total_tokens))
-            .collect(),
-    }
+    pub items: Vec<(&'static str, String)>,
 }
 
 /// 解析报表中的用量数据，生成结构化块。
@@ -283,7 +254,12 @@ pub fn usage_blocks(report: &ProviderReport) -> Vec<UsageBlock> {
             for row in rows.iter().filter(|r| {
                 r.source == "local" && r.group.as_deref() == Some(group_id) && r.id != "30d"
             }) {
-                items.push(usage_item(&row.id, row));
+                let label = match row.id.as_str() {
+                    "1d" => "1天",
+                    "7d" => "7天",
+                    _ => "累计",
+                };
+                items.push((label, compact_tokens_cn(row.total_tokens)));
             }
             if !items.is_empty() {
                 blocks.push(UsageBlock { tag, items });
@@ -295,7 +271,12 @@ pub fn usage_blocks(report: &ProviderReport) -> Vec<UsageBlock> {
             .iter()
             .filter(|row| row.source == "local" && row.id != "30d")
         {
-            local_items.push(usage_item(&row.id, row));
+            let label = match row.id.as_str() {
+                "1d" => "1天",
+                "7d" => "7天",
+                _ => "累计",
+            };
+            local_items.push((label, compact_tokens_cn(row.total_tokens)));
         }
         if !local_items.is_empty() {
             blocks.push(UsageBlock {
@@ -305,14 +286,13 @@ pub fn usage_blocks(report: &ProviderReport) -> Vec<UsageBlock> {
         }
     }
     for row in rows.iter().filter(|row| row.source == "remote") {
+        let label = match row.id.as_str() {
+            "30d" => "30天",
+            _ => "30天",
+        };
         blocks.push(UsageBlock {
             tag: "官方",
-            items: vec![UsageItem {
-                period: "30天",
-                value: compact_tokens_cn(row.total_tokens),
-                total_tokens: row.total_tokens,
-                models: Vec::new(),
-            }],
+            items: vec![(label, compact_tokens_cn(row.total_tokens))],
         });
     }
     blocks
@@ -325,8 +305,8 @@ pub fn usage_lines_cn(report: &ProviderReport) -> Vec<String> {
         .map(|block| {
             let items: Vec<String> = block
                 .items
-                .iter()
-                .map(|item| format!("{} {}", item.period, item.value))
+                .into_iter()
+                .map(|(p, v)| format!("{p} {v}"))
                 .collect();
             format!("{}：{}", block.tag, items.join("  ·  "))
         })
@@ -485,64 +465,19 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].tag, "用量");
         assert_eq!(
-            blocks[0]
-                .items
-                .iter()
-                .map(|item| (item.period, item.value.as_str()))
-                .collect::<Vec<_>>(),
-            vec![("1天", "125万"), ("7天", "1234万"), ("累计", "8923万")]
+            blocks[0].items,
+            vec![
+                ("1天", "125万".into()),
+                ("7天", "1234万".into()),
+                ("累计", "8923万".into()),
+            ]
         );
         assert_eq!(blocks[1].tag, "官方");
-        assert_eq!(
-            blocks[1]
-                .items
-                .iter()
-                .map(|item| (item.period, item.value.as_str()))
-                .collect::<Vec<_>>(),
-            vec![("30天", "31亿")]
-        );
+        assert_eq!(blocks[1].items, vec![("30天", "31亿".into())]);
 
         let lines = usage_lines_cn(&report);
         assert_eq!(lines[0], "用量：1天 125万  ·  7天 1234万  ·  累计 8923万");
         assert_eq!(lines[1], "官方：30天 31亿");
-    }
-
-    /// 模型明细要透传到 UsageItem（悬浮气泡的数据源），并按原降序保留。
-    #[test]
-    fn usage_blocks_carry_model_details() {
-        use crate::model::UsageModel;
-        let mut report = ProviderReport::ok(ProviderId::Glm, "Zhipu", None, None, vec![]);
-        report.usage = Some(vec![UsageRow {
-            id: "7d".into(),
-            label: "last 7 days".into(),
-            source: "local".into(),
-            total_tokens: 100_000,
-            group: None,
-            models: vec![
-                UsageModel {
-                    name: "glm-5.3".into(),
-                    total_tokens: 90_000,
-                },
-                UsageModel {
-                    name: "glm-5.3-flash".into(),
-                    total_tokens: 10_000,
-                },
-            ],
-        }]);
-
-        let blocks = usage_blocks(&report);
-        assert_eq!(blocks.len(), 1);
-        let item = &blocks[0].items[0];
-        assert_eq!(item.period, "7天");
-        assert_eq!(item.value, "10万");
-        assert_eq!(item.total_tokens, 100_000);
-        assert_eq!(
-            item.models,
-            vec![
-                ("glm-5.3".to_string(), 90_000),
-                ("glm-5.3-flash".to_string(), 10_000)
-            ]
-        );
     }
 
     #[test]
@@ -588,21 +523,13 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].tag, "Gemini");
         assert_eq!(
-            blocks[0]
-                .items
-                .iter()
-                .map(|item| (item.period, item.value.as_str()))
-                .collect::<Vec<_>>(),
-            vec![("1天", "1721万"), ("累计", "6675万")]
+            blocks[0].items,
+            vec![("1天", "1721万".into()), ("累计", "6675万".into())]
         );
         assert_eq!(blocks[1].tag, "Claude&GPT");
         assert_eq!(
-            blocks[1]
-                .items
-                .iter()
-                .map(|item| (item.period, item.value.as_str()))
-                .collect::<Vec<_>>(),
-            vec![("1天", "498万"), ("累计", "498万")]
+            blocks[1].items,
+            vec![("1天", "498万".into()), ("累计", "498万".into())]
         );
 
         let lines = usage_lines_cn(&report);

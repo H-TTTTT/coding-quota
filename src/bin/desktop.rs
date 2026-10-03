@@ -8,8 +8,7 @@ mod tray;
 mod instance;
 use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
 use coding_quota::render::{
-    ago_cn, compact_tokens_cn, compact_until_cn, credit_balance_cn, label_cn, title_cn,
-    usage_blocks, usage_lines_cn,
+    ago_cn, compact_until_cn, credit_balance_cn, label_cn, title_cn, usage_blocks, usage_lines_cn,
 };
 use coding_quota::usage;
 use coding_quota::{alerts, cache, credentials, fetch};
@@ -65,20 +64,12 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             load_chinese_font(&cc.egui_ctx);
-            cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
-            let mut visuals = egui::Visuals::dark();
+            let mut visuals = egui::Visuals::light();
             visuals.panel_fill = egui::Color32::TRANSPARENT;
-            visuals.window_fill = egui::Color32::from_rgb(26, 28, 35);
-            visuals.window_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 68, 80));
-            visuals.popup_shadow = egui::Shadow {
-                offset: [0, 4],
-                blur: 12,
-                spread: 0,
-                color: egui::Color32::from_black_alpha(140),
-            };
+            visuals.window_fill = egui::Color32::TRANSPARENT;
+            visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
             visuals.faint_bg_color = egui::Color32::TRANSPARENT;
             visuals.code_bg_color = egui::Color32::TRANSPARENT;
-            visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
             visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
             visuals.widgets.inactive.bg_fill = egui::Color32::from_white_alpha(18);
             visuals.widgets.hovered.bg_fill = egui::Color32::from_white_alpha(36);
@@ -92,12 +83,7 @@ fn main() -> eframe::Result<()> {
             visuals.widgets.hovered.corner_radius = radius;
             visuals.widgets.active.corner_radius = radius;
             visuals.widgets.open.corner_radius = radius;
-            cc.egui_ctx.all_styles_mut(|style| {
-                style.visuals = visuals.clone();
-            });
-            cc.egui_ctx
-                .set_visuals_of(egui::Theme::Dark, visuals.clone());
-            cc.egui_ctx.set_visuals_of(egui::Theme::Light, visuals);
+            cc.egui_ctx.set_visuals(visuals);
             Ok(Box::new(DesktopApp::new(cc.egui_ctx.clone())))
         }),
     )
@@ -497,7 +483,6 @@ impl eframe::App for DesktopApp {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // 逐平台增量到达：先到的平台先显示，最慢的一方（Devin 横幅最长 25s）不再拖住整屏
-        ctx.set_theme(egui::ThemePreference::Dark);
         while let Ok((snapshot, round_done)) = self.snap_rx.try_recv() {
             self.snapshot = Some(snapshot);
             if round_done {
@@ -980,71 +965,15 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                                 .small()
                                 .color(text_color),
                         );
-                        for (i, item) in block.items.iter().enumerate() {
+                        for (i, (period, val)) in block.items.iter().enumerate() {
                             if i > 0 {
                                 ui.label(egui::RichText::new("  ·  ").small().color(dot_color));
                             }
-                            let label = ui.label(
-                                egui::RichText::new(format!("{} {}", item.period, item.value))
+                            ui.label(
+                                egui::RichText::new(format!("{period} {val}"))
                                     .small()
                                     .color(text_color),
                             );
-                            if !item.models.is_empty() {
-                                let models = item.models.clone();
-                                let total = item.total_tokens;
-                                label.on_hover_ui(|ui| {
-                                    egui::Frame::new()
-                                        .fill(egui::Color32::from_rgb(26, 28, 35))
-                                        .corner_radius(egui::CornerRadius::same(6))
-                                        .inner_margin(egui::Margin::symmetric(8, 6))
-                                        .show(ui, |ui| {
-                                            ui.set_min_width(210.0);
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{} · 模型用量明细",
-                                                    item.period
-                                                ))
-                                                .strong()
-                                                .color(egui::Color32::from_rgb(250, 250, 250)),
-                                            );
-                                            ui.add_space(3.0);
-                                            for (name, tokens) in &models {
-                                                let share = if total > 0 {
-                                                    tokens * 100 / total
-                                                } else {
-                                                    0
-                                                };
-                                                ui.horizontal(|ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(name.clone())
-                                                            .small()
-                                                            .color(egui::Color32::from_rgb(
-                                                                230, 235, 240,
-                                                            )),
-                                                    );
-                                                    ui.with_layout(
-                                                        egui::Layout::right_to_left(
-                                                            egui::Align::Center,
-                                                        ),
-                                                        |ui| {
-                                                            ui.label(
-                                                                egui::RichText::new(format!(
-                                                                    "{share}%  {}",
-                                                                    compact_tokens_cn(*tokens)
-                                                                ))
-                                                                .small()
-                                                                .strong()
-                                                                .color(egui::Color32::from_rgb(
-                                                                    130, 205, 250,
-                                                                )),
-                                                            );
-                                                        },
-                                                    );
-                                                });
-                                            }
-                                        });
-                                });
-                            }
                         }
                     });
                 }

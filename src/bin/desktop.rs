@@ -67,8 +67,14 @@ fn main() -> eframe::Result<()> {
             load_chinese_font(&cc.egui_ctx);
             let mut visuals = egui::Visuals::light();
             visuals.panel_fill = egui::Color32::TRANSPARENT;
-            visuals.window_fill = egui::Color32::TRANSPARENT;
-            visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
+            visuals.window_fill = egui::Color32::from_rgb(26, 28, 35);
+            visuals.window_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 68, 80));
+            visuals.popup_shadow = egui::Shadow {
+                offset: [0, 4],
+                blur: 12,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(140),
+            };
             visuals.faint_bg_color = egui::Color32::TRANSPARENT;
             visuals.code_bg_color = egui::Color32::TRANSPARENT;
             visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
@@ -979,7 +985,16 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                                 let models = item.models.clone();
                                 let total = item.total_tokens;
                                 label.on_hover_ui(|ui| {
-                                    ui.set_min_width(190.0);
+                                    ui.set_min_width(200.0);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} · 模型用量明细",
+                                            item.period
+                                        ))
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(250, 250, 250)),
+                                    );
+                                    ui.add_space(2.0);
                                     for (name, tokens) in &models {
                                         let share =
                                             if total > 0 { tokens * 100 / total } else { 0 };
@@ -987,7 +1002,7 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                                             ui.label(
                                                 egui::RichText::new(name.clone())
                                                     .small()
-                                                    .color(egui::Color32::from_rgb(210, 214, 220)),
+                                                    .color(egui::Color32::from_rgb(230, 235, 240)),
                                             );
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -998,8 +1013,9 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                                                             compact_tokens_cn(*tokens)
                                                         ))
                                                         .small()
+                                                        .strong()
                                                         .color(egui::Color32::from_rgb(
-                                                            160, 190, 225,
+                                                            130, 205, 250,
                                                         )),
                                                     );
                                                 },

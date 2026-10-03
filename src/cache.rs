@@ -75,6 +75,7 @@ impl Cache {
         report.plan.clone_from(&stale.plan);
         report.resets_left = stale.resets_left;
         report.credit_balance = stale.credit_balance;
+        report.usage.clone_from(&stale.usage);
         report.windows.clone_from(&stale.windows);
         report.fetched_at = stale.fetched_at;
     }

@@ -7,7 +7,10 @@ mod tray;
 #[path = "desktop/instance.rs"]
 mod instance;
 use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
-use coding_quota::render::{ago_cn, compact_until_cn, credit_balance_cn, label_cn, title_cn};
+use coding_quota::render::{
+    ago_cn, compact_until_cn, credit_balance_cn, label_cn, title_cn, usage_blocks, usage_lines_cn,
+};
+use coding_quota::usage;
 use coding_quota::{cache, credentials, fetch};
 use eframe::egui;
 #[cfg(windows)]
@@ -377,6 +380,8 @@ impl DesktopApp {
                 latest.retain(|report| !skip.contains(&report.provider));
                 let mut publish = |mut report: ProviderReport| {
                     // 失败/退避：额度照常显示旧值并附上错误；成功则落盘
+                    // 本机 OMP token 用量挂在 worker 线程上：阻塞扫描不碰 UI 循环。
+                    usage::attach(&mut report);
                     cache.backfill(&mut report);
                     cache.save_report(&report);
                     match latest
@@ -761,20 +766,24 @@ fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
     if let Some(identity) = &report.identity {
         width += gap + text_width(ui, identity, small.clone());
     }
-    if let Some(resets) = report.resets_left {
-        width = width.max(text_width(
-            ui,
-            &format!("限流重置：剩余 {resets} 次"),
-            small.clone(),
-        ));
+    if report.windows.iter().all(|w| w.resets_left.is_none()) {
+        if let Some(resets) = report.resets_left {
+            width = width.max(text_width(
+                ui,
+                &format!("重置卡：剩余 {resets} 次"),
+                small.clone(),
+            ));
+        }
     }
-    if let Some(credits) = report.credit_balance {
-        width = width.max(text_width(ui, &credit_balance_cn(credits), small.clone()));
+    if report.windows.is_empty() {
+        if let Some(credits) = report.credit_balance {
+            width = width.max(text_width(ui, &credit_balance_cn(credits), small.clone()));
+        }
     }
     if report.error.is_some() {
         width = width.max(text_width(ui, &error_text(report), small.clone()));
     }
-    for window in &report.windows {
+    for (idx, window) in report.windows.iter().enumerate() {
         let mut row = text_width(ui, &label_cn(&window.label), label.clone());
         if let Some(reset) = window.reset_at {
             row += gap + text_width(ui, &compact_until_cn(reset), label_mono.clone());
@@ -787,10 +796,18 @@ fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
                 small.clone(),
             ));
         }
+        if idx == 0 {
+            if let Some(credits) = report.credit_balance {
+                width = width.max(text_width(ui, &credit_balance_cn(credits), small.clone()));
+            }
+        }
         // 额度条行：条至少 MIN_BAR_WIDTH，右侧固定留 QUOTA_VALUE_WIDTH 给剩余量
         width = width.max(
             MIN_BAR_WIDTH + gap + text_width(ui, &remaining_text(report, window), value.clone()),
         );
+    }
+    for text in usage_lines_cn(report) {
+        width = width.max(text_width(ui, &text, small.clone()));
     }
     width + 16.0
 }
@@ -818,19 +835,23 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                     }
                 });
             });
-            if let Some(resets) = report.resets_left {
-                ui.label(
-                    egui::RichText::new(format!("限流重置：剩余 {resets} 次"))
-                        .small()
-                        .color(egui::Color32::from_rgb(160, 160, 160)),
-                );
+            if report.windows.iter().all(|w| w.resets_left.is_none()) {
+                if let Some(resets) = report.resets_left {
+                    ui.label(
+                        egui::RichText::new(format!("重置卡：剩余 {resets} 次"))
+                            .small()
+                            .color(egui::Color32::from_rgb(160, 160, 160)),
+                    );
+                }
             }
-            if let Some(credits) = report.credit_balance {
-                ui.label(
-                    egui::RichText::new(credit_balance_cn(credits))
-                        .small()
-                        .color(egui::Color32::from_rgb(160, 160, 160)),
-                );
+            if report.windows.is_empty() {
+                if let Some(credits) = report.credit_balance {
+                    ui.label(
+                        egui::RichText::new(credit_balance_cn(credits))
+                            .small()
+                            .color(egui::Color32::from_rgb(160, 160, 160)),
+                    );
+                }
             }
             // 有回填数据（windows 非空）时：报错行 + 变灰的旧额度，不再直接 return
             let stale = report.error.is_some() && !report.windows.is_empty();
@@ -854,7 +875,7 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
             } else {
                 egui::Color32::from_rgb(218, 218, 218)
             };
-            for window in &report.windows {
+            for (idx, window) in report.windows.iter().enumerate() {
                 let remaining = (1.0 - window.used_fraction).clamp(0.0, 1.0) as f32;
                 ui.horizontal(|ui| {
                     ui.label(
@@ -896,7 +917,50 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                             .color(dim),
                     );
                 }
+                if idx == 0 {
+                    if let Some(credits) = report.credit_balance {
+                        ui.label(
+                            egui::RichText::new(credit_balance_cn(credits))
+                                .small()
+                                .color(dim),
+                        );
+                    }
+                }
                 ui.add_space(2.0);
+            }
+            let blocks = usage_blocks(report);
+            if !blocks.is_empty() {
+                ui.add_space(2.0);
+                let text_color = if stale {
+                    dim
+                } else {
+                    egui::Color32::from_rgb(242, 242, 242)
+                };
+                let dot_color = if stale {
+                    dim
+                } else {
+                    egui::Color32::from_rgb(180, 180, 180)
+                };
+                for block in blocks {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.label(
+                            egui::RichText::new(format!("{}：", block.tag))
+                                .small()
+                                .color(text_color),
+                        );
+                        for (i, (period, val)) in block.items.iter().enumerate() {
+                            if i > 0 {
+                                ui.label(egui::RichText::new("  ·  ").small().color(dot_color));
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("{period} {val}"))
+                                    .small()
+                                    .color(text_color),
+                            );
+                        }
+                    });
+                }
             }
         });
 }

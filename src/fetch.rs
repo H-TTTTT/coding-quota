@@ -123,7 +123,12 @@ pub async fn fetch_all(
     only: Option<ProviderId>,
     skip: &[ProviderId],
 ) -> Snapshot {
-    fetch_all_streaming(creds, only, skip, |_| {}).await
+    let mut snapshot = fetch_all_streaming(creds, only, skip, |_| {}).await;
+    // 本机 OMP 用量与远端查询无关，统一在快照出口挂到各卡片上。
+    for report in &mut snapshot.reports {
+        crate::usage::attach(report);
+    }
+    snapshot
 }
 
 async fn maybe_fetch(
@@ -388,12 +393,95 @@ async fn fetch_glm(client: &reqwest::Client, cred: StoredCred) -> ProviderReport
                 // 官网的重置管理单独查询库存；只读 list，不调用消耗重置卡的 use。
                 // 库存不可用时不伪造零次，也不让正常额度查询失败。
                 let resets = get_json(client, reset_url, raw_auth(&key)).await.ok();
-                return parse_glm(cred.identity, body, resets.as_ref());
+                let mut report = parse_glm(cred.identity, body, resets.as_ref());
+                if let Some(remote) = glm_model_usage(client, quota_url, &key).await {
+                    report.usage = Some(vec![remote]);
+                }
+                return report;
             }
             Err(err) => last_err = err,
         }
     }
     ProviderReport::err(ProviderId::Glm, cred.identity, last_err)
+}
+
+/// 智谱服务端近 30 天模型 token 用量：与额度接口同族的只读查询，失败不影响卡片。
+async fn glm_model_usage(
+    client: &reqwest::Client,
+    quota_url: &str,
+    key: &str,
+) -> Option<crate::model::UsageRow> {
+    let url = quota_url.replace("/quota/limit", "/model-usage");
+    let now = chrono::Local::now();
+    let start = now - chrono::Duration::days(30);
+    let query = format!(
+        "startTime={}&endTime={}",
+        urlencoding_compat(&start.format("%Y-%m-%d %H:%M:%S").to_string()),
+        urlencoding_compat(&now.format("%Y-%m-%d %H:%M:%S").to_string()),
+    );
+    let body = get_json(client, &format!("{url}?{query}"), raw_auth(key))
+        .await
+        .ok()?;
+    parse_glm_model_usage(&body)
+}
+
+fn urlencoding_compat(value: &str) -> String {
+    // 智谱接口要求 %YY 形式的空格编码；手写替换避免引入 urlencoding 依赖。
+    value.replace(' ', "%20").replace(':', "%3A")
+}
+
+fn parse_glm_model_usage(body: &Value) -> Option<crate::model::UsageRow> {
+    let root = body.get("data").unwrap_or(body);
+    let models = root.get("modelDataList")?.as_array()?;
+    let mut parsed: Vec<crate::model::UsageModel> = Vec::new();
+    let mut total = 0_u64;
+    for model in models {
+        let name = model
+            .get("modelName")
+            .or_else(|| model.get("modelCode"))
+            .and_then(Value::as_str)?
+            .trim();
+        if name.is_empty() {
+            continue;
+        }
+        let tokens: u64 = model
+            .get("tokensUsage")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| match value {
+                        Value::Number(n) => n.as_u64(),
+                        Value::String(s) => s.parse().ok(),
+                        _ => None,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        if tokens > 0 {
+            parsed.push(crate::model::UsageModel {
+                name: name.to_string(),
+                total_tokens: tokens,
+            });
+            total += tokens;
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    parsed.sort_by(|a, b| {
+        b.total_tokens
+            .cmp(&a.total_tokens)
+            .then(a.name.cmp(&b.name))
+    });
+    Some(crate::model::UsageRow {
+        id: "30d".into(),
+        label: "last 30 days (server)".into(),
+        source: "remote".into(),
+        total_tokens: total,
+        group: None,
+        models: parsed,
+    })
 }
 
 fn parse_glm(identity: Option<String>, body: Value, reset_body: Option<&Value>) -> ProviderReport {
@@ -908,8 +996,13 @@ fn parse_codex(identity: Option<String>, plan: Option<String>, body: Value) -> P
         plan_label,
         windows,
     );
-    report.resets_left =
+    let reset_credits =
         number(body.pointer("/rate_limit_reset_credits/available_count")).map(|value| value as i64);
+    report.resets_left = reset_credits;
+    // 重置卡与智谱保持一致显示在主限流窗口（7 天窗口 / 5 小时窗口）进度条下方。
+    if let Some(primary) = report.windows.first_mut() {
+        primary.resets_left = reset_credits;
+    }
     report.credit_balance = body.get("credits").and_then(|credits| {
         if credits.get("unlimited").and_then(Value::as_bool) == Some(true) {
             Some(CreditBalance::Unlimited)
@@ -1913,6 +2006,7 @@ mod tests {
             );
             assert_eq!(report.credit_balance, Some(expected));
             assert_eq!(report.resets_left, Some(2));
+            assert_eq!(report.windows[0].resets_left, Some(2));
             assert_eq!(report.windows[0].used_fraction, 0.4);
         }
     }
@@ -1936,6 +2030,8 @@ mod tests {
             );
             assert_eq!(report.credit_balance, None);
             assert_eq!(report.windows[0].used_fraction, 0.2);
+            assert_eq!(report.resets_left, None);
+            assert_eq!(report.windows[0].resets_left, None);
             assert!(report.error.is_none(), "{:?}", report.error);
         }
     }

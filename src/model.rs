@@ -141,6 +141,29 @@ pub enum CreditBalance {
     Unlimited,
 }
 
+/// 一条 token 用量汇总：来自本机 OMP 会话扫描或服务端用量接口。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageRow {
+    /// "1d" | "7d" | "30d" | "all"。
+    pub id: String,
+    /// 快照输出用的英文说明（界面文案在展示层按 id 生成）。
+    pub label: String,
+    /// "local"（本机 OMP 会话）| "remote"（服务端接口）。
+    pub source: String,
+    pub total_tokens: u64,
+    /// 可选的细分子组，如 Antigravity 下的 "gemini" 与 "claude_gpt"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<UsageModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageModel {
+    pub name: String,
+    pub total_tokens: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderReport {
     pub provider: ProviderId,
@@ -154,6 +177,8 @@ pub struct ProviderReport {
     pub resets_left: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_balance: Option<CreditBalance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Vec<UsageRow>>,
     pub windows: Vec<QuotaWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -175,6 +200,7 @@ impl ProviderReport {
             plan,
             resets_left: None,
             credit_balance: None,
+            usage: None,
             windows,
             error: None,
             fetched_at: Utc::now(),
@@ -188,6 +214,7 @@ impl ProviderReport {
             identity,
             plan: None,
             resets_left: None,
+            usage: None,
             credit_balance: None,
             windows: Vec::new(),
             error: Some(error.into()),

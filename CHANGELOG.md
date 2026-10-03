@@ -17,7 +17,8 @@ All notable changes to this project are documented in this file.
 - 进程被强杀（关掉终端窗口、结束任务）时来不及删除的只读凭据数据库副本（`%TEMP%\coding-quota-*-agent.db` 及其 `-wal` / `-shm`）现在会在启动时清扫；修改时间不足 10 分钟的副本视为并发进程正在使用，不会误删。
 - Devin 的日/周额度现在都是实时值：卡片优先走 omp 同款的 seat-management 接口（`server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus`，用 omp 里的 `devin` 登录授权），不再出现「非更紧窗口停在旧值、与网页对不上」的情况；无该凭据或请求失败时仍回退 CLI 横幅 + `user_status` 缓存。
 - 智谱重置卡不再遗漏：用现有 Coding Plan API key 只读查询 `/api/biz/customer-package-reset/list?targetType=PERSONAL`，按官网的 `available: true` 分别统计 5 小时和周重置卡；GUI、TUI、文本快照和 JSON 均显示对应窗口的剩余次数。不可用记录不计数，查询失败保留正常额度，不伪造零次；不调用消耗重置卡的接口。
-- Codex（含 Pro 套餐）现在显示 `/wham/usage` 的 `credits.balance` 积分余额，与限流重置次数分开；保留小数，零余额、无限积分和未返回余额明确区分，刷新失败时按已有缓存规则保留上次的余额。GUI/TUI 的尺寸测量包含新增行，`--snapshot` / `--json` 同步输出。
+- Codex（含 Pro 套餐）现在显示 `/wham/usage` 的 `credits.balance` 积分余额，与限流重置次数分开；重置卡与积分余额均改在主限流窗口（7 天窗口 / 5 小时窗口）进度条下方显示「重置卡：剩余 X 次」与「积分：剩余 X」，文案、位置与样式与智谱保持完全一致，不再堆在卡片顶部。GUI/TUI 的尺寸测量包含新增行，`--snapshot` / `--json` 同步输出。
+- 新增 token 用量统计（借鉴 dushan-quota 的数据源思路，纯 Rust 实现）：增量扫描本机 OMP 会话日志（按 mtime+size 缓存，未变文件不重扫），按平台聚合近 1 天 / 7 天 / 30 天 / 本机累计与模型明细，`--json` 输出完整模型树；卡片底部以半透明微黑底条精简展示为紧凑单行「用量：1天 X · 7天 Y · 累计 Z」（过滤信息重叠的近 30 天，去掉多余的 `.0` 尾随），高亮白字适配浅色明亮桌面壁纸；智谱卡片独立第二行展示「官方：30天 W」；Google Antigravity 卡片自动按模型前缀将用量精确拆分为「Gemini：...」与「Claude&GPT：...」双行独立显示，分别对应上方的 Gemini 额度与 Claude&GPT 共享额度。
 - MCP 每月额度现在显示剩余次数：智谱接口里 MCP 行的 `number=1` 是套餐标志位不是总量，之前 75/4000 被当成 1% 的百分比条。修正为按 `currentValue`（已用）+ `remaining`（剩余）计算总量，GUI、TUI、快照与 JSON 一致显示 `剩余 3925/4000` 这样的次数。
 - 卡片增多或屏幕较小时，GUI 正文现在可纵向滚动，TUI 支持方向键、PgUp/PgDn、Home/End，末张 Antigravity 卡片不再因高度上限不可达。TUI 的量高、滚动范围与实际自动换行使用同一口径；长错误提示换行后也能滚到最后一项。
 

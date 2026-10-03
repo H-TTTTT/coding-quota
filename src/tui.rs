@@ -3,9 +3,10 @@ use chrono::Utc;
 use coding_quota::cache;
 use coding_quota::credentials::{self, CredentialSet};
 use coding_quota::fetch;
-use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
+use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot, UsageRow};
 use coding_quota::render::{
     ago_cn, bar_parts, compact_until_cn, credit_balance_cn, label_cn, status_color, title_cn,
+    usage_blocks,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -479,7 +480,34 @@ fn demo_snapshot() -> Snapshot {
             days(4),
         )],
     );
+    codex.windows[0].resets_left = Some(2);
     codex.resets_left = Some(2);
+    codex.usage = Some(vec![
+        UsageRow {
+            id: "1d".into(),
+            label: "last 1 day".into(),
+            source: "local".into(),
+            total_tokens: 1_250_000,
+            group: None,
+            models: Vec::new(),
+        },
+        UsageRow {
+            id: "7d".into(),
+            label: "last 7 days".into(),
+            source: "local".into(),
+            total_tokens: 12_340_000,
+            group: None,
+            models: Vec::new(),
+        },
+        UsageRow {
+            id: "all".into(),
+            label: "local total".into(),
+            source: "local".into(),
+            total_tokens: 89_230_000,
+            group: None,
+            models: Vec::new(),
+        },
+    ]);
     let reports = vec![
         codex,
         ProviderReport::ok(
@@ -718,23 +746,27 @@ fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<
         Span::raw(" ".repeat(pad + gap)),
         Span::styled(identity, Style::default().add_modifier(Modifier::DIM)),
     ])];
-    if let Some(resets) = report.resets_left {
-        lines.push(Line::from(vec![
-            Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
-            Span::styled(
-                format!("限流重置：剩余 {resets} 次"),
-                Style::default().fg(FG_ACCENT),
-            ),
-        ]));
+    if report.windows.iter().all(|w| w.resets_left.is_none()) {
+        if let Some(resets) = report.resets_left {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
+                Span::styled(
+                    format!("重置卡：剩余 {resets} 次"),
+                    Style::default().fg(if stale { FG_MUTED } else { FG_ACCENT }),
+                ),
+            ]));
+        }
     }
-    if let Some(credits) = report.credit_balance {
-        lines.push(Line::from(vec![
-            Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
-            Span::styled(
-                credit_balance_cn(credits),
-                Style::default().fg(if stale { FG_MUTED } else { FG_ACCENT }),
-            ),
-        ]));
+    if report.windows.is_empty() {
+        if let Some(credits) = report.credit_balance {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
+                Span::styled(
+                    credit_balance_cn(credits),
+                    Style::default().fg(if stale { FG_MUTED } else { FG_ACCENT }),
+                ),
+            ]));
+        }
     }
 
     if let Some(text) = error_line(report) {
@@ -754,7 +786,7 @@ fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<
         return lines;
     }
 
-    for window in &report.windows {
+    for (idx, window) in report.windows.iter().enumerate() {
         let label = label_cn(&window.label);
         let reset = reset_text(window);
         let label_pad =
@@ -795,6 +827,41 @@ fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<
                 ),
             ]));
         }
+        if idx == 0 {
+            if let Some(credits) = report.credit_balance {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
+                    Span::styled(
+                        credit_balance_cn(credits),
+                        Style::default().fg(if stale { FG_MUTED } else { FG_ACCENT }),
+                    ),
+                ]));
+            }
+        }
+    }
+    // 用量行：标签与周期 DIM，数值用清爽的冰蓝灰区分于额度条与重置卡
+    let blocks = usage_blocks(report);
+    let tag_style = Style::default().fg(FG_MUTED);
+    let period_style = Style::default().fg(FG_MUTED);
+    let dot_style = Style::default().fg(FG_MUTED);
+    let val_style = Style::default().fg(if stale {
+        FG_MUTED
+    } else {
+        Color::Rgb(160, 205, 235)
+    });
+    for block in blocks {
+        let mut spans = vec![
+            Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
+            Span::styled(format!("{}：", block.tag), tag_style),
+        ];
+        for (i, (period, val)) in block.items.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("  ·  ", dot_style));
+            }
+            spans.push(Span::styled(format!("{period} "), period_style));
+            spans.push(Span::styled(val.clone(), val_style));
+        }
+        lines.push(Line::from(spans));
     }
     lines
 }

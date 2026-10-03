@@ -147,6 +147,11 @@ fn find_omp_db() -> Option<PathBuf> {
     None
 }
 
+/// OMP 会话日志目录：与凭据库同目录（`~/.omp/agent/sessions`）。
+pub fn omp_sessions_root() -> Option<PathBuf> {
+    find_omp_db().and_then(|db| db.parent().map(|dir| dir.join("sessions")))
+}
+
 fn wsl_unc_candidates() -> Vec<PathBuf> {
     let mut homes = Vec::new();
     if let Ok(home) = std::env::var("HOME") {

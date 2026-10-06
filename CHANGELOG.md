@@ -10,6 +10,7 @@ All notable changes to this project are documented in this file.
 - `--watch` 每轮重新读取凭据库：登录、登出、token 轮换、换 `CODING_QUOTA_DB` 都不必重启进程；watch 期间凭据库临时读不到只跳过本轮并打印一行原因，不再让整个 watch 退出（单发 `--snapshot` 仍按原语义直接失败）。
 - 新增 Google Antigravity 额度卡片：读取 omp 的有效 `google-antigravity` OAuth 登录及 projectId，按 Antigravity Hub 请求规范查询实时额度；显示 Gemini 与平台内 Claude/GPT 共享额度的 5 小时、周窗口、剩余百分比及重置时间，共享 bucket 去重。这是 Antigravity 内的模型额度，不是独立 Claude/Codex 订阅额度。GUI、TUI、托盘开关、`--snapshot` / `--json` 和 `--provider antigravity` / `google-antigravity` 均已接入；登出后隐藏，失败沿用已有缓存及退避规则，401 沿用 omp token 刷新。
 - 额度告警与 Windows 原生通知：剩余百分比跌破 10%、归零、或重置回满（<10% 回到 ≥50%）时从托盘弹系统气泡，一轮多条合并为一条；只在真实跨越时触发，重启用缓存播种不回放历史。托盘菜单新增「额度告警」开关（默认开启，状态存 `%APPDATA%\coding-quota\alerts_enabled.txt`）与「测试通知」入口。
+- 重置卡显示到期时间：智谱重置卡库存接口的每条记录带 `expireTime`，Codex 新增只读查询 `wham/rate-limit-reset-credits` 明细端点拿每张卡的 `expires_at`（数量仍以 usage 端点为准，明细失败只是无日期）。「重置卡：剩余 X 次」行追加可用卡中最早一张的到期日（北京时间 MM-DD，如「重置卡：剩余 5 次 · 最早 10-18 到期」）；GUI、TUI、快照与 `--json`（`resets_expire` 字段）一致。不可用卡、已兑换卡与解析失败的日期不参与计算，`expires_at: null`（永不过期）的卡也不参与。绝不调用消耗重置卡的 consume 接口。
 
 ### Fixed
 

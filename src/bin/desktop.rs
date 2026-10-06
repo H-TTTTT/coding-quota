@@ -8,7 +8,8 @@ mod tray;
 mod instance;
 use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
 use coding_quota::render::{
-    ago_cn, compact_until_cn, credit_balance_cn, label_cn, title_cn, usage_blocks, usage_lines_cn,
+    ago_cn, compact_until_cn, credit_balance_cn, label_cn, resets_line_cn, title_cn, usage_blocks,
+    usage_lines_cn,
 };
 use coding_quota::usage;
 use coding_quota::{alerts, cache, credentials, fetch};
@@ -784,11 +785,7 @@ fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
     }
     if report.windows.iter().all(|w| w.resets_left.is_none()) {
         if let Some(resets) = report.resets_left {
-            width = width.max(text_width(
-                ui,
-                &format!("重置卡：剩余 {resets} 次"),
-                small.clone(),
-            ));
+            width = width.max(text_width(ui, &resets_line_cn(resets, None), small.clone()));
         }
     }
     if report.windows.is_empty() {
@@ -808,7 +805,7 @@ fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
         if let Some(resets) = window.resets_left {
             width = width.max(text_width(
                 ui,
-                &format!("重置卡：剩余 {resets} 次"),
+                &resets_line_cn(resets, window.resets_expire),
                 small.clone(),
             ));
         }
@@ -854,7 +851,7 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
             if report.windows.iter().all(|w| w.resets_left.is_none()) {
                 if let Some(resets) = report.resets_left {
                     ui.label(
-                        egui::RichText::new(format!("重置卡：剩余 {resets} 次"))
+                        egui::RichText::new(resets_line_cn(resets, None))
                             .small()
                             .color(egui::Color32::from_rgb(160, 160, 160)),
                     );
@@ -928,7 +925,7 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                 });
                 if let Some(resets) = window.resets_left {
                     ui.label(
-                        egui::RichText::new(format!("重置卡：剩余 {resets} 次"))
+                        egui::RichText::new(resets_line_cn(resets, window.resets_expire))
                             .small()
                             .color(dim),
                     );

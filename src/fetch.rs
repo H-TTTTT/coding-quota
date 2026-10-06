@@ -499,15 +499,26 @@ fn parse_glm(identity: Option<String>, body: Value, reset_body: Option<&Value>) 
                 && body.get("success").and_then(Value::as_bool) == Some(true)
         })
         .and_then(|body| body.get("data"));
-    let available_resets = |field: &str| -> Option<i64> {
-        let cards = reset_data?.get(field)?.as_array()?;
-        // 与官网一致以 available 为准，不能把过期/不可用记录算进库存。
-        Some(
-            cards
-                .iter()
-                .filter(|card| card.get("available").and_then(Value::as_bool) == Some(true))
-                .count() as i64,
-        )
+    let available_resets = |field: &str| -> (Option<i64>, Option<DateTime<Utc>>) {
+        let Some(cards) = reset_data
+            .and_then(|data| data.get(field))
+            .and_then(Value::as_array)
+        else {
+            return (None, None);
+        };
+        // 与官网一致以 available 为准，不能把过期/不可用记录算进库存；
+        // 到期时间取可用卡里最早的一张（先到期的最紧迫）。
+        let usable: Vec<&Value> = cards
+            .iter()
+            .filter(|card| card.get("available").and_then(Value::as_bool) == Some(true))
+            .collect();
+        let count = Some(usable.len() as i64);
+        let earliest = usable
+            .iter()
+            .filter_map(|card| card.get("expireTime").and_then(Value::as_str))
+            .filter_map(parse_beijing_datetime)
+            .min();
+        (count, earliest)
     };
 
     let mut windows = Vec::new();
@@ -525,11 +536,13 @@ fn parse_glm(identity: Option<String>, body: Value, reset_body: Option<&Value>) 
         };
         let mut window = glm_count_window(id, label, limit, reset)
             .unwrap_or_else(|| QuotaWindow::from_used_percent(id, label, used_percent, reset));
-        window.resets_left = match id {
+        let (resets, resets_expire) = match id {
             "glm-5h" => available_resets("fiveHourResets"),
             "glm-week" => available_resets("weekResets"),
-            _ => None,
+            _ => (None, None),
         };
+        window.resets_left = resets;
+        window.resets_expire = resets_expire;
         windows.push(window);
     }
     if windows.is_empty() {
@@ -542,6 +555,16 @@ fn parse_glm(identity: Option<String>, body: Value, reset_body: Option<&Value>) 
         plan,
         windows,
     )
+}
+/// 官网 expireTime 形如 "2026-10-18 22:07:42"，北京时间语义（无时区标记）。
+fn parse_beijing_datetime(raw: &str) -> Option<DateTime<Utc>> {
+    use chrono::FixedOffset;
+    let cst = FixedOffset::east_opt(8 * 3600)?;
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+        .ok()?
+        .and_local_timezone(cst)
+        .single()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 fn glm_count_window(
@@ -947,6 +970,7 @@ fn parse_grok(identity: Option<String>, body: Value) -> ProviderReport {
 async fn fetch_codex(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
     let plan = cred.plan.clone();
     let account_fallback = cred.account_id.clone();
+    let detail_fallback = account_fallback.clone();
     let result = fetch_with_refresh(client, &cred, "openai-codex", move |client, token| {
         let mut headers = bearer(token);
         if let Some(account_id) =
@@ -966,13 +990,35 @@ async fn fetch_codex(client: &reqwest::Client, cred: StoredCred) -> ProviderRepo
     match result {
         Ok((token, body)) => {
             let identity = credentials::jwt_email(&token).or(cred.identity);
-            parse_codex(identity, plan, body)
+            // 重置卡明细端点提供每张卡的 expires_at（usage 只给数量）；
+            // 只读查询，失败静默——数量照常显示，只是没有到期日期。
+            let mut detail_headers = bearer(&token);
+            if let Some(account_id) =
+                credentials::chatgpt_account_id(&token, detail_fallback.as_deref())
+            {
+                if let Ok(value) = HeaderValue::from_str(&account_id) {
+                    detail_headers.insert("ChatGPT-Account-Id", value);
+                }
+            }
+            let detail = get_json(
+                client,
+                "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+                detail_headers,
+            )
+            .await
+            .ok();
+            parse_codex(identity, plan, body, detail.as_ref())
         }
         Err(err) => ProviderReport::err(ProviderId::Codex, cred.identity, err),
     }
 }
 
-fn parse_codex(identity: Option<String>, plan: Option<String>, body: Value) -> ProviderReport {
+fn parse_codex(
+    identity: Option<String>,
+    plan: Option<String>,
+    body: Value,
+    credits_detail: Option<&Value>,
+) -> ProviderReport {
     let plan_label = body
         .get("plan_type")
         .and_then(|v| v.as_str())
@@ -1002,6 +1048,7 @@ fn parse_codex(identity: Option<String>, plan: Option<String>, body: Value) -> P
     // 重置卡与智谱保持一致显示在主限流窗口（7 天窗口 / 5 小时窗口）进度条下方。
     if let Some(primary) = report.windows.first_mut() {
         primary.resets_left = reset_credits;
+        primary.resets_expire = codex_earliest_reset_expiry(credits_detail);
     }
     report.credit_balance = body.get("credits").and_then(|credits| {
         if credits.get("unlimited").and_then(Value::as_bool) == Some(true) {
@@ -1013,6 +1060,20 @@ fn parse_codex(identity: Option<String>, plan: Option<String>, body: Value) -> P
         }
     });
     report
+}
+
+/// Codex 重置卡明细：可用（status == "available"）卡中最早的 expires_at；
+/// expires_at 为 null 的卡（协议定义为永不过期）不参与最早计算。
+fn codex_earliest_reset_expiry(detail: Option<&Value>) -> Option<DateTime<Utc>> {
+    let credits = detail?.get("credits")?.as_array()?;
+    credits
+        .iter()
+        .filter(|credit| credit.get("status").and_then(Value::as_str) == Some("available"))
+        .filter_map(|credit| credit.get("expires_at").and_then(Value::as_str))
+        .filter(|raw| !raw.eq_ignore_ascii_case("null"))
+        .filter_map(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .min()
 }
 
 fn push_codex_window(windows: &mut Vec<QuotaWindow>, raw: Option<&Value>, review: bool) {
@@ -2003,6 +2064,7 @@ mod tests {
                     "rate_limit_reset_credits": {"available_count": 2},
                     "credits": credits
                 }),
+                None,
             );
             assert_eq!(report.credit_balance, Some(expected));
             assert_eq!(report.resets_left, Some(2));
@@ -2027,6 +2089,7 @@ mod tests {
                     }},
                     "credits": credits
                 }),
+                None,
             );
             assert_eq!(report.credit_balance, None);
             assert_eq!(report.windows[0].used_fraction, 0.2);
@@ -2034,6 +2097,41 @@ mod tests {
             assert_eq!(report.windows[0].resets_left, None);
             assert!(report.error.is_none(), "{:?}", report.error);
         }
+    }
+
+    /// Codex 重置卡到期时间来自明细端点：只算 available 卡的最早 expires_at，
+    /// null（永不过期）与已兑换/不可用卡不参与；明细缺失时无日期。
+    #[test]
+    fn codex_reset_expiry_takes_earliest_available_credit() {
+        let body = serde_json::json!({
+            "rate_limit": {"primary_window": {
+                "used_percent": 10, "limit_window_seconds": 604800
+            }},
+            "rate_limit_reset_credits": {"available_count": 2}
+        });
+        let detail = serde_json::json!({
+            "credits": [
+                {"status": "redeemed", "expires_at": "2026-10-05T00:00:00Z"},
+                {"status": "available", "expires_at": "2026-10-22T20:58:42Z"},
+                {"status": "available", "expires_at": "2026-10-29T19:09:13Z"},
+                {"status": "available", "expires_at": null}
+            ],
+            "available_count": 2
+        });
+        let report = parse_codex(None, None, body.clone(), Some(&detail));
+        assert_eq!(
+            report.windows[0].resets_expire,
+            Some(
+                DateTime::parse_from_rfc3339("2026-10-22T20:58:42Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+
+        // 明细端点失败：数量照常，日期缺席。
+        let report = parse_codex(None, None, body, None);
+        assert_eq!(report.windows[0].resets_left, Some(2));
+        assert_eq!(report.windows[0].resets_expire, None);
     }
 
     fn glm_quota_fixture() -> Value {
@@ -2076,13 +2174,17 @@ mod tests {
             "success": true,
             "data": {
                 "fiveHourResets": [
-                    {"available": true},
-                    {"available": false},
-                    {"available": true},
-                    {"available": "true"},
+                    {"available": true, "expireTime": "2026-10-18 22:07:42"},
+                    {"available": false, "expireTime": "2026-10-01 00:00:00"},
+                    {"available": true, "expireTime": "2026-10-28 11:19:01"},
+                    {"available": "true", "expireTime": "2026-10-01 00:00:00"},
+                    {"available": true, "expireTime": "not-a-date"},
                     {}
                 ],
-                "weekResets": [{"available": true}, {"available": false}]
+                "weekResets": [
+                    {"available": true, "expireTime": "2026-10-28 11:19:01"},
+                    {"available": false, "expireTime": "2026-09-30 00:00:00"}
+                ]
             }
         });
         let report = parse_glm(None, glm_quota_fixture(), Some(&resets));
@@ -2090,14 +2192,40 @@ mod tests {
         let windows: Vec<_> = report
             .windows
             .iter()
-            .map(|window| (window.id.as_str(), window.used_fraction, window.resets_left))
+            .map(|window| {
+                (
+                    window.id.as_str(),
+                    window.used_fraction,
+                    window.resets_left,
+                    window.resets_expire,
+                )
+            })
             .collect();
         assert_eq!(
             windows,
             [
-                ("glm-5h", 0.2, Some(2)),
-                ("glm-week", 0.6, Some(1)),
-                ("glm-mcp", 0.1, None),
+                (
+                    "glm-5h",
+                    0.2,
+                    Some(3),
+                    // 不可用卡与坏日期不算：可用卡里最早的是 10-18（北京时间）。
+                    Some(
+                        DateTime::parse_from_rfc3339("2026-10-18T14:07:42Z")
+                            .unwrap()
+                            .with_timezone(&Utc),
+                    ),
+                ),
+                (
+                    "glm-week",
+                    0.6,
+                    Some(1),
+                    Some(
+                        DateTime::parse_from_rfc3339("2026-10-28T03:19:01Z")
+                            .unwrap()
+                            .with_timezone(&Utc),
+                    ),
+                ),
+                ("glm-mcp", 0.1, None, None),
             ]
         );
     }

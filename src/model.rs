@@ -86,6 +86,9 @@ pub struct QuotaWindow {
     /// 当前额度窗口可用的手动重置卡次数；未查询到库存时为 None。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resets_left: Option<i64>,
+    /// 可用重置卡中最早一张的到期时间（官网 expireTime，北京时间语义）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_expire: Option<DateTime<Utc>>,
 }
 
 impl QuotaWindow {
@@ -104,6 +107,7 @@ impl QuotaWindow {
             unit: Some("percent".into()),
             reset_at,
             resets_left: None,
+            resets_expire: None,
         }
     }
 
@@ -129,6 +133,7 @@ impl QuotaWindow {
             unit: Some(unit.into()),
             reset_at,
             resets_left: None,
+            resets_expire: None,
         }
     }
 }

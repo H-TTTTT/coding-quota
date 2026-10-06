@@ -125,9 +125,29 @@ fn format_window(window: &QuotaWindow) -> String {
         extra,
     );
     if let Some(resets) = window.resets_left {
-        write!(out, "\n  reset cards left: {resets}").expect("writing to a String cannot fail");
+        let mut line = format!("  reset cards left: {resets}");
+        if let Some(expire) = window.resets_expire {
+            write!(line, " (earliest expires {})", date_cn(expire))
+                .expect("writing to a String cannot fail");
+        }
+        out.push_str(&line);
     }
     out
+}
+
+/// 北京时间的 MM-DD（官网 expireTime 本就是北京时间语义，展示时换算回去）。
+pub fn date_cn(when: DateTime<Utc>) -> String {
+    use chrono::FixedOffset;
+    let cst = FixedOffset::east_opt(8 * 3600).expect("valid offset");
+    when.with_timezone(&cst).format("%m-%d").to_string()
+}
+
+/// 重置卡行文案：剩余次数 + 可用卡中最早到期的日期（有到期数据时）。
+pub fn resets_line_cn(resets: i64, expire: Option<DateTime<Utc>>) -> String {
+    match expire {
+        Some(expire) => format!("重置卡：剩余 {resets} 次 · 最早 {} 到期", date_cn(expire)),
+        None => format!("重置卡：剩余 {resets} 次"),
+    }
 }
 
 pub fn bar(fraction: f64, width: usize) -> String {
@@ -413,6 +433,21 @@ mod tests {
         assert_eq!(compact_tokens_cn(456_146_001), "4.56亿");
         assert_eq!(compact_tokens_cn(1_552_626_856), "15.53亿");
         assert_eq!(compact_tokens_cn(3_166_652_059), "31.67亿");
+    }
+
+    #[test]
+    fn resets_line_includes_earliest_expiry() {
+        // expireTime 按北京时间换算：2026-10-18 22:07:42 CST == 14:07:42Z。
+        let expire = chrono::DateTime::parse_from_rfc3339("2026-10-18T14:07:42Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(date_cn(expire), "10-18");
+        assert_eq!(
+            resets_line_cn(5, Some(expire)),
+            "重置卡：剩余 5 次 · 最早 10-18 到期"
+        );
+        assert_eq!(resets_line_cn(0, None), "重置卡：剩余 0 次");
+        assert_eq!(resets_line_cn(2, None), "重置卡：剩余 2 次");
     }
 
     #[test]

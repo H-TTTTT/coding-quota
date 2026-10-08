@@ -19,7 +19,6 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::mpsc;
 use std::time::Duration;
 
-const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const QUOTA_VALUE_WIDTH: f32 = 86.0;
 /// 额度标签行（左侧标签 + 右侧重置时间）统一字号，与「剩余 xx%」一致。
 /// 注意不能用 `.small().monospace()`：两者都是设置 text_style，后者会覆盖前者。
@@ -33,6 +32,8 @@ const MIN_BAR_WIDTH: f32 = 120.0;
 
 enum Cmd {
     Refresh,
+    /// 设置变了（如刷新频率），打断等待重读配置，本身不触发抓取。
+    Wake,
 }
 
 fn main() -> eframe::Result<()> {
@@ -172,6 +173,16 @@ mod win32 {
 
     #[link(name = "user32")]
     extern "system" {
+        fn GetSystemMetrics(index: i32) -> i32;
+        fn LoadImageW(
+            instance: *mut c_void,
+            name: *const u16,
+            kind: u32,
+            width: i32,
+            height: i32,
+            flags: u32,
+        ) -> *mut c_void;
+        fn PostMessageW(hwnd: *mut c_void, message: u32, wparam: usize, lparam: isize) -> i32;
         pub fn GetWindowLongPtrW(hwnd: *mut c_void, index: i32) -> isize;
         pub fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, new_value: isize) -> isize;
         pub fn GetCursorPos(point: *mut Point) -> i32;
@@ -185,6 +196,11 @@ mod win32 {
             cy: i32,
             flags: u32,
         ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
     }
 
     #[link(name = "dwmapi")]
@@ -212,6 +228,29 @@ mod win32 {
         let corner = DWMWCP_ROUND;
         DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, 4);
     }
+
+    /// 使用 exe 自身的大小图标资源，避免窗口沿用 eframe 的默认“e”图标。
+    /// 排入消息队列，在首帧的框架图标初始化之后应用；只执行一次，不逐帧覆盖。
+    /// LR_SHARED 图标由系统管理，句柄在进程生命周期内有效。
+    pub unsafe fn apply_app_icon(hwnd: *mut c_void) {
+        const WM_SETICON: u32 = 0x0080;
+        const IMAGE_ICON: u32 = 1;
+        const LR_SHARED: u32 = 0x8000;
+        let instance = GetModuleHandleW(std::ptr::null());
+        for (kind, width_metric, height_metric) in [(0, 49, 50), (1, 11, 12)] {
+            let icon = LoadImageW(
+                instance,
+                std::ptr::without_provenance::<u16>(1),
+                IMAGE_ICON,
+                GetSystemMetrics(width_metric),
+                GetSystemMetrics(height_metric),
+                LR_SHARED,
+            );
+            if !icon.is_null() {
+                PostMessageW(hwnd, WM_SETICON, kind, icon as isize);
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -227,6 +266,7 @@ fn apply_window_chrome(frame: &eframe::Frame, glass_applied: &mut bool) {
         win32::apply_noactivate(hwnd);
         if !*glass_applied {
             win32::apply_glass(hwnd);
+            win32::apply_app_icon(hwnd);
             *glass_applied = true;
         }
     }
@@ -441,8 +481,11 @@ impl DesktopApp {
                     tray::notify("编程额度", &body);
                 }
                 round_alerts.clear();
-                match cmd_rx.recv_timeout(REFRESH_INTERVAL) {
-                    Ok(Cmd::Refresh) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                // 每轮重读刷新间隔：托盘里改了「刷新频率」后由 Cmd::Wake 立刻生效
+                match cmd_rx.recv_timeout(tray::load_interval()) {
+                    Ok(Cmd::Refresh) | Ok(Cmd::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                        continue
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 }
             }
@@ -503,6 +546,10 @@ impl eframe::App for DesktopApp {
                 tray::TrayCommand::ProvidersChanged => {
                     self.hidden_providers = tray::load_hidden();
                     self.last_content_size = None;
+                }
+                tray::TrayCommand::IntervalChanged => {
+                    // 不打断进行中的抓取；本轮结束后按新间隔等待
+                    let _ = self.cmd_tx.send(Cmd::Wake);
                 }
                 tray::TrayCommand::Quit => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);

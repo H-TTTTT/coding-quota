@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- 托盘菜单新增「刷新频率」选项（1 / 3 / 5 / 10 / 30 分钟，默认 5 分钟），选择立即生效，持久化在 `%APPDATA%\coding-quota\refresh_interval_secs.txt`。
+
 ### Changed
 
 - 挂件加了单实例锁：重复启动 `coding-quota-gui.exe`（双击、开机自启 + 手动启动）不再出现第二个托盘图标和第二路后台刷新，只会弹一句「已经在运行」的提示后退出。锁按登录会话隔离，远程桌面会话里各开一个仍然允许。
@@ -13,6 +17,8 @@ All notable changes to this project are documented in this file.
 - 重置卡显示到期时间：智谱重置卡库存接口的每条记录带 `expireTime`，Codex 新增只读查询 `wham/rate-limit-reset-credits` 明细端点拿每张卡的 `expires_at`（数量仍以 usage 端点为准，明细失败只是无日期）。「重置卡：剩余 X 次」行追加可用卡中最早一张的到期日（北京时间 MM-DD，如「重置卡：剩余 5 次 · 最早 10-18 到期」）；GUI、TUI、快照与 `--json`（`resets_expire` 字段）一致。不可用卡、已兑换卡与解析失败的日期不参与计算，`expires_at: null`（永不过期）的卡也不参与。绝不调用消耗重置卡的 consume 接口。
 
 ### Fixed
+
+- 修复任务管理器中 exe 图标与「编程额度」子窗口图标不一致：窗口首帧初始化后使用 exe 内嵌资源 1 的系统大、小图标，替换 eframe 默认的「e」图标。通过消息队列延后应用，避免框架首帧设置覆盖；复用现有 `icon.ico`，无需新增图片或依赖。
 
 - Kimi 的「总额度」实际就是每周额度：卡片改为直接读官方 `usages.limit_5h` / `usages.limit_7d` 字段（used_ratio），标签修正为「5 小时限额」「每周额度」；`usages` 子对象缺失时逐条退回旧的 `limits[]` / `usage` 块。月额度不在 coding API 返回中（只在 kimi.com 会员页，需浏览器登录态），无法经 omp 凭据显示。
 - 把 exe 移动或改名之后，开机自启不再静默失效：启动时检查 `HKCU\...\Run` 里的路径（仅在自启已开启时），与实际位置不一致就改写为当前可执行文件，比较忽略大小写。

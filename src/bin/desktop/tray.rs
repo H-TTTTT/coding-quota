@@ -11,6 +11,7 @@ use std::sync::mpsc;
 pub enum TrayCommand {
     Refresh,
     ProvidersChanged,
+    IntervalChanged,
     Quit,
 }
 
@@ -67,6 +68,43 @@ pub fn load_hidden() -> Vec<String> {
 pub fn is_hidden(hidden: &[String], provider: ProviderId) -> bool {
     let key = provider_key(provider);
     hidden.iter().any(|item| item == key)
+}
+
+/// 托盘「刷新频率」可选项（秒）。
+const INTERVALS: &[(u64, &str)] = &[
+    (60, "1 分钟"),
+    (180, "3 分钟"),
+    (300, "5 分钟"),
+    (600, "10 分钟"),
+    (1800, "30 分钟"),
+];
+const DEFAULT_INTERVAL_SECS: u64 = 300;
+
+fn interval_file() -> Option<std::path::PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    Some(
+        std::path::PathBuf::from(appdata)
+            .join("coding-quota")
+            .join("refresh_interval_secs.txt"),
+    )
+}
+
+/// 当前刷新间隔（秒）。文件缺失或内容不在可选项里时用默认 5 分钟。
+pub fn load_interval() -> std::time::Duration {
+    let secs = interval_file()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|secs| INTERVALS.iter().any(|(option, _)| option == secs))
+        .unwrap_or(DEFAULT_INTERVAL_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+fn save_interval(secs: u64) {
+    let Some(path) = interval_file() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, secs.to_string());
 }
 
 /// 隐藏列表映射为 ProviderId，供取数层整体跳过（退订的平台不再请求）。
@@ -168,7 +206,10 @@ pub fn heal_autostart_path() {}
 
 #[cfg(windows)]
 mod imp {
-    use super::{is_hidden, load_hidden, toggle_hidden, TrayCommand, PROVIDERS, WIDGET_HWND};
+    use super::{
+        is_hidden, load_hidden, load_interval, save_interval, toggle_hidden, TrayCommand,
+        INTERVALS, PROVIDERS, WIDGET_HWND,
+    };
     use core::ffi::c_void;
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicIsize, Ordering};
@@ -219,6 +260,7 @@ mod imp {
     const ID_ALERTS: usize = 5;
     const ID_NOTIFY_TEST: usize = 6;
     const ID_PROVIDER_BASE: usize = 100;
+    const ID_INTERVAL_BASE: usize = 200;
 
     const HKEY_CURRENT_USER: *mut c_void = 0x8000_0001_usize as *mut c_void;
     const KEY_QUERY_VALUE: u32 = 0x0001;
@@ -888,6 +930,25 @@ mod imp {
             AppendMenuW(menu, MF_STRING | MF_POPUP, submenu as usize, label.as_ptr());
         }
 
+        let interval_menu = CreatePopupMenu();
+        if !interval_menu.is_null() {
+            let current = load_interval().as_secs();
+            for (index, (secs, label)) in INTERVALS.iter().enumerate() {
+                let mut flags = MF_STRING;
+                if *secs == current {
+                    flags |= MF_CHECKED;
+                }
+                append(interval_menu, flags, ID_INTERVAL_BASE + index, label);
+            }
+            let label = wide("刷新频率");
+            AppendMenuW(
+                menu,
+                MF_STRING | MF_POPUP,
+                interval_menu as usize,
+                label.as_ptr(),
+            );
+        }
+
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
         append(menu, MF_STRING, ID_QUIT, "退出");
 
@@ -932,6 +993,10 @@ mod imp {
             id if (ID_PROVIDER_BASE..ID_PROVIDER_BASE + PROVIDERS.len()).contains(&id) => {
                 toggle_hidden(PROVIDERS[id - ID_PROVIDER_BASE].0);
                 dispatch(TrayCommand::ProvidersChanged);
+            }
+            id if (ID_INTERVAL_BASE..ID_INTERVAL_BASE + INTERVALS.len()).contains(&id) => {
+                save_interval(INTERVALS[id - ID_INTERVAL_BASE].0);
+                dispatch(TrayCommand::IntervalChanged);
             }
             _ => {}
         }

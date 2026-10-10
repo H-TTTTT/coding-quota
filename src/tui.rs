@@ -724,7 +724,7 @@ fn max_scroll(content_rows: u16) -> u16 {
 }
 
 fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<Line<'static>> {
-    let stale = report.error.is_some() && !report.windows.is_empty();
+    let stale = report.error.is_some() && report.has_data();
     let worst = report
         .windows
         .iter()
@@ -758,7 +758,7 @@ fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<
         }
     }
     if report.windows.is_empty() {
-        if let Some(credits) = report.credit_balance {
+        if let Some(credits) = &report.credit_balance {
             lines.push(Line::from(vec![
                 Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
                 Span::styled(
@@ -778,7 +778,7 @@ fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<
             return lines;
         }
     }
-    if report.windows.is_empty() {
+    if !report.has_data() {
         lines.push(Line::from(format!(
             "{}暂无额度数据",
             " ".repeat(TUI_LEFT_GUTTER)
@@ -828,7 +828,7 @@ fn report_lines(report: &ProviderReport, width: usize, bar_width: usize) -> Vec<
             ]));
         }
         if idx == 0 {
-            if let Some(credits) = report.credit_balance {
+            if let Some(credits) = &report.credit_balance {
                 lines.push(Line::from(vec![
                     Span::raw(" ".repeat(TUI_LEFT_GUTTER)),
                     Span::styled(
@@ -911,7 +911,7 @@ fn remaining_extra(report: &ProviderReport, window: &QuotaWindow) -> String {
 
 fn error_line(report: &ProviderReport) -> Option<String> {
     let error = report.error.as_deref()?;
-    let stale = !report.windows.is_empty();
+    let stale = report.has_data();
     Some(if stale {
         format!(
             "更新失败，显示{}数据：{}",

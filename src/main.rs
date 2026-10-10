@@ -12,7 +12,7 @@ use std::io::IsTerminal;
 #[command(
     name = "coding-quota-tui",
     version,
-    about = "Show Codex, Claude, Grok, GLM, Kimi, Cursor, Devin, and Google Antigravity coding-plan quotas in one place"
+    about = "Show coding-plan quotas and DeepSeek account balance in one place"
 )]
 struct Cli {
     /// Machine-readable JSON
@@ -23,7 +23,7 @@ struct Cli {
     #[arg(long)]
     snapshot: bool,
 
-    /// Only query one provider: codex, claude, grok, glm, kimi, cursor, devin, antigravity
+    /// Only query one provider: codex, claude, grok, glm, kimi, cursor, devin, antigravity, deepseek
     #[arg(long, short = 'p')]
     provider: Option<String>,
 

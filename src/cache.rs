@@ -78,7 +78,7 @@ impl Cache {
         report.identity.clone_from(&stale.identity);
         report.plan.clone_from(&stale.plan);
         report.resets_left = stale.resets_left;
-        report.credit_balance = stale.credit_balance;
+        report.credit_balance.clone_from(&stale.credit_balance);
         report.usage.clone_from(&stale.usage);
         report.windows.clone_from(&stale.windows);
         report.fetched_at = stale.fetched_at;
@@ -281,6 +281,34 @@ mod tests {
             !cache.merge(&ProviderReport::missing(ProviderId::Grok)),
             "本来就没有条目，不算变化"
         );
+    }
+
+    #[test]
+    fn balance_backfill_preserves_age_and_does_not_revive_logout_or_expired_data() {
+        use crate::model::{CreditBalance, MoneyBalance};
+        let mut saved = ProviderReport::ok(ProviderId::Deepseek, "DeepSeek", None, None, vec![]);
+        saved.credit_balance = Some(CreditBalance::Money(vec![MoneyBalance {
+            amount: 33.88,
+            currency: "CNY".into(),
+        }]));
+        saved.fetched_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let cache = cache_with(vec![saved.clone()]);
+        let mut failed = ProviderReport::err(ProviderId::Deepseek, None, "HTTP 500");
+        cache.backfill(&mut failed);
+        assert_eq!(failed.credit_balance, saved.credit_balance);
+        assert_eq!(failed.fetched_at, saved.fetched_at);
+        assert_eq!(failed.error.as_deref(), Some("HTTP 500"));
+        assert!(failed.has_data());
+
+        let mut logged_out = ProviderReport::missing(ProviderId::Deepseek);
+        cache.backfill(&mut logged_out);
+        assert!(!logged_out.has_data());
+
+        saved.fetched_at = chrono::Utc::now() - chrono::Duration::hours(25);
+        let cache = cache_with(vec![saved]);
+        let mut failed = ProviderReport::err(ProviderId::Deepseek, None, "HTTP 500");
+        cache.backfill(&mut failed);
+        assert!(!failed.has_data());
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use crate::backoff::Backoff;
 use crate::credentials::{self, CredentialSet, StoredCred};
-use crate::model::{CreditBalance, ProviderId, ProviderReport, QuotaWindow, Snapshot};
+use crate::model::{
+    CreditBalance, MoneyBalance, ProviderId, ProviderReport, QuotaWindow, Snapshot,
+};
 use chrono::{DateTime, TimeZone, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
 use serde_json::Value;
@@ -85,6 +87,7 @@ pub async fn fetch_all_streaming(
         (ProviderId::Kimi, creds.kimi.clone()),
         (ProviderId::Cursor, creds.cursor.clone()),
         (ProviderId::Antigravity, creds.antigravity.clone()),
+        (ProviderId::Deepseek, creds.deepseek.clone()),
     ] {
         let client = client.clone();
         let skip = skip.clone();
@@ -164,6 +167,7 @@ async fn maybe_fetch(
         ProviderId::Kimi => fetch_kimi(client, cred).await,
         ProviderId::Cursor => fetch_cursor(client, cred).await,
         ProviderId::Antigravity => fetch_antigravity(client, cred).await,
+        ProviderId::Deepseek => fetch_deepseek(client, cred).await,
         // Devin 走 CLI 横幅，不使用 CredentialSet 里的凭据
         ProviderId::Devin => fetch_devin(),
     };
@@ -1011,6 +1015,52 @@ async fn fetch_codex(client: &reqwest::Client, cred: StoredCred) -> ProviderRepo
         }
         Err(err) => ProviderReport::err(ProviderId::Codex, cred.identity, err),
     }
+}
+
+/// DeepSeek 账户余额：只读查询官方 /user/balance，不构造额度百分比窗口。
+async fn fetch_deepseek(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
+    let identity = cred.identity.clone();
+    match fetch_with_refresh(client, &cred, "deepseek", |client, token| {
+        Box::pin(get_json(
+            client,
+            "https://api.deepseek.com/user/balance",
+            bearer(token),
+        ))
+    })
+    .await
+    {
+        Ok((_, body)) => parse_deepseek(identity, body),
+        Err(err) => ProviderReport::err(ProviderId::Deepseek, identity, err),
+    }
+}
+
+fn parse_deepseek(identity: Option<String>, body: Value) -> ProviderReport {
+    let balances = body
+        .get("balance_infos")
+        .and_then(Value::as_array)
+        .filter(|infos| !infos.is_empty())
+        .and_then(|infos| {
+            infos
+                .iter()
+                .map(|info| {
+                    let amount = number(info.get("total_balance")).filter(|v| v.is_finite())?;
+                    let currency = info
+                        .get("currency")?
+                        .as_str()
+                        .filter(|currency| !currency.is_empty())?;
+                    Some(MoneyBalance {
+                        amount,
+                        currency: currency.to_string(),
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+        });
+    let Some(balances) = balances else {
+        return ProviderReport::err(ProviderId::Deepseek, identity, "invalid balance payload");
+    };
+    let mut report = ProviderReport::ok(ProviderId::Deepseek, "DeepSeek", identity, None, vec![]);
+    report.credit_balance = Some(CreditBalance::Money(balances));
+    report
 }
 
 fn parse_codex(
@@ -2132,6 +2182,84 @@ mod tests {
         let report = parse_codex(None, None, body, None);
         assert_eq!(report.windows[0].resets_left, Some(2));
         assert_eq!(report.windows[0].resets_expire, None);
+    }
+
+    #[test]
+    fn deepseek_balance_preserves_totals_currencies_and_zero() {
+        let report = parse_deepseek(
+            None,
+            serde_json::json!({
+                "is_available": true,
+                "balance_infos": [
+                    {
+                        "currency": "CNY", "total_balance": "33.88",
+                        "granted_balance": "10.00", "topped_up_balance": "23.88"
+                    },
+                    {
+                        "currency": "USD", "total_balance": "12.50",
+                        "granted_balance": "0.00", "topped_up_balance": "12.50"
+                    }
+                ]
+            }),
+        );
+        assert_eq!(
+            report.credit_balance,
+            Some(CreditBalance::Money(vec![
+                MoneyBalance {
+                    amount: 33.88,
+                    currency: "CNY".into()
+                },
+                MoneyBalance {
+                    amount: 12.5,
+                    currency: "USD".into()
+                },
+            ]))
+        );
+        assert!(
+            report.windows.is_empty(),
+            "balance must not become a percentage window"
+        );
+
+        let exhausted = parse_deepseek(
+            None,
+            serde_json::json!({
+                "is_available": false,
+                "balance_infos": [{"currency": "CNY", "total_balance": "0.00"}]
+            }),
+        );
+        assert_eq!(
+            exhausted.credit_balance,
+            Some(CreditBalance::Money(vec![MoneyBalance {
+                amount: 0.0,
+                currency: "CNY".into(),
+            }]))
+        );
+        assert!(
+            exhausted.has_data(),
+            "known zero balance is still displayable data"
+        );
+    }
+
+    #[test]
+    fn deepseek_invalid_balance_is_an_error_not_zero_or_partial_success() {
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"balance_infos": []}),
+            serde_json::json!({"balance_infos": [{"currency": "CNY"}]}),
+            serde_json::json!({"balance_infos": [{"total_balance": "33.88"}]}),
+            serde_json::json!({"balance_infos": [{"currency": "CNY", "total_balance": "NaN"}]}),
+            serde_json::json!({"balance_infos": [
+                {"currency": "CNY", "total_balance": "33.88"},
+                {"currency": "USD", "total_balance": "invalid"}
+            ]}),
+        ] {
+            let report = parse_deepseek(None, payload);
+            assert!(
+                report.error.is_some(),
+                "missing/invalid amounts must allow stale backfill"
+            );
+            assert_eq!(report.credit_balance, None);
+        }
     }
 
     fn glm_quota_fixture() -> Value {

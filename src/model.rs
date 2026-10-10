@@ -12,12 +12,13 @@ pub enum ProviderId {
     Cursor,
     Devin,
     Antigravity,
+    Deepseek,
 }
 
 impl ProviderId {
     /// 展示顺序：各处的卡片顺序、`--snapshot` 与缓存的稳定落盘顺序都用它。
     /// 并行取数回来的是完成顺序，不按它排序卡片会每轮跳位置。
-    pub const ALL: [ProviderId; 8] = [
+    pub const ALL: [ProviderId; 9] = [
         Self::Codex,
         Self::Claude,
         Self::Grok,
@@ -26,6 +27,7 @@ impl ProviderId {
         Self::Cursor,
         Self::Devin,
         Self::Antigravity,
+        Self::Deepseek,
     ];
 
     /// 在 `ALL` 里的下标，用作稳定排序键。
@@ -39,6 +41,7 @@ impl ProviderId {
             Self::Cursor => 5,
             Self::Devin => 6,
             Self::Antigravity => 7,
+            Self::Deepseek => 8,
         }
     }
 
@@ -52,6 +55,7 @@ impl ProviderId {
             Self::Cursor => "Cursor",
             Self::Devin => "Devin",
             Self::Antigravity => "Google Antigravity",
+            Self::Deepseek => "DeepSeek",
         }
     }
 
@@ -65,6 +69,7 @@ impl ProviderId {
             "cursor" => Some(Self::Cursor),
             "devin" | "devin-cli" | "cognition" => Some(Self::Devin),
             "antigravity" | "google-antigravity" => Some(Self::Antigravity),
+            "deepseek" => Some(Self::Deepseek),
             _ => None,
         }
     }
@@ -138,12 +143,20 @@ impl QuotaWindow {
     }
 }
 
-/// Codex 的额外积分余额，不是限流窗口的剩余百分比或重置次数。
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// Codex 的额外积分余额与 DeepSeek 的账户余额，不是限流窗口的剩余百分比或重置次数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "balance", rename_all = "snake_case")]
 pub enum CreditBalance {
     Limited(f64),
     Unlimited,
+    /// API 账户余额，各币种独立显示，不能互相相加。
+    Money(Vec<MoneyBalance>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MoneyBalance {
+    pub amount: f64,
+    pub currency: String,
 }
 
 /// 一条 token 用量汇总：来自本机 OMP 会话扫描或服务端用量接口。
@@ -229,6 +242,11 @@ impl ProviderReport {
 
     pub fn missing(provider: ProviderId) -> Self {
         Self::err(provider, None, "no credential found")
+    }
+
+    /// 已取得可展示的数据；余额型平台没有额度窗口。
+    pub fn has_data(&self) -> bool {
+        !self.windows.is_empty() || self.credit_balance.is_some()
     }
 
     /// omp 中没有该平台授权（区别于抓取失败等临时错误）。

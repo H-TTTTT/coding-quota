@@ -1,4 +1,4 @@
-use crate::model::{CreditBalance, ProviderReport, QuotaWindow, Snapshot};
+use crate::model::{CreditBalance, MoneyBalance, ProviderReport, QuotaWindow, Snapshot};
 use chrono::{DateTime, Utc};
 use std::fmt::Write;
 
@@ -32,29 +32,23 @@ fn provider_block(report: &ProviderReport) -> String {
         }
     }
     if report.windows.is_empty() {
-        if let Some(credits) = report.credit_balance {
-            lines.push(match credits {
-                CreditBalance::Limited(balance) => format!("  credits left: {balance}"),
-                CreditBalance::Unlimited => "  credits: unlimited".into(),
-            });
+        if let Some(credits) = &report.credit_balance {
+            lines.push(format!("  {}", balance_text(credits)));
         }
     }
     if let Some(error) = &report.error {
         lines.push(format!("  ○ {error}"));
         return lines.join("\n");
     }
-    if report.windows.is_empty() {
+    if !report.has_data() {
         lines.push("  ○ no usage data".into());
         return lines.join("\n");
     }
     for (idx, window) in report.windows.iter().enumerate() {
         lines.push(format_window(window));
         if idx == 0 {
-            if let Some(credits) = report.credit_balance {
-                lines.push(match credits {
-                    CreditBalance::Limited(balance) => format!("  credits left: {balance}"),
-                    CreditBalance::Unlimited => "  credits: unlimited".into(),
-                });
+            if let Some(credits) = &report.credit_balance {
+                lines.push(format!("  {}", balance_text(credits)));
             }
         }
     }
@@ -200,10 +194,37 @@ pub fn title_cn(title: &str) -> &str {
     }
 }
 
-pub fn credit_balance_cn(credits: CreditBalance) -> String {
+/// 快照侧英文文案：credits left: X / balance: ¥33.88。
+fn balance_text(credits: &CreditBalance) -> String {
+    match credits {
+        CreditBalance::Limited(balance) => format!("credits left: {balance}"),
+        CreditBalance::Unlimited => "credits: unlimited".into(),
+        CreditBalance::Money(balances) => format!("balance: {}", money_amounts(balances)),
+    }
+}
+
+/// 各币种余额独立展示；未知币种保留货币代码，不能默认为人民币。
+fn money_amounts(balances: &[MoneyBalance]) -> String {
+    let mut out = String::new();
+    for (index, balance) in balances.iter().enumerate() {
+        if index > 0 {
+            out.push_str(" · ");
+        }
+        match balance.currency.as_str() {
+            "CNY" => write!(out, "¥{:.2}", balance.amount),
+            "USD" => write!(out, "${:.2}", balance.amount),
+            other => write!(out, "{:.2} {other}", balance.amount),
+        }
+        .expect("writing to a String cannot fail");
+    }
+    out
+}
+
+pub fn credit_balance_cn(credits: &CreditBalance) -> String {
     match credits {
         CreditBalance::Limited(balance) => format!("积分：剩余 {balance}"),
         CreditBalance::Unlimited => "积分：无限".into(),
+        CreditBalance::Money(balances) => format!("余额：{}", money_amounts(balances)),
     }
 }
 

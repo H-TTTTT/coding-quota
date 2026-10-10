@@ -803,7 +803,7 @@ fn error_text(report: &ProviderReport) -> String {
     let Some(error) = &report.error else {
         return String::new();
     };
-    if report.windows.is_empty() {
+    if !report.has_data() {
         error.clone()
     } else {
         format!("更新失败，显示{}数据：{error}", ago_cn(report.fetched_at))
@@ -826,7 +826,7 @@ fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
     let value = egui::FontId::new(11.0, egui::FontFamily::Proportional);
     let gap = ui.spacing().item_spacing.x;
 
-    let mut width = text_width(ui, &report_title(report), body);
+    let mut width = text_width(ui, &report_title(report), body.clone());
     if let Some(identity) = &report.identity {
         width += gap + text_width(ui, identity, small.clone());
     }
@@ -836,8 +836,8 @@ fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
         }
     }
     if report.windows.is_empty() {
-        if let Some(credits) = report.credit_balance {
-            width = width.max(text_width(ui, &credit_balance_cn(credits), small.clone()));
+        if let Some(credits) = &report.credit_balance {
+            width = width.max(text_width(ui, &credit_balance_cn(credits), body));
         }
     }
     if report.error.is_some() {
@@ -857,7 +857,7 @@ fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
             ));
         }
         if idx == 0 {
-            if let Some(credits) = report.credit_balance {
+            if let Some(credits) = &report.credit_balance {
                 width = width.max(text_width(ui, &credit_balance_cn(credits), small.clone()));
             }
         }
@@ -874,6 +874,7 @@ fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
 
 fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
     let title = report_title(report);
+    let stale = report.error.is_some() && report.has_data();
     egui::Frame::new()
         .fill(egui::Color32::from_black_alpha(18))
         .corner_radius(egui::CornerRadius::same(8))
@@ -905,16 +906,17 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                 }
             }
             if report.windows.is_empty() {
-                if let Some(credits) = report.credit_balance {
+                if let Some(credits) = &report.credit_balance {
                     ui.label(
-                        egui::RichText::new(credit_balance_cn(credits))
-                            .small()
-                            .color(egui::Color32::from_rgb(160, 160, 160)),
+                        egui::RichText::new(credit_balance_cn(credits)).color(if stale {
+                            egui::Color32::from_rgb(178, 178, 178)
+                        } else {
+                            egui::Color32::from_rgb(242, 242, 242)
+                        }),
                     );
                 }
             }
-            // 有回填数据（windows 非空）时：报错行 + 变灰的旧额度，不再直接 return
-            let stale = report.error.is_some() && !report.windows.is_empty();
+            // 有回填额度或余额时，保留旧值并附上错误与数据年龄。
             if report.error.is_some() {
                 ui.label(
                     egui::RichText::new(error_text(report))
@@ -978,7 +980,7 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                     );
                 }
                 if idx == 0 {
-                    if let Some(credits) = report.credit_balance {
+                    if let Some(credits) = &report.credit_balance {
                         ui.label(
                             egui::RichText::new(credit_balance_cn(credits))
                                 .small()

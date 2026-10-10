@@ -49,6 +49,7 @@ pub struct CredentialSet {
     pub cursor: Option<StoredCred>,
     pub devin: Option<StoredCred>,
     pub antigravity: Option<StoredCred>,
+    pub deepseek: Option<StoredCred>,
 }
 
 /// 临时凭据副本的文件名前缀，见 `copy_db` / `sweep_stale_db_copies`。
@@ -357,6 +358,8 @@ fn load_from_sqlite(path: &Path, set: &mut CredentialSet) -> Result<()> {
             "devin" => set.devin = Some(cred),
             // 订阅额度只对 OAuth 登录有意义；API key 行不授权（同 Claude 的理由）。
             "google-antigravity" if credential_type == "oauth" => set.antigravity = Some(cred),
+            // 余额查询走 api.deepseek.com 的 API key，与订阅登录无关。
+            "deepseek" if credential_type == "api_key" => set.deepseek = Some(cred),
             _ => {}
         }
     }
@@ -623,6 +626,50 @@ mod tests {
             let mut logged_in = CredentialSet::default();
             load_from_sqlite(&path, &mut logged_in)?;
             assert!(logged_in.grok.is_some(), "login must restore the provider");
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn deepseek_only_active_api_key_authorizes_balance() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "coding-quota-deepseek-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let result = (|| -> Result<()> {
+            let db = rusqlite::Connection::open(&path)?;
+            db.execute_batch(
+                "CREATE TABLE auth_credentials (
+                    provider TEXT, credential_type TEXT, identity_key TEXT,
+                    data TEXT, disabled_cause TEXT
+                 );
+                 INSERT INTO auth_credentials VALUES
+                    ('deepseek', 'oauth', '', '{\"access\":\"test-only\"}', NULL);",
+            )?;
+            let mut oauth = CredentialSet::default();
+            load_from_sqlite(&path, &mut oauth)?;
+            assert!(oauth.deepseek.is_none());
+
+            db.execute(
+                "UPDATE auth_credentials SET credential_type = 'api_key', data = ?1",
+                [r#"{"key":"test-only"}"#],
+            )?;
+            let mut active = CredentialSet::default();
+            load_from_sqlite(&path, &mut active)?;
+            assert!(active.deepseek.is_some());
+
+            db.execute_batch("UPDATE auth_credentials SET disabled_cause = 'deleted by user'")?;
+            let mut logged_out = CredentialSet::default();
+            load_from_sqlite(&path, &mut logged_out)?;
+            assert!(logged_out.deepseek.is_none());
+
+            db.execute_batch("UPDATE auth_credentials SET disabled_cause = NULL")?;
+            let mut logged_in = CredentialSet::default();
+            load_from_sqlite(&path, &mut logged_in)?;
+            assert!(logged_in.deepseek.is_some());
             Ok(())
         })();
         let _ = std::fs::remove_file(&path);

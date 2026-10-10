@@ -298,6 +298,7 @@ fn provider_id(raw: &str) -> Option<ProviderId> {
         "cursor" => Some(ProviderId::Cursor),
         "devin" => Some(ProviderId::Devin),
         "google-antigravity" => Some(ProviderId::Antigravity),
+        "deepseek" => Some(ProviderId::Deepseek),
         _ => None,
     }
 }

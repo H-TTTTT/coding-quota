@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file.
 
 - 托盘菜单新增「刷新频率」选项（1 / 3 / 5 / 10 / 30 分钟，默认 5 分钟），选择立即生效，持久化在 `%APPDATA%\coding-quota\refresh_interval_secs.txt`。
 - 新增 DeepSeek API 账户余额卡片：读取 omp 中有效的 `deepseek` API key，只读调用官方 `GET https://api.deepseek.com/user/balance`。GUI 以白字余额行展示，TUI 同步显示余额；人民币与美元分别保留，不绘制虚假的额度百分比或进度条。支持托盘显示开关、`--provider deepseek`、快照、JSON 与现有本机用量统计。余额为零照常显示；响应金额缺失或无效时按查询失败处理，GUI/TUI 保留 24 小时内的旧余额并标明数据年龄，登出后隐藏且不从缓存复活。原有 Codex 积分余额与重置卡显示保持不变。
+- GUI 厂商卡片支持拖拽排序：按住卡片拖动时，目标卡片整圈亮起蓝色边框标示落点，松开后完成移动；靠近卡片区上下边缘时自动滚动，可调整屏幕外的卡片。完整厂商顺序持久化到 `%APPDATA%\coding-quota\card_order.txt`，刷新与重启后保留，隐藏/登出的平台重新出现时仍按保存的位置显示。标题栏拖动仍只移动窗口，TUI/快照/JSON 的平台顺序不变。
 
 ### Changed
 

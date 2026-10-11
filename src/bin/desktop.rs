@@ -6,6 +6,9 @@ mod tray;
 
 #[path = "desktop/instance.rs"]
 mod instance;
+
+#[path = "desktop/order.rs"]
+mod order;
 use coding_quota::model::{ProviderId, ProviderReport, QuotaWindow, Snapshot};
 use coding_quota::render::{
     ago_cn, compact_until_cn, credit_balance_cn, label_cn, resets_line_cn, title_cn, usage_blocks,
@@ -396,6 +399,10 @@ struct DesktopApp {
     last_content_size: Option<(f32, f32)>,
     /// 正在刷新（点刷新按钮/托盘刷新后到新数据到达前），刷新图标自身旋转。
     refreshing: bool,
+    /// 完整的平台排序，隐藏/未登录的平台仍保留位置。
+    card_order: Vec<ProviderId>,
+    dragging_card: Option<ProviderId>,
+    order_save_error: Option<String>,
 }
 
 impl DesktopApp {
@@ -508,6 +515,9 @@ impl DesktopApp {
             pos_guard_done: false,
             last_content_size: None,
             refreshing: false,
+            card_order: order::load(),
+            dragging_card: None,
+            order_save_error: None,
         }
     }
 }
@@ -527,7 +537,8 @@ impl eframe::App for DesktopApp {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // 逐平台增量到达：先到的平台先显示，最慢的一方（Devin 横幅最长 25s）不再拖住整屏
-        while let Ok((snapshot, round_done)) = self.snap_rx.try_recv() {
+        while let Ok((mut snapshot, round_done)) = self.snap_rx.try_recv() {
+            order::apply(&mut snapshot.reports, &self.card_order);
             self.snapshot = Some(snapshot);
             if round_done {
                 self.refreshing = false;
@@ -603,11 +614,13 @@ impl eframe::App for DesktopApp {
         self.was_focused = focused;
         // 刷新中（含首屏加载）：每帧重绘，刷新图标才能转起来
         let refreshing = self.refreshing || self.snapshot.is_none();
-        if self.drag_offset.is_some() || refreshing {
+        if self.drag_offset.is_some() || self.dragging_card.is_some() || refreshing {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(Duration::from_secs(30));
         }
+
+        let mut card_drop = None;
 
         egui::CentralPanel::default()
             .frame(
@@ -712,38 +725,25 @@ impl eframe::App for DesktopApp {
                     Some(snapshot) => {
                         // 卡片区放在纵向 ScrollArea 里：窗口高度仍按内容自适应
                         //（target_h 超过 max_h 时被压到 max_h），短屏幕、卡片多时
-                        // 内容超出视口可以滚动，最后一张卡（Antigravity）不会被裁到
-                        // 够不着。auto_shrink(false) 让内容撑满可用宽度，绘制与
-                        // measure_report_width 的量宽口径保持一致。
-                        let mut shown = 0;
-                        let mut widest: f32 = 0.0;
+                        // 内容超出视口可以滚动，最后一张卡不会被裁到够不着。
+                        // 拖卡片用于排序；滚轮/滚动条与拖拽到边缘自动滚动仍可用。
                         let scroll = egui::ScrollArea::vertical()
+                            .id_salt("provider-cards")
+                            .drag_to_scroll(false)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                for report in &snapshot.reports {
-                                    // omp 中没有授权的、以及托盘里取消勾选的平台都不显示
-                                    if report.is_missing()
-                                        || tray::is_hidden(&self.hidden_providers, report.provider)
-                                    {
-                                        continue;
-                                    }
-                                    // 先量宽度再绘制：内容超出可用宽度时 egui 会直接裁掉右侧，
-                                    // 画完再量只能量到被裁后的尺寸。
-                                    widest = widest.max(measure_report_width(ui, report));
-                                    draw_report(ui, report);
-                                    ui.add_space(6.0);
-                                    shown += 1;
-                                }
-                                if shown == 0 {
-                                    ui.label(
-                                        egui::RichText::new("无可显示平台")
-                                            .color(egui::Color32::from_rgb(218, 218, 218)),
-                                    );
-                                }
+                                let (width, drop) = draw_card_list(
+                                    ui,
+                                    &snapshot.reports,
+                                    &self.hidden_providers,
+                                    &mut self.dragging_card,
+                                );
+                                (width, drop)
                             });
                         // 高度用 ScrollArea 量到的完整内容高度（不是被视口截短后的）。
                         content_height = scroll.content_size.y;
-                        content_width = widest;
+                        content_width = scroll.inner.0;
+                        card_drop = scroll.inner.1;
                     }
                 }
                 // 只在内容尺寸变化时调整窗口，不覆盖用户手动拖拽的尺寸
@@ -770,6 +770,17 @@ impl eframe::App for DesktopApp {
                     }
                 }
             });
+        if let Some(drop) = card_drop {
+            if order::move_relative(&mut self.card_order, drop.source, drop.target, drop.before) {
+                self.order_save_error = order::save(&self.card_order)
+                    .err()
+                    .map(|err| err.to_string());
+                if let Some(snapshot) = &mut self.snapshot {
+                    order::apply(&mut snapshot.reports, &self.card_order);
+                }
+                ctx.request_repaint();
+            }
+        }
     }
 }
 
@@ -814,6 +825,143 @@ fn text_width(ui: &egui::Ui, text: &str, font_id: egui::FontId) -> f32 {
     ui.fonts(|fonts| fonts.layout_no_wrap(text.to_string(), font_id, egui::Color32::WHITE))
         .size()
         .x
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CardDrop {
+    source: ProviderId,
+    target: ProviderId,
+    before: bool,
+}
+
+/// 卡片列表：内容绘制与拖放排序共用同一矩形。只在松开鼠标后换序，
+/// 避免高矮不同的卡片在拖动途中跳动；目标卡片整圈亮蓝框标示落点。
+fn draw_card_list(
+    ui: &mut egui::Ui,
+    reports: &[ProviderReport],
+    hidden: &[String],
+    dragging: &mut Option<ProviderId>,
+) -> (f32, Option<CardDrop>) {
+    ui.style_mut().interaction.selectable_labels = false;
+    if let Some(source) = *dragging {
+        if !reports.iter().any(|report| {
+            report.provider == source && !report.is_missing() && !tray::is_hidden(hidden, source)
+        }) {
+            *dragging = None;
+        }
+    }
+    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        *dragging = None;
+    }
+    let (pointer, down, released) = ui.input(|input| {
+        (
+            input.pointer.interact_pos(),
+            input.pointer.primary_down(),
+            input.pointer.primary_released(),
+        )
+    });
+    let clip = ui.clip_rect();
+    let pointer = pointer.filter(|position| clip.contains(*position));
+    let mut shown = 0;
+    let mut widest: f32 = 0.0;
+    let mut target = None;
+    let mut last_target = None;
+    let mut over_source = false;
+    for report in reports {
+        if report.is_missing() || tray::is_hidden(hidden, report.provider) {
+            continue;
+        }
+        // 先量宽度再绘制：内容超出可用宽度时 egui 会直接裁掉右侧。
+        widest = widest.max(measure_report_width(ui, report));
+        let rect = draw_report(ui, report);
+        let hit = ui.interact(
+            rect,
+            egui::Id::new(("card-order", report.provider)),
+            egui::Sense::click_and_drag(),
+        );
+        if hit.drag_started_by(egui::PointerButton::Primary) {
+            *dragging = Some(report.provider);
+        }
+        if let Some(source) = *dragging {
+            if source == report.provider {
+                // 拖动的卡片本身：浅色描边提示正在拖动
+                ui.painter().rect_stroke(
+                    rect,
+                    egui::CornerRadius::same(8),
+                    egui::Stroke::new(1.5_f32, egui::Color32::from_white_alpha(90)),
+                    egui::StrokeKind::Inside,
+                );
+                over_source |= pointer.is_some_and(|position| rect.contains(position));
+            } else if let Some(position) = pointer {
+                if target.is_none() && position.y <= rect.bottom() {
+                    target = Some((report.provider, position.y < rect.center().y, rect));
+                }
+                last_target = Some((report.provider, false, rect));
+            }
+        } else {
+            hit.on_hover_cursor(egui::CursorIcon::Grab);
+        }
+        ui.add_space(6.0);
+        shown += 1;
+    }
+    if shown == 0 {
+        ui.label(egui::RichText::new("无可显示平台").color(egui::Color32::from_rgb(218, 218, 218)));
+    }
+    let target = if over_source {
+        None
+    } else {
+        target.or(last_target)
+    };
+    if let Some(_source) = *dragging {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        if let Some((_provider, _before, rect)) = target {
+            // 目标卡片整圈亮蓝框标示落点
+            ui.painter().rect_stroke(
+                rect,
+                egui::CornerRadius::same(8),
+                egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(130, 205, 250)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if down {
+            // 在视口边缘持续拖动时滚动，才能跨越屏幕外的卡片。
+            if let Some(position) = pointer {
+                let direction = if position.y < clip.top() + 28.0 {
+                    1.0
+                } else if position.y > clip.bottom() - 28.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+                if direction != 0.0 {
+                    let dt = ui.input(|input| input.stable_dt.min(0.05));
+                    ui.scroll_with_delta_animation(
+                        egui::vec2(0.0, direction * 300.0 * dt),
+                        egui::style::ScrollAnimation::none(),
+                    );
+                    ui.ctx().request_repaint();
+                }
+            }
+        } else {
+            // 松开鼠标：落在目标卡片上（含其上下延伸区）就把换序请求交给 update()
+            if released {
+                if let Some((provider, before, _)) = target {
+                    if let Some(source) = dragging.take() {
+                        return (
+                            widest,
+                            Some(CardDrop {
+                                source,
+                                target: provider,
+                                before,
+                            }),
+                        );
+                    }
+                }
+            }
+            *dragging = None;
+        }
+    }
+    (widest, None)
 }
 
 /// 量出这张卡片完整显示所需的最小宽度（含卡片左右各 8 的内边距）。
@@ -872,7 +1020,7 @@ fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
     width + 16.0
 }
 
-fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
+fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) -> egui::Rect {
     let title = report_title(report);
     let stale = report.error.is_some() && report.has_data();
     egui::Frame::new()
@@ -1024,7 +1172,9 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) {
                     });
                 }
             }
-        });
+        })
+        .response
+        .rect
 }
 
 fn remaining_color(remaining: f32) -> egui::Color32 {
@@ -1034,5 +1184,267 @@ fn remaining_color(remaining: f32) -> egui::Color32 {
         egui::Color32::from_rgb(220, 180, 60)
     } else {
         egui::Color32::from_rgb(90, 180, 90)
+    }
+}
+
+#[cfg(test)]
+mod card_drag_tests {
+    use super::*;
+
+    fn reports() -> Vec<ProviderReport> {
+        [ProviderId::Codex, ProviderId::Glm, ProviderId::Kimi]
+            .into_iter()
+            .map(|provider| {
+                let mut windows = vec![QuotaWindow::from_used_percent("5h", "Window", 25.0, None)];
+                if provider == ProviderId::Glm {
+                    windows.push(QuotaWindow::from_used_percent("7d", "Weekly", 50.0, None));
+                }
+                ProviderReport::ok(provider, provider.title(), None, None, windows)
+            })
+            .collect()
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        reports: &[ProviderReport],
+        dragging: &mut Option<ProviderId>,
+        events: Vec<egui::Event>,
+    ) -> (Option<CardDrop>, egui::FullOutput) {
+        let mut drop = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (width, drop_result) = egui::ScrollArea::vertical()
+                        .id_salt("provider-cards")
+                        .drag_to_scroll(false)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| draw_card_list(ui, reports, &[], dragging))
+                        .inner;
+                    let _ = width;
+                    drop = drop_result;
+                });
+            },
+        );
+        (drop, output)
+    }
+
+    fn rect(ctx: &egui::Context, provider: ProviderId) -> egui::Rect {
+        ctx.read_response(egui::Id::new(("card-order", provider)))
+            .unwrap()
+            .rect
+    }
+
+    fn button(position: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn card_drag_commits_on_release_and_supports_both_directions() {
+        let ctx = egui::Context::default();
+        let mut reports = reports();
+        let mut dragging = None;
+        frame(&ctx, &reports, &mut dragging, vec![]);
+        let start = rect(&ctx, ProviderId::Codex).center();
+        let glm_rect = rect(&ctx, ProviderId::Glm);
+        let end = glm_rect.center() + egui::vec2(0.0, glm_rect.height() * 0.25);
+        frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(start)],
+        );
+        frame(&ctx, &reports, &mut dragging, vec![button(start, true)]);
+        let (held, motion_output) = frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(end)],
+        );
+        assert_eq!(dragging, Some(ProviderId::Codex));
+        assert_eq!(held, None);
+        // 原卡片不在拖动途中移位，指针静止时不能来回交换。
+        assert_eq!(rect(&ctx, ProviderId::Glm), glm_rect);
+        // 拖动中卡片：1.5px 白描边画在自己身上；目标卡片：2px 蓝亮框精确等于目标 rect。
+        let codex_rect = rect(&ctx, ProviderId::Codex);
+        let rect_shapes: Vec<_> = motion_output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect) => Some(rect),
+                _ => None,
+            })
+            .collect();
+        assert!(rect_shapes
+            .iter()
+            .any(|rect| { rect.stroke.width == 1.5 && rect.rect == codex_rect }));
+        assert!(rect_shapes
+            .iter()
+            .any(|rect| { rect.stroke.width == 2.0 && rect.rect == glm_rect }));
+        let (dropped, _) = frame(&ctx, &reports, &mut dragging, vec![button(end, false)]);
+        assert_eq!(
+            dropped,
+            Some(CardDrop {
+                source: ProviderId::Codex,
+                target: ProviderId::Glm,
+                before: false
+            })
+        );
+        assert_eq!(dragging, None);
+        let mut order = ProviderId::ALL.to_vec();
+        let drop = dropped.unwrap();
+        assert!(order::move_relative(
+            &mut order,
+            drop.source,
+            drop.target,
+            drop.before
+        ));
+        order::apply(&mut reports, &order);
+        assert_eq!(reports[0].provider, ProviderId::Glm);
+        assert_eq!(reports[1].provider, ProviderId::Codex);
+
+        // 反向：Kimi 拖到 GLM 上半部，插到 GLM 前。
+        frame(&ctx, &reports, &mut dragging, vec![]);
+        frame(&ctx, &reports, &mut dragging, vec![]);
+        let start = rect(&ctx, ProviderId::Kimi).center();
+        let target = rect(&ctx, ProviderId::Glm);
+        let end = target.center() - egui::vec2(0.0, target.height() * 0.25);
+        frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(start)],
+        );
+        frame(&ctx, &reports, &mut dragging, vec![button(start, true)]);
+        // egui 的交互矩形来自上一 pass；换序后先让新布局完成再取拖拽坐标。
+        frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(end)],
+        );
+        let (dropped, _) = frame(&ctx, &reports, &mut dragging, vec![button(end, false)]);
+        assert_eq!(
+            dropped,
+            Some(CardDrop {
+                source: ProviderId::Kimi,
+                target: ProviderId::Glm,
+                before: true
+            })
+        );
+    }
+
+    #[test]
+    fn release_outside_cards_or_removed_source_cancels_without_reordering() {
+        let ctx = egui::Context::default();
+        let mut reports = reports();
+        let mut dragging = None;
+        frame(&ctx, &reports, &mut dragging, vec![]);
+        let start = rect(&ctx, ProviderId::Codex).center();
+        frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+        );
+        frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(start + egui::vec2(0.0, 10.0))],
+        );
+        assert_eq!(dragging, Some(ProviderId::Codex));
+        let outside = egui::pos2(-10.0, -10.0);
+        let (result, _) = frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(outside), button(outside, false)],
+        );
+        assert_eq!(result, None);
+        assert_eq!(dragging, None);
+
+        let start = rect(&ctx, ProviderId::Codex).center();
+        frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+        );
+        frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(start + egui::vec2(0.0, 10.0))],
+        );
+        reports[0] = ProviderReport::missing(ProviderId::Codex);
+        let (result, _) = frame(&ctx, &reports, &mut dragging, vec![]);
+        assert_eq!(result, None);
+        assert_eq!(dragging, None);
+    }
+
+    #[test]
+    fn dragging_at_viewport_edge_reaches_the_last_card() {
+        let ctx = egui::Context::default();
+        let reports: Vec<_> = ProviderId::ALL
+            .into_iter()
+            .map(|provider| {
+                ProviderReport::ok(
+                    provider,
+                    provider.title(),
+                    None,
+                    None,
+                    vec![
+                        QuotaWindow::from_used_percent("5h", "Window", 25.0, None),
+                        QuotaWindow::from_used_percent("7d", "Weekly", 50.0, None),
+                    ],
+                )
+            })
+            .collect();
+        let mut dragging = None;
+        frame(&ctx, &reports, &mut dragging, vec![]);
+        let start = rect(&ctx, ProviderId::Codex).center();
+        frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+        );
+        let bottom_edge = egui::pos2(200.0, 586.0);
+        frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(bottom_edge)],
+        );
+        for _ in 0..160 {
+            frame(&ctx, &reports, &mut dragging, vec![]);
+        }
+        let last = rect(&ctx, ProviderId::Deepseek);
+        assert!(
+            last.top() < 590.0 && last.bottom() <= 600.0,
+            "last card must be reachable while holding the drag: {last:?}, dragging={dragging:?}"
+        );
+        let (drop, _) = frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![button(bottom_edge, false)],
+        );
+        let drop = drop.unwrap();
+        assert_eq!(drop.source, ProviderId::Codex);
+        assert_eq!(drop.target, ProviderId::Deepseek);
     }
 }

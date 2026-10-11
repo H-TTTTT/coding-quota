@@ -34,7 +34,7 @@ pub const PROVIDERS: [(ProviderId, &str); 9] = [
     (ProviderId::Deepseek, "DeepSeek"),
 ];
 
-fn provider_key(provider: ProviderId) -> &'static str {
+pub(super) fn provider_key(provider: ProviderId) -> &'static str {
     match provider {
         ProviderId::Codex => "codex",
         ProviderId::Claude => "claude",

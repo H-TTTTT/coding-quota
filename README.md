@@ -9,7 +9,7 @@ See coding-plan quotas and API account balances in one place: **OpenAI Codex, Cl
 | | `coding-quota-gui.exe` (desktop widget) | `coding-quota-tui.exe` (terminal TUI / CLI) |
 | --- | --- | --- |
 | UI | Borderless acrylic widget pinned to the desktop | Compact 48-column TUI in a frameless Windows Terminal window |
-| Interaction | Drag by the title bar, scroll overflowing cards, tray icon context menu | `R` refresh, `Q` quit, `↑↓` / `PgUp` / `PgDn` / `Home` / `End` scroll, auto-refresh every 2 minutes |
+| Interaction | Drag the title bar to move the widget; drag provider cards to reorder; scroll overflowing cards; tray icon context menu | `R` refresh, `Q` quit, `↑↓` / `PgUp` / `PgDn` / `Home` / `End` scroll, auto-refresh every 2 minutes |
 | Extras | Launch with Windows, per-provider visibility, window position memory | `--snapshot` plain text, `--json` for scripts, `-p <provider>` to filter, `--demo` for a mock-data preview |
 
 ## Download
@@ -38,6 +38,7 @@ Zero configuration: the tool reads the existing omp credential store (`~/.omp/ag
 - `--json` exposes Codex `credit_balance` (`kind: limited` with `balance`, or `kind: unlimited`) and each Zhipu window's optional `resets_left`; missing fields mean unknown, while a known empty reset-card inventory is zero
 - Failed refreshes keep the last good values (cached in `%APPDATA%\coding-quota\last_good.json`), drawn dimmed with their age; values older than 24 hours are dropped rather than shown, and a provider that keeps failing is retried with backoff instead of every round. `--json` / `--snapshot` always report the live result
 - Both the widget and the TUI fit their size to the content
+- GUI card order: hold the left mouse button on a provider card, drag it above or below another card — the target card lights up with a blue outline showing where the drop lands — then release. The list scrolls automatically while holding near its top/bottom edges. Order is saved in `%APPDATA%\coding-quota\card_order.txt` and survives refreshes and restarts; hiding a provider or logging out retains its position for when it returns. TUI/CLI order is unchanged
 
 ## Build from source
 

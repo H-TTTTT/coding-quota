@@ -89,9 +89,20 @@ fn main() -> eframe::Result<()> {
             visuals.widgets.active.corner_radius = radius;
             visuals.widgets.open.corner_radius = radius;
             cc.egui_ctx.set_visuals(visuals);
+            configure_scrollbars(&cc.egui_ctx);
             Ok(Box::new(DesktopApp::new(cc.egui_ctx.clone())))
         }),
     )
+}
+
+fn configure_scrollbars(ctx: &egui::Context) {
+    // 浮动滚动条悬停、拖动时也保持细窄，不挤占卡片内容。
+    ctx.all_styles_mut(|style| {
+        style.spacing.scroll.bar_width = 4.0;
+        style.spacing.scroll.floating_width = 2.0;
+        // 沿用挂件控件的浅灰底色，让细滑块在透明背景上仍清楚可见。
+        style.spacing.scroll.foreground_color = false;
+    });
 }
 
 /// egui 自带字体不含中文，从系统目录加载微软雅黑（失败则尝试等线、黑体）。
@@ -1454,5 +1465,98 @@ mod card_drag_tests {
         let drop = drop.unwrap();
         assert_eq!(drop.source, ProviderId::Codex);
         assert_eq!(drop.target, ProviderId::Deepseek);
+    }
+
+    #[test]
+    fn thin_scrollbar_keeps_dragging_without_reordering_cards() {
+        let ctx = egui::Context::default();
+        configure_scrollbars(&ctx);
+        let reports: Vec<_> = ProviderId::ALL
+            .into_iter()
+            .map(|provider| {
+                ProviderReport::ok(
+                    provider,
+                    provider.title(),
+                    None,
+                    None,
+                    vec![
+                        QuotaWindow::from_used_percent("5h", "Window", 25.0, None),
+                        QuotaWindow::from_used_percent("7d", "Weekly", 50.0, None),
+                    ],
+                )
+            })
+            .collect();
+        let handle_rect = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Rect(rect)
+                        if rect.rect.left() > 350.0
+                            && rect.rect.width() < 16.0
+                            && rect.rect.height() > 30.0 =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .min_by(|a, b| a.height().total_cmp(&b.height()))
+                .expect("overflowing card list must paint a scrollbar handle")
+        };
+        let mut dragging = None;
+        frame(&ctx, &reports, &mut dragging, vec![]);
+        let (_, mut output) = frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(egui::pos2(200.0, 60.0))],
+        );
+        for _ in 0..16 {
+            output = frame(&ctx, &reports, &mut dragging, vec![]).1;
+        }
+        let normal = handle_rect(&output);
+        assert!((normal.width() - 2.0).abs() < 0.05);
+        let start = normal.center();
+        frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(start)],
+        );
+        for _ in 0..16 {
+            output = frame(&ctx, &reports, &mut dragging, vec![]).1;
+        }
+        let hovered = handle_rect(&output);
+        assert!((hovered.width() - 4.0).abs() < 0.05);
+        let before_top = rect(&ctx, ProviderId::Codex).top();
+        frame(&ctx, &reports, &mut dragging, vec![button(start, true)]);
+        let end = start + egui::vec2(0.0, 80.0);
+        frame(
+            &ctx,
+            &reports,
+            &mut dragging,
+            vec![egui::Event::PointerMoved(end)],
+        );
+        for _ in 0..16 {
+            output = frame(&ctx, &reports, &mut dragging, vec![]).1;
+        }
+        let held = handle_rect(&output);
+        let after_top = rect(&ctx, ProviderId::Codex).top();
+        assert!((held.width() - 4.0).abs() < 0.05);
+        assert!(
+            after_top < before_top - 1.0,
+            "dragging the handle must scroll"
+        );
+        assert_eq!(dragging, None, "handle drag must not start a card reorder");
+        let (drop, _) = frame(&ctx, &reports, &mut dragging, vec![button(end, false)]);
+        assert_eq!(drop, None, "handle release must not reorder cards");
+        eprintln!(
+            "rendered scrollbar widths: normal={}, hover={}, drag={}; first card top {} -> {}",
+            normal.width(),
+            hovered.width(),
+            held.width(),
+            before_top,
+            after_top
+        );
     }
 }

@@ -1009,7 +1009,7 @@ fn measure_report_width(ui: &egui::Ui, report: &ProviderReport) -> f32 {
                 width = width.max(text_width(ui, &credit_balance_cn(credits), small.clone()));
             }
         }
-        // 额度条行：条至少 MIN_BAR_WIDTH，右侧固定留 QUOTA_VALUE_WIDTH 给剩余量
+        // 额度条至少 MIN_BAR_WIDTH；剩余文字和间距按实际宽度计入。
         width = width.max(
             MIN_BAR_WIDTH + gap + text_width(ui, &remaining_text(report, window), value.clone()),
         );
@@ -1105,8 +1105,16 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) -> egui::Rect {
                     });
                 });
                 let extra = remaining_text(report, window);
+                let remaining_galley = ui.painter().layout_no_wrap(
+                    extra,
+                    egui::FontId::new(11.0, egui::FontFamily::Proportional),
+                    main,
+                );
+                // 普通百分比保留原宽度，较长的次数文案额外留足文字宽度与间距。
+                let value_width =
+                    QUOTA_VALUE_WIDTH.max(remaining_galley.size().x + ui.spacing().item_spacing.x);
                 ui.horizontal(|ui| {
-                    let bar_width = (ui.available_width() - QUOTA_VALUE_WIDTH).max(80.0);
+                    let bar_width = (ui.available_width() - value_width).max(80.0);
                     let bar = egui::ProgressBar::new(remaining)
                         .desired_width(bar_width)
                         .desired_height(13.0)
@@ -1117,7 +1125,7 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) -> egui::Rect {
                         });
                     ui.add(bar);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new(extra).size(11.0).color(main));
+                        ui.label(remaining_galley);
                     });
                 });
                 if let Some(resets) = window.resets_left {

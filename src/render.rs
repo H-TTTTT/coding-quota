@@ -190,6 +190,7 @@ pub fn ago(when: DateTime<Utc>) -> String {
 pub fn title_cn(title: &str) -> &str {
     match title {
         "Zhipu Coding Plan" => "智谱 Coding Plan",
+        "MiniMax Coding Plan" => "MiniMax 编程套餐",
         other => other,
     }
 }

@@ -1451,7 +1451,8 @@ mod card_drag_tests {
         for _ in 0..160 {
             frame(&ctx, &reports, &mut dragging, vec![]);
         }
-        let last = rect(&ctx, ProviderId::Deepseek);
+        let last_provider = *ProviderId::ALL.last().unwrap();
+        let last = rect(&ctx, last_provider);
         assert!(
             last.top() < 590.0 && last.bottom() <= 600.0,
             "last card must be reachable while holding the drag: {last:?}, dragging={dragging:?}"
@@ -1464,7 +1465,7 @@ mod card_drag_tests {
         );
         let drop = drop.unwrap();
         assert_eq!(drop.source, ProviderId::Codex);
-        assert_eq!(drop.target, ProviderId::Deepseek);
+        assert_eq!(drop.target, last_provider);
     }
 
     #[test]

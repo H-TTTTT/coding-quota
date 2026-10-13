@@ -299,6 +299,7 @@ fn provider_id(raw: &str) -> Option<ProviderId> {
         "devin" => Some(ProviderId::Devin),
         "google-antigravity" => Some(ProviderId::Antigravity),
         "deepseek" => Some(ProviderId::Deepseek),
+        "minimax-code-cn" => Some(ProviderId::Minimax),
         _ => None,
     }
 }

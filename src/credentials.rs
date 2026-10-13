@@ -50,6 +50,7 @@ pub struct CredentialSet {
     pub devin: Option<StoredCred>,
     pub antigravity: Option<StoredCred>,
     pub deepseek: Option<StoredCred>,
+    pub minimax: Option<StoredCred>,
 }
 
 /// 临时凭据副本的文件名前缀，见 `copy_db` / `sweep_stale_db_copies`。
@@ -360,6 +361,7 @@ fn load_from_sqlite(path: &Path, set: &mut CredentialSet) -> Result<()> {
             "google-antigravity" if credential_type == "oauth" => set.antigravity = Some(cred),
             // 余额查询走 api.deepseek.com 的 API key，与订阅登录无关。
             "deepseek" if credential_type == "api_key" => set.deepseek = Some(cred),
+            "minimax-code-cn" if credential_type == "api_key" => set.minimax = Some(cred),
             _ => {}
         }
     }
@@ -629,6 +631,61 @@ mod tests {
             Ok(())
         })();
         let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn minimax_reads_active_wal_credential_and_honors_logout() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "cq-minimax-auth-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let result = (|| -> Result<()> {
+            let db = rusqlite::Connection::open(&path)?;
+            db.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE auth_credentials (
+                    provider TEXT, credential_type TEXT, identity_key TEXT,
+                    data TEXT, disabled_cause TEXT
+                 );
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )?;
+            // 这次写入仍在 WAL，不能只复制 agent.db 主文件后判断账号是否存在。
+            db.execute(
+                "INSERT INTO auth_credentials VALUES ('minimax-code-cn', 'api_key', '', ?1, NULL)",
+                [r#"{"key":"test-only"}"#],
+            )?;
+            db.execute(
+                "INSERT INTO auth_credentials VALUES ('minimax-code-cn', 'oauth', '', ?1, NULL)",
+                [r#"{"access":"unsupported"}"#],
+            )?;
+            let mut active = CredentialSet::default();
+            load_from_sqlite(&path, &mut active)?;
+            assert!(active.minimax.is_some());
+            db.execute_batch(
+                "UPDATE auth_credentials SET disabled_cause='deleted by user'
+                 WHERE credential_type='api_key';",
+            )?;
+            let mut logged_out = CredentialSet::default();
+            load_from_sqlite(&path, &mut logged_out)?;
+            assert!(logged_out.minimax.is_none());
+            db.execute_batch(
+                "UPDATE auth_credentials SET disabled_cause=NULL WHERE credential_type='api_key'",
+            )?;
+            let mut logged_in = CredentialSet::default();
+            load_from_sqlite(&path, &mut logged_in)?;
+            assert!(logged_in.minimax.is_some());
+            Ok(())
+        })();
+        for file in [
+            &path,
+            &path.with_extension("db-wal"),
+            &path.with_extension("db-shm"),
+        ] {
+            let _ = std::fs::remove_file(file);
+        }
         result
     }
 

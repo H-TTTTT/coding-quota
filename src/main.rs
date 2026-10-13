@@ -23,7 +23,7 @@ struct Cli {
     #[arg(long)]
     snapshot: bool,
 
-    /// Only query one provider: codex, claude, grok, glm, kimi, cursor, devin, antigravity, deepseek
+    /// Only query one provider: codex, claude, grok, glm, kimi, cursor, devin, antigravity, deepseek, minimax
     #[arg(long, short = 'p')]
     provider: Option<String>,
 
@@ -365,7 +365,7 @@ async fn main() -> Result<()> {
     let only = match cli.provider.as_deref() {
         Some(raw) => Some(ProviderId::parse_filter(raw).ok_or_else(|| {
             anyhow::anyhow!(
-                "unknown provider `{raw}` (codex|claude|grok|glm|kimi|cursor|devin|antigravity)"
+                "unknown provider `{raw}` (codex|claude|grok|glm|kimi|cursor|devin|antigravity|deepseek|minimax)"
             )
         })?),
         None => None,

@@ -13,12 +13,13 @@ pub enum ProviderId {
     Devin,
     Antigravity,
     Deepseek,
+    Minimax,
 }
 
 impl ProviderId {
     /// 展示顺序：各处的卡片顺序、`--snapshot` 与缓存的稳定落盘顺序都用它。
     /// 并行取数回来的是完成顺序，不按它排序卡片会每轮跳位置。
-    pub const ALL: [ProviderId; 9] = [
+    pub const ALL: [ProviderId; 10] = [
         Self::Codex,
         Self::Claude,
         Self::Grok,
@@ -28,6 +29,7 @@ impl ProviderId {
         Self::Devin,
         Self::Antigravity,
         Self::Deepseek,
+        Self::Minimax,
     ];
 
     /// 在 `ALL` 里的下标，用作稳定排序键。
@@ -42,6 +44,7 @@ impl ProviderId {
             Self::Devin => 6,
             Self::Antigravity => 7,
             Self::Deepseek => 8,
+            Self::Minimax => 9,
         }
     }
 
@@ -56,6 +59,7 @@ impl ProviderId {
             Self::Devin => "Devin",
             Self::Antigravity => "Google Antigravity",
             Self::Deepseek => "DeepSeek",
+            Self::Minimax => "MiniMax",
         }
     }
 
@@ -70,6 +74,7 @@ impl ProviderId {
             "devin" | "devin-cli" | "cognition" => Some(Self::Devin),
             "antigravity" | "google-antigravity" => Some(Self::Antigravity),
             "deepseek" => Some(Self::Deepseek),
+            "minimax" | "minimax-code-cn" => Some(Self::Minimax),
             _ => None,
         }
     }

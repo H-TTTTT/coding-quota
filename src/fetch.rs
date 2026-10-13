@@ -88,6 +88,7 @@ pub async fn fetch_all_streaming(
         (ProviderId::Cursor, creds.cursor.clone()),
         (ProviderId::Antigravity, creds.antigravity.clone()),
         (ProviderId::Deepseek, creds.deepseek.clone()),
+        (ProviderId::Minimax, creds.minimax.clone()),
     ] {
         let client = client.clone();
         let skip = skip.clone();
@@ -168,6 +169,7 @@ async fn maybe_fetch(
         ProviderId::Cursor => fetch_cursor(client, cred).await,
         ProviderId::Antigravity => fetch_antigravity(client, cred).await,
         ProviderId::Deepseek => fetch_deepseek(client, cred).await,
+        ProviderId::Minimax => fetch_minimax(client, cred).await,
         // Devin 走 CLI 横幅，不使用 CredentialSet 里的凭据
         ProviderId::Devin => fetch_devin(),
     };
@@ -1015,6 +1017,95 @@ async fn fetch_codex(client: &reqwest::Client, cred: StoredCred) -> ProviderRepo
         }
         Err(err) => ProviderReport::err(ProviderId::Codex, cred.identity, err),
     }
+}
+
+/// MiniMax 国内编程套餐：使用套餐 key 只读查询官方 Token Plan 额度。
+async fn fetch_minimax(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
+    let identity = cred.identity.clone();
+    match fetch_with_refresh(client, &cred, "minimax-code-cn", |client, token| {
+        Box::pin(get_json(
+            client,
+            "https://api.minimaxi.com/v1/token_plan/remains",
+            bearer(token),
+        ))
+    })
+    .await
+    {
+        Ok((_, body)) => parse_minimax(identity, body),
+        Err(err) => ProviderReport::err(ProviderId::Minimax, identity, err),
+    }
+}
+
+fn parse_minimax(identity: Option<String>, body: Value) -> ProviderReport {
+    if body
+        .pointer("/base_resp/status_code")
+        .and_then(Value::as_i64)
+        != Some(0)
+    {
+        return ProviderReport::err(ProviderId::Minimax, identity, "MiniMax quota query failed");
+    }
+    let Some(remains) = body.get("model_remains").and_then(Value::as_array) else {
+        return ProviderReport::err(
+            ProviderId::Minimax,
+            identity,
+            "invalid MiniMax quota payload",
+        );
+    };
+    let mut windows = Vec::with_capacity(remains.len() * 2);
+    for item in remains {
+        let model = item
+            .get("model_name")
+            .and_then(Value::as_str)
+            .unwrap_or("general");
+        for (id, label, percent_field, status_field, end_field) in [
+            (
+                "minimax-5h",
+                "5h window",
+                "current_interval_remaining_percent",
+                "current_interval_status",
+                "end_time",
+            ),
+            (
+                "minimax-week",
+                "Weekly",
+                "current_weekly_remaining_percent",
+                "current_weekly_status",
+                "weekly_end_time",
+            ),
+        ] {
+            if item.get(status_field).and_then(Value::as_i64) == Some(3) {
+                continue;
+            }
+            let Some(remaining) = number(item.get(percent_field)).filter(|value| value.is_finite())
+            else {
+                continue;
+            };
+            let reset = millis_to_dt(number(item.get(end_field)));
+            // 当前接口的 general 是套餐共享额度。计数字段可能为 0，
+            // 不能由 0/0 编造次数或覆盖官方剩余百分比。
+            let window = if model == "general" {
+                QuotaWindow::from_used_percent(id, label, 100.0 - remaining, reset)
+            } else {
+                QuotaWindow::from_used_percent(
+                    &format!("{id}-{model}"),
+                    &format!("{model} · {label}"),
+                    100.0 - remaining,
+                    reset,
+                )
+            };
+            windows.push(window);
+        }
+    }
+    if windows.is_empty() {
+        return ProviderReport::err(ProviderId::Minimax, identity, "no MiniMax quota windows");
+    }
+    ProviderReport::ok(
+        ProviderId::Minimax,
+        "MiniMax Coding Plan",
+        identity,
+        None,
+        windows,
+    )
 }
 
 /// DeepSeek 账户余额：只读查询官方 /user/balance，不构造额度百分比窗口。
@@ -2260,6 +2351,83 @@ mod tests {
             );
             assert_eq!(report.credit_balance, None);
         }
+    }
+
+    fn minimax_quota_fixture() -> Value {
+        serde_json::json!({
+            "base_resp": {"status_code": 0, "status_msg": "success"},
+            "model_remains": [{
+                "model_name": "general",
+                "end_time": 1791924872012_i64,
+                "weekly_end_time": 1792511672012_i64,
+                "current_interval_status": 1,
+                "current_interval_total_count": 0,
+                "current_interval_usage_count": 0,
+                "current_interval_remaining_percent": 97,
+                "current_weekly_status": 1,
+                "current_weekly_total_count": 0,
+                "current_weekly_usage_count": 0,
+                "current_weekly_remaining_percent": 99
+            }]
+        })
+    }
+
+    #[test]
+    fn minimax_uses_official_remaining_percent_even_when_counts_are_zero() {
+        let report = parse_minimax(None, minimax_quota_fixture());
+        assert_eq!(report.windows.len(), 2);
+        assert!((report.windows[0].used_fraction - 0.03).abs() < 1e-9);
+        assert!((report.windows[1].used_fraction - 0.01).abs() < 1e-9);
+        assert_eq!(
+            report.windows[0].reset_at,
+            Utc.timestamp_millis_opt(1791924872012).single()
+        );
+        assert_eq!(
+            report.windows[1].reset_at,
+            Utc.timestamp_millis_opt(1792511672012).single()
+        );
+        assert!(report
+            .windows
+            .iter()
+            .all(|window| window.used.is_none() && window.limit.is_none()));
+    }
+
+    #[test]
+    fn minimax_preserves_zero_remaining_and_does_not_invent_inactive_or_unknown_windows() {
+        let mut body = minimax_quota_fixture();
+        body["model_remains"][0]["current_interval_remaining_percent"] = serde_json::json!(0);
+        body["model_remains"][0]["current_weekly_remaining_percent"] = serde_json::json!(100);
+        let report = parse_minimax(None, body.clone());
+        assert_eq!(report.windows[0].used_fraction, 1.0);
+        assert_eq!(report.windows[1].used_fraction, 0.0);
+
+        body["model_remains"][0]["current_interval_status"] = serde_json::json!(3);
+        let report = parse_minimax(None, body.clone());
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].id, "minimax-week");
+
+        body["model_remains"][0]["current_weekly_remaining_percent"] = Value::Null;
+        let report = parse_minimax(None, body);
+        assert!(report.error.is_some());
+        assert!(report.windows.is_empty());
+    }
+
+    #[test]
+    fn minimax_business_failure_is_not_successful_quota_data() {
+        let mut body = minimax_quota_fixture();
+        body["base_resp"]["status_code"] = serde_json::json!(1004);
+        let report = parse_minimax(None, body);
+        assert!(report.error.is_some());
+        assert!(report.windows.is_empty());
+        let report = parse_minimax(
+            None,
+            serde_json::json!({
+                "base_resp": {"status_code": 0},
+                "model_remains": [{"current_interval_remaining_percent": "NaN"}]
+            }),
+        );
+        assert!(report.error.is_some());
+        assert!(report.windows.is_empty());
     }
 
     fn glm_quota_fixture() -> Value {

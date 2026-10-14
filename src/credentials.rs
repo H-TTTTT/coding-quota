@@ -356,6 +356,7 @@ fn load_from_sqlite(path: &Path, set: &mut CredentialSet) -> Result<()> {
                     set.kimi = Some(cred);
                 }
             }
+            "cursor" => set.cursor = Some(cred),
             "devin" => set.devin = Some(cred),
             // 订阅额度只对 OAuth 登录有意义；API key 行不授权（同 Claude 的理由）。
             "google-antigravity" if credential_type == "oauth" => set.antigravity = Some(cred),
@@ -628,6 +629,69 @@ mod tests {
             let mut logged_in = CredentialSet::default();
             load_from_sqlite(&path, &mut logged_in)?;
             assert!(logged_in.grok.is_some(), "login must restore the provider");
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn every_credentialed_provider_is_mapped_from_its_omp_row() -> Result<()> {
+        use crate::model::ProviderId;
+        // 守卫 load_from_sqlite 的分支表：新增平台时若漏写或误删映射，
+        // 这里会直接失败，而不是表现为「明明登录了却提示无凭据」。
+        let path = std::env::temp_dir().join(format!(
+            "cq-provider-mapping-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let result = (|| -> Result<()> {
+            let db = rusqlite::Connection::open(&path)?;
+            db.execute_batch(
+                "CREATE TABLE auth_credentials (
+                    provider TEXT, credential_type TEXT, identity_key TEXT,
+                    data TEXT, disabled_cause TEXT
+                 );",
+            )?;
+            for (provider, credential_type) in [
+                ("openai-codex", "oauth"),
+                ("anthropic", "oauth"),
+                ("xai-oauth", "oauth"),
+                ("zhipu-coding-plan", "api_key"),
+                ("kimi-code", "oauth"),
+                ("cursor", "oauth"),
+                ("devin", "oauth"),
+                ("google-antigravity", "oauth"),
+                ("deepseek", "api_key"),
+                ("minimax-code-cn", "api_key"),
+            ] {
+                db.execute(
+                    "INSERT INTO auth_credentials VALUES (?1, ?2, 'identity:probe', '{}', NULL)",
+                    [provider, credential_type],
+                )?;
+            }
+            let mut set = CredentialSet::default();
+            load_from_sqlite(&path, &mut set)?;
+            let missing: Vec<&str> = [
+                (ProviderId::Codex, set.codex.is_none()),
+                (ProviderId::Claude, set.claude.is_none()),
+                (ProviderId::Grok, set.grok.is_none()),
+                (ProviderId::Glm, set.glm.is_none()),
+                (ProviderId::Kimi, set.kimi.is_none()),
+                (ProviderId::Cursor, set.cursor.is_none()),
+                (ProviderId::Devin, set.devin.is_none()),
+                (ProviderId::Antigravity, set.antigravity.is_none()),
+                (ProviderId::Deepseek, set.deepseek.is_none()),
+                (ProviderId::Minimax, set.minimax.is_none()),
+            ]
+            .into_iter()
+            .filter(|(_, absent)| *absent)
+            .map(|(provider, _)| provider.title())
+            .collect();
+            assert!(
+                missing.is_empty(),
+                "these providers are authorized in omp but never reach the set: {missing:?}"
+            );
             Ok(())
         })();
         let _ = std::fs::remove_file(&path);

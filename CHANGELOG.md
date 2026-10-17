@@ -6,6 +6,7 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- MiniMax 卡片在本机 MiniMax Code 登录态仍有效时，额外显示积分余额和周重置卡库存。额度窗口仍来自订阅 Key 的 `token_plan/remains`；积分与用量弹窗一致，读 `POST /matrix/api/v1/commerce/get_membership_info` 的 `op_credit_summary.total_remaining_amount`（该字段缺失时才用 `opcredit_balance`，确认为 0 也显示），不使用 `token_plan_credit.remaining_credits`。重置卡只读 `reset_card/list` 的数量和最早到期日。登录过期或接口失败时不编造 0，也不改写 MiniMax Code 的登录文件。
 - 新增 MiniMax 国内编程套餐卡片：自动读取 omp 中有效的 `minimax-code-cn` 套餐 API key，只读查询官方 `GET https://api.minimaxi.com/v1/token_plan/remains`。显示 5 小时和每周剩余额度、重置倒计时，接入 GUI、TUI、托盘显示开关、拖拽排序、快照、JSON 与本机用量统计；可用 `--provider minimax` / `minimax-code-cn` 单独查询。以官方剩余百分比为准，计数字段为零时不伪造套餐容量；0% 剩余正常显示，未启用或缺少额度的窗口不伪造可用额度。读取实时 SQLite WAL，支持刚新增的凭据与软删除登出。
 - 托盘菜单新增「刷新频率」选项（1 / 3 / 5 / 10 / 30 分钟，默认 5 分钟），选择立即生效，持久化在 `%APPDATA%\coding-quota\refresh_interval_secs.txt`。
 - 新增 DeepSeek API 账户余额卡片：读取 omp 中有效的 `deepseek` API key，只读调用官方 `GET https://api.deepseek.com/user/balance`。GUI 以白字余额行展示，TUI 同步显示余额；人民币与美元分别保留，不绘制虚假的额度百分比或进度条。支持托盘显示开关、`--provider deepseek`、快照、JSON 与现有本机用量统计。余额为零照常显示；响应金额缺失或无效时按查询失败处理，GUI/TUI 保留 24 小时内的旧余额并标明数据年龄，登出后隐藏且不从缓存复活。原有 Codex 积分余额与重置卡显示保持不变。

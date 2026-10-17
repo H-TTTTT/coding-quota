@@ -1031,7 +1031,15 @@ async fn fetch_minimax(client: &reqwest::Client, cred: StoredCred) -> ProviderRe
     })
     .await
     {
-        Ok((_, body)) => parse_minimax(identity, body),
+        Ok((_, body)) => {
+            let mut report = parse_minimax(identity, body);
+            if report.error.is_none() {
+                // 积分和重置卡不在 remains 里。订阅 Key 调这两项会 401；
+                // 只在本机 MiniMax Code 登录态仍有效时补查，失败不掩盖额度窗口。
+                attach_minimax_account(client, &mut report).await;
+            }
+            report
+        }
         Err(err) => ProviderReport::err(ProviderId::Minimax, identity, err),
     }
 }
@@ -1106,6 +1114,200 @@ fn parse_minimax(identity: Option<String>, body: Value) -> ProviderReport {
         None,
         windows,
     )
+}
+
+/// MiniMax Code 把访问令牌写在本机 OAuth 文件里。过期后不代它刷新：
+/// 刷新会轮换 refresh token，写坏文件会把用户从 MiniMax Code 登出。
+struct McodeSession {
+    access_token: String,
+    origin: &'static str,
+    agent_origin: &'static str,
+}
+
+fn load_mcode_session() -> Option<McodeSession> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let root = std::path::PathBuf::from(home)
+        .join(".minimax")
+        .join("auth")
+        .join("prod");
+    let mut best: Option<(i64, McodeSession)> = None;
+    for (region, origin, agent_origin) in [
+        ("cn", "https://www.minimaxi.com", "https://agent.minimax.cn"),
+        ("en", "https://www.minimax.io", "https://agent.minimax.io"),
+        (
+            "global",
+            "https://www.minimax.io",
+            "https://agent.minimax.io",
+        ),
+    ] {
+        let path = root.join(region).join("mcode-public").join("auth.json");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(auth) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let Some((expires_at, access_token)) =
+            select_mcode_access_token(&auth, Utc::now().timestamp_millis())
+        else {
+            continue;
+        };
+        let replace = best
+            .as_ref()
+            .map(|(best_exp, _)| expires_at > *best_exp)
+            .unwrap_or(true);
+        if replace {
+            best = Some((
+                expires_at,
+                McodeSession {
+                    access_token,
+                    origin,
+                    agent_origin,
+                },
+            ));
+        }
+    }
+    best.map(|(_, session)| session)
+}
+
+fn select_mcode_access_token(auth: &Value, now_ms: i64) -> Option<(i64, String)> {
+    let mut best: Option<(i64, String)> = None;
+    let records = auth.get("records")?.as_object()?;
+    for record in records.values() {
+        if record.get("tokenType").and_then(Value::as_str) != Some("Bearer") {
+            continue;
+        }
+        if record.get("clientId").and_then(Value::as_str) != Some("mcode-public") {
+            continue;
+        }
+        let Some(expires_at) = record.get("expiresAtMs").and_then(Value::as_i64) else {
+            continue;
+        };
+        // 留 15 秒，避免请求发出时刚好过期。
+        if expires_at <= now_ms.saturating_add(15_000) {
+            continue;
+        }
+        let Some(token) = record
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        else {
+            continue;
+        };
+        let replace = best
+            .as_ref()
+            .map(|(best_exp, _)| expires_at > *best_exp)
+            .unwrap_or(true);
+        if replace {
+            best = Some((expires_at, token.to_string()));
+        }
+    }
+    best
+}
+
+fn mcode_headers(token: &str, origin: &str) -> HeaderMap {
+    let mut headers = bearer(token);
+    if let Ok(value) = HeaderValue::from_str(origin) {
+        headers.insert("Origin", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&format!("{origin}/")) {
+        headers.insert("Referer", value);
+    }
+    headers
+}
+
+async fn attach_minimax_account(client: &reqwest::Client, report: &mut ProviderReport) {
+    let Some(session) = load_mcode_session() else {
+        return;
+    };
+    // 用量弹窗的「积分」来自会员信息，不来自 token_plan_credit.remaining_credits。
+    let credit_headers = mcode_headers(&session.access_token, session.agent_origin);
+    let credit_url = format!(
+        "{}/matrix/api/v1/commerce/get_membership_info",
+        session.agent_origin
+    );
+    if let Ok(body) = post_json(client, &credit_url, credit_headers).await {
+        apply_minimax_credits(report, &body);
+    }
+    let headers = mcode_headers(&session.access_token, session.origin);
+    let card_url = format!(
+        "{}/backend/account/reset_card/list?page=1&size=100",
+        session.origin
+    );
+    if let Ok(body) = get_json(client, &card_url, headers).await {
+        apply_minimax_reset_cards(report, &body);
+    }
+}
+
+fn apply_minimax_credits(report: &mut ProviderReport, body: &Value) {
+    if body
+        .pointer("/base_resp/status_code")
+        .and_then(Value::as_i64)
+        != Some(0)
+    {
+        return;
+    }
+    // 与 MiniMax Code 用量弹窗相同：优先 op_credit_summary.total_remaining_amount，
+    // 该字段缺失时才用 opcredit_balance。不读 remaining_credits、total_remains_credit
+    // 或 tp_remains，那些字段和弹窗上的积分不是同一个数。
+    let summary_amount = body.pointer("/op_credit_summary/total_remaining_amount");
+    let amount = if summary_amount.is_some_and(|value| !value.is_null()) {
+        credit_amount(summary_amount)
+    } else {
+        credit_amount(body.get("opcredit_balance"))
+    };
+    let Some(amount) = amount else {
+        return;
+    };
+    report.credit_balance = Some(CreditBalance::Limited(amount));
+}
+
+fn credit_amount(value: Option<&Value>) -> Option<f64> {
+    let parsed = match value? {
+        Value::Number(amount) => amount.as_f64(),
+        Value::String(raw) => raw.replace(',', "").trim().parse().ok(),
+        _ => None,
+    };
+    parsed.filter(|amount| amount.is_finite() && *amount >= 0.0)
+}
+
+fn apply_minimax_reset_cards(report: &mut ProviderReport, body: &Value) {
+    if body
+        .pointer("/base_resp/status_code")
+        .and_then(Value::as_i64)
+        != Some(0)
+    {
+        return;
+    }
+    let cards = body.get("cards").and_then(Value::as_array);
+    let count = body
+        .get("total")
+        .and_then(Value::as_i64)
+        .or_else(|| cards.map(|cards| cards.len() as i64))
+        .filter(|count| *count >= 0);
+    let Some(count) = count else {
+        return;
+    };
+    let earliest = cards.and_then(|cards| {
+        cards
+            .iter()
+            .filter_map(|card| millis_to_dt(number(card.get("expire_time"))))
+            .min()
+    });
+    // 签到重置卡清的是周窗口。周窗口不存在时挂到第一张额度条，避免到期日没处显示。
+    let index = report
+        .windows
+        .iter()
+        .position(|window| window.id == "minimax-week")
+        .or_else(|| report.windows.first().map(|_| 0));
+    if let Some(index) = index {
+        let window = &mut report.windows[index];
+        window.resets_left = Some(count);
+        window.resets_expire = earliest;
+    } else {
+        report.resets_left = Some(count);
+    }
 }
 
 /// DeepSeek 账户余额：只读查询官方 /user/balance，不构造额度百分比窗口。
@@ -2428,6 +2630,173 @@ mod tests {
         );
         assert!(report.error.is_some());
         assert!(report.windows.is_empty());
+    }
+
+    #[test]
+    fn minimax_account_shows_known_zero_credits_and_weekly_reset_cards() {
+        let mut report = parse_minimax(None, minimax_quota_fixture());
+        apply_minimax_credits(
+            &mut report,
+            &serde_json::json!({
+                "op_credit_summary": {
+                    "total_remaining_amount": 0,
+                    "free_remaining_amount": 0
+                },
+                "opcredit_balance": 50,
+                "remaining_credits": 999,
+                "api_key": "sk-test-must-not-leak",
+                "base_resp": {"status_code": 0, "status_msg": "success"}
+            }),
+        );
+        apply_minimax_reset_cards(
+            &mut report,
+            &serde_json::json!({
+                "cards": [
+                    {"card_id": "1", "expire_time": 1793376000000_i64},
+                    {"card_id": "2", "expire_time": 1793116800000_i64},
+                    {"card_id": "3", "expire_time": 1793462400000_i64}
+                ],
+                "total": 3,
+                "base_resp": {"status_code": 0, "status_msg": "success"}
+            }),
+        );
+        assert_eq!(report.credit_balance, Some(CreditBalance::Limited(0.0)));
+        assert_eq!(report.windows[0].resets_left, None);
+        assert_eq!(report.windows[1].id, "minimax-week");
+        assert_eq!(report.windows[1].resets_left, Some(3));
+        assert_eq!(
+            report.windows[1].resets_expire,
+            Utc.timestamp_millis_opt(1793116800000).single()
+        );
+        let encoded = serde_json::to_string(&report).expect("report serializes");
+        assert!(
+            !encoded.contains("sk-test-must-not-leak"),
+            "subscription key echoed by the credit API must not enter the report"
+        );
+        assert!(report.error.is_none());
+        assert!((report.windows[0].used_fraction - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn minimax_account_shows_usage_popover_credits_not_credit_pack_remainder() {
+        let mut report = parse_minimax(None, minimax_quota_fixture());
+        apply_minimax_credits(
+            &mut report,
+            &serde_json::json!({
+                "op_credit_summary": {"total_remaining_amount": "1,200"},
+                "opcredit_balance": 0,
+                "total_remains_credit": 0,
+                "remaining_credits": 0,
+                "tp_remains": 136791529889.62,
+                "base_resp": {"status_code": 0}
+            }),
+        );
+        assert_eq!(report.credit_balance, Some(CreditBalance::Limited(1200.0)));
+
+        let mut report = parse_minimax(None, minimax_quota_fixture());
+        apply_minimax_credits(
+            &mut report,
+            &serde_json::json!({
+                "opcredit_balance": 0,
+                "remaining_credits": 1200,
+                "base_resp": {"status_code": 0}
+            }),
+        );
+        assert_eq!(report.credit_balance, Some(CreditBalance::Limited(0.0)));
+
+        let mut report = parse_minimax(None, minimax_quota_fixture());
+        apply_minimax_credits(
+            &mut report,
+            &serde_json::json!({
+                "remaining_credits": 1200,
+                "base_resp": {"status_code": 0}
+            }),
+        );
+        assert_eq!(report.credit_balance, None);
+
+        let mut report = parse_minimax(None, minimax_quota_fixture());
+        apply_minimax_credits(
+            &mut report,
+            &serde_json::json!({
+                "op_credit_summary": {"total_remaining_amount": "nope"},
+                "opcredit_balance": 7,
+                "base_resp": {"status_code": 0}
+            }),
+        );
+        assert_eq!(report.credit_balance, None);
+    }
+
+    #[test]
+    fn minimax_account_lookup_failure_does_not_invent_credits_or_hide_quota() {
+        let mut report = parse_minimax(None, minimax_quota_fixture());
+        apply_minimax_credits(
+            &mut report,
+            &serde_json::json!({"base_resp": {"status_code": 1004, "status_msg": "not login"}}),
+        );
+        apply_minimax_reset_cards(
+            &mut report,
+            &serde_json::json!({"base_resp": {"status_code": 1004, "status_msg": "not login"}}),
+        );
+        assert_eq!(report.credit_balance, None);
+        assert!(report
+            .windows
+            .iter()
+            .all(|window| window.resets_left.is_none()));
+        assert!(report.error.is_none());
+        assert_eq!(report.windows.len(), 2);
+
+        let mut weekly_off = minimax_quota_fixture();
+        weekly_off["model_remains"][0]["current_weekly_status"] = serde_json::json!(3);
+        let mut report = parse_minimax(None, weekly_off);
+        apply_minimax_reset_cards(
+            &mut report,
+            &serde_json::json!({
+                "cards": [{"expire_time": 1793116800000_i64}],
+                "total": 0,
+                "base_resp": {"status_code": 0}
+            }),
+        );
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows[0].id, "minimax-5h");
+        assert_eq!(report.windows[0].resets_left, Some(0));
+        assert_eq!(
+            report.windows[0].resets_expire,
+            Utc.timestamp_millis_opt(1793116800000).single()
+        );
+    }
+
+    #[test]
+    fn mcode_access_token_ignores_expired_and_non_bearer_records() {
+        let auth = serde_json::json!({
+            "records": {
+                "stale": {
+                    "tokenType": "Bearer",
+                    "clientId": "mcode-public",
+                    "expiresAtMs": 20_000,
+                    "accessToken": "stale-token"
+                },
+                "other": {
+                    "tokenType": "Bearer",
+                    "clientId": "other",
+                    "expiresAtMs": 90_000,
+                    "accessToken": "wrong-client"
+                },
+                "fresh": {
+                    "tokenType": "Bearer",
+                    "clientId": "mcode-public",
+                    "expiresAtMs": 80_000,
+                    "accessToken": " fresh-token "
+                }
+            }
+        });
+        assert!(
+            select_mcode_access_token(&auth, 70_000).is_none(),
+            "a token inside the 15s skew, and every other record, must be ignored"
+        );
+        assert_eq!(
+            select_mcode_access_token(&auth, 1_000).map(|(_, token)| token),
+            Some("fresh-token".to_string())
+        );
     }
 
     fn glm_quota_fixture() -> Value {

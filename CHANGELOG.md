@@ -14,6 +14,7 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- TUI 不再向 Windows Terminal 的 `settings.json` 或 `Fragments` 注入 `Coding Quota TUI` 配置文件，并在启动时自动清理早期版本遗留的同名配置项，避免在 PowerShell / Windows Terminal 配置文件列表中残留该条目。
 - 挂件加了单实例锁：重复启动 `coding-quota-gui.exe`（双击、开机自启 + 手动启动）不再出现第二个托盘图标和第二路后台刷新，只会弹一句「已经在运行」的提示后退出。锁按登录会话隔离，远程桌面会话里各开一个仍然允许。
 - `--watch` 每轮重新读取凭据库：登录、登出、token 轮换、换 `CODING_QUOTA_DB` 都不必重启进程；watch 期间凭据库临时读不到只跳过本轮并打印一行原因，不再让整个 watch 退出（单发 `--snapshot` 仍按原语义直接失败）。
 - 新增 Google Antigravity 额度卡片：读取 omp 的有效 `google-antigravity` OAuth 登录及 projectId，按 Antigravity Hub 请求规范查询实时额度；显示 Gemini 与平台内 Claude/GPT 共享额度的 5 小时、周窗口、剩余百分比及重置时间，共享 bucket 去重。这是 Antigravity 内的模型额度，不是独立 Claude/Codex 订阅额度。GUI、TUI、托盘开关、`--snapshot` / `--json` 和 `--provider antigravity` / `google-antigravity` 均已接入；登出后隐藏，失败沿用已有缓存及退避规则，401 沿用 omp token 刷新。

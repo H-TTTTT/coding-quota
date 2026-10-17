@@ -66,7 +66,7 @@ On the current Windows workstation, Rust is available in WSL Ubuntu-24.04. Use `
 - `.cargo/config.toml`: configures MinGW GCC/ar for `x86_64-pc-windows-gnu`; it does **not** choose a default target.
 - `src/credentials.rs`: readonly omp SQLite access, temporary-copy cleanup and `omp token` refresh integration.
 - `src/cache.rs`: `%APPDATA%\coding-quota\last_good.json` persistence and stale-data policy.
-- `src/main.rs`: Windows Terminal launcher, profile management and content-addressed console-host executable cache.
+- `src/main.rs`: Windows Terminal launcher, legacy terminal-profile cleanup and content-addressed console-host executable cache.
 - `README.md`, `CHANGELOG.md`: user commands and behavior history; record user-visible changes under Unreleased.
 
 ## Runtime/Tooling Preferences

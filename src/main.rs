@@ -54,68 +54,29 @@ fn enable_windows_console() {
     }
 }
 
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))]
 mod terminal_profile {
+    use serde_json::Value;
     use std::path::{Path, PathBuf};
 
-    const GUID: &str = "{d0ac4c18-765a-43fd-b12d-4005d099cd6f}";
-    pub const NAME: &str = "Coding Quota TUI";
-    const ENTRY: &str = r#"            {
-                "closeOnExit": "graceful",
-                "commandline": "cmd.exe",
-                "guid": "{d0ac4c18-765a-43fd-b12d-4005d099cd6f}",
-                "hidden": true,
-                "historySize": 0,
-                "name": "Coding Quota TUI",
-                "padding": "0, 2",
-                "scrollbarState": "hidden"
-            }"#;
-    const FRAGMENT: &str = r#"{
-  "profiles": [
-    {
-      "closeOnExit": "graceful",
-      "commandline": "cmd.exe",
-      "guid": "{d0ac4c18-765a-43fd-b12d-4005d099cd6f}",
-      "hidden": true,
-      "historySize": 0,
-      "name": "Coding Quota TUI",
-      "padding": "0, 2",
-      "scrollbarState": "hidden"
-    }
-  ]
-}
-"#;
+    const LEGACY_GUID: &str = "{d0ac4c18-765a-43fd-b12d-4005d099cd6f}";
+    const LEGACY_NAME: &str = "Coding Quota TUI";
 
-    pub fn ensure() -> bool {
+    /// 清理早期版本写进 Windows Terminal 的 `Coding Quota TUI` 配置文件，
+    /// 避免在终端设置和下拉菜单里留下多余条目。
+    pub fn cleanup_legacy() {
         let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
-            return false;
+            return;
         };
         let local_app_data = PathBuf::from(local_app_data);
-        let fragment = local_app_data
+        let fragment_dir = local_app_data
             .join("Microsoft")
             .join("Windows Terminal")
             .join("Fragments")
-            .join("CodingQuota")
-            .join("profile.json");
+            .join("CodingQuota");
+        let _ = std::fs::remove_dir_all(fragment_dir);
 
-        if let Some((installed, changed)) = install_active_settings(&local_app_data) {
-            if installed {
-                let _ = std::fs::remove_file(fragment);
-                if changed {
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                }
-            }
-            return installed;
-        }
-
-        let Some(directory) = fragment.parent() else {
-            return false;
-        };
-        std::fs::create_dir_all(directory).is_ok() && std::fs::write(fragment, FRAGMENT).is_ok()
-    }
-
-    fn install_active_settings(local_app_data: &Path) -> Option<(bool, bool)> {
-        let candidates = [
+        for settings_path in [
             local_app_data
                 .join("Packages")
                 .join("Microsoft.WindowsTerminal_8wekyb3d8bbwe")
@@ -130,104 +91,87 @@ mod terminal_profile {
                 .join("Microsoft")
                 .join("Windows Terminal")
                 .join("settings.json"),
-        ];
-        candidates
-            .into_iter()
-            .find(|path| path.is_file())
-            .map(|path| patch_settings(&path))
+        ] {
+            if settings_path.is_file() {
+                let _ = remove_from_settings_file(&settings_path);
+            }
+            let backup = settings_path.with_file_name("settings.json.coding-quota-backup");
+            let _ = std::fs::remove_file(backup);
+        }
     }
 
-    fn patch_settings(path: &Path) -> (bool, bool) {
-        let Ok(settings) = std::fs::read_to_string(path) else {
-            return (false, false);
-        };
-        if settings.contains(GUID) {
-            let needs_padding = !settings.contains(r#""padding": "0, 2""#);
-            if needs_padding {
-                let start = settings.find(GUID).unwrap_or(0);
-                let legacy = settings[start..]
-                    .find(r#""padding": "0""#)
-                    .map(|i| start + i);
-                if let Some(index) = legacy {
-                    let backup = path.with_file_name("settings.json.coding-quota-backup");
-                    if !backup.exists() && std::fs::copy(path, &backup).is_err() {
-                        return (false, false);
-                    }
-                    let mut updated = settings;
-                    updated.replace_range(
-                        index..index + r#""padding": "0""#.len(),
-                        r#""padding": "0, 2""#,
-                    );
-                    return (std::fs::write(path, updated).is_ok(), true);
-                }
-            }
-            return (true, false);
-        }
-        let Some(profiles) = settings.find("\"profiles\"") else {
-            return (false, false);
-        };
-        let Some(list) = settings[profiles..]
-            .find("\"list\"")
-            .map(|index| profiles + index)
-        else {
-            return (false, false);
-        };
-        let Some(open) = settings[list..].find('[').map(|index| list + index) else {
-            return (false, false);
-        };
-        let Some(close) = array_end(&settings, open) else {
-            return (false, false);
-        };
-
-        let comma = if settings[open + 1..close].trim().is_empty() {
-            ""
-        } else {
-            ","
-        };
-        let mut updated = String::with_capacity(settings.len() + ENTRY.len() + 16);
-        updated.push_str(&settings[..close]);
-        updated.push_str(comma);
-        updated.push('\n');
-        updated.push_str(ENTRY);
-        updated.push('\n');
-        updated.push_str("        ");
-        updated.push_str(&settings[close..]);
-
-        let backup = path.with_file_name("settings.json.coding-quota-backup");
-        if !backup.exists() && std::fs::copy(path, &backup).is_err() {
-            return (false, false);
-        }
-        (std::fs::write(path, updated).is_ok(), true)
+    fn remove_from_settings_file(path: &Path) -> Option<bool> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let updated = strip_legacy_profile(&raw)?;
+        std::fs::write(path, updated).ok()?;
+        Some(true)
     }
 
-    fn array_end(text: &str, open: usize) -> Option<usize> {
-        let mut depth = 0usize;
-        let mut quoted = false;
-        let mut escaped = false;
-        for (offset, character) in text[open..].char_indices() {
-            if quoted {
-                if escaped {
-                    escaped = false;
-                } else if character == '\\' {
-                    escaped = true;
-                } else if character == '"' {
-                    quoted = false;
-                }
-                continue;
-            }
-            match character {
-                '"' => quoted = true,
-                '[' => depth += 1,
-                ']' => {
-                    depth = depth.checked_sub(1)?;
-                    if depth == 0 {
-                        return Some(open + offset);
-                    }
-                }
-                _ => {}
-            }
+    pub(crate) fn strip_legacy_profile(raw: &str) -> Option<String> {
+        if !raw.contains(LEGACY_GUID) && !raw.contains(LEGACY_NAME) {
+            return None;
         }
-        None
+        let mut root: Value = serde_json::from_str(raw).ok()?;
+        let list = root.pointer_mut("/profiles/list")?.as_array_mut()?;
+        let before = list.len();
+        list.retain(|entry| {
+            let guid = entry.get("guid").and_then(Value::as_str);
+            let name = entry.get("name").and_then(Value::as_str);
+            !guid.is_some_and(|g| g.eq_ignore_ascii_case(LEGACY_GUID)) && name != Some(LEGACY_NAME)
+        });
+        if list.len() == before {
+            return None;
+        }
+        let mut rendered = serde_json::to_string_pretty(&root).ok()?;
+        if raw.contains("\r\n") {
+            rendered = rendered.replace('\n', "\r\n");
+        }
+        if raw.ends_with("\r\n") && !rendered.ends_with("\r\n") {
+            rendered.push_str("\r\n");
+        } else if raw.ends_with('\n') && !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        Some(rendered)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn strips_legacy_coding_quota_profile_and_preserves_other_profiles() {
+            let sample = r#"{
+    "profiles": {
+        "list": [
+            {
+                "guid": "{963ff2f7-6aed-5ce3-9d91-90d99571f53a}",
+                "name": "Ubuntu-24.04"
+            },
+            {
+                "closeOnExit": "graceful",
+                "commandline": "cmd.exe",
+                "guid": "{d0ac4c18-765a-43fd-b12d-4005d099cd6f}",
+                "hidden": true,
+                "historySize": 0,
+                "name": "Coding Quota TUI",
+                "padding": "0, 2",
+                "scrollbarState": "hidden"
+            },
+            {
+                "guid": "{2b761077-1626-5d25-ba1b-1aa81e2f101e}",
+                "name": "Developer PowerShell for VS 2022"
+            }
+        ]
+    }
+}
+"#;
+            let cleaned = strip_legacy_profile(sample).expect("legacy profile must be removed");
+            assert!(!cleaned.contains(LEGACY_GUID));
+            assert!(!cleaned.contains(LEGACY_NAME));
+            assert!(cleaned.contains("Ubuntu-24.04"));
+            assert!(cleaned.contains("Developer PowerShell for VS 2022"));
+            assert!(strip_legacy_profile(&cleaned).is_none());
+        }
     }
 }
 
@@ -338,9 +282,7 @@ fn launch_focused_tui() -> bool {
         .args(["--focus", "--size"])
         .arg(size)
         .args(["--window", "new", "new-tab"]);
-    if terminal_profile::ensure() {
-        command.args(["--profile", terminal_profile::NAME]);
-    }
+    terminal_profile::cleanup_legacy();
     let launched = command
         .args(["--suppressApplicationTitle", "--title", "编程额度"])
         .arg(executable)
@@ -380,6 +322,8 @@ async fn main() -> Result<()> {
     }
     // 终端窗口被直接关掉时进程是被强杀的，来不及删掉只读凭据副本；启动时扫一次。
     let _ = credentials::sweep_stale_db_copies();
+    #[cfg(windows)]
+    terminal_profile::cleanup_legacy();
     let want_tui = interactive && (hosted || std::io::stdout().is_terminal());
 
     if cli.json {

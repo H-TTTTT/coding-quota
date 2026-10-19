@@ -12,6 +12,11 @@ use std::time::Duration;
 
 const UA: &str = "coding-quota/0.1";
 const TIMEOUT: Duration = Duration::from_secs(20);
+/// 单次 TCP 连接的上限。本机所用 DNS（校园网 / 校园 VPN）会给
+/// api.minimaxi.com、api.deepseek.com 返回同一组地址，其中一个节点不回包。
+/// 不设连接超时时，握手会一直挂到整个请求超时（20s），表现为「请求超时」。
+/// 加上连接超时后，这个地址会被快速放弃并换用同一组里的可用地址。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 失败的平台先按 5 分钟退避（与挂件的刷新节奏一致），连续失败翻倍，1 小时封顶。
 const BACKOFF_BASE: Duration = Duration::from_secs(300);
 const BACKOFF_MAX: Duration = Duration::from_secs(3600);
@@ -24,6 +29,7 @@ fn http_client() -> Result<&'static reqwest::Client, String> {
         .get_or_init(|| {
             reqwest::Client::builder()
                 .timeout(TIMEOUT)
+                .connect_timeout(CONNECT_TIMEOUT)
                 .build()
                 .map_err(|err| format!("http client: {err}"))
         })

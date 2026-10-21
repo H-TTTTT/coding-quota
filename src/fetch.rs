@@ -207,7 +207,8 @@ where
     match request(client, &token).await {
         Ok(body) => Ok((token, body)),
         Err(err) if err.starts_with("HTTP 401") => {
-            let Some(fresh) = credentials::secret_from_omp(omp_provider, true) else {
+            let Some(fresh) = credentials::secret_from_omp(omp_provider, cred.oauth_account, true)
+            else {
                 return Err(err);
             };
             if fresh == token {
@@ -226,7 +227,7 @@ fn resolve_secret(cred: &StoredCred, omp_provider: &str) -> Option<String> {
     // the authoritative signal and fetch_with_refresh retries it once.
     cred.access
         .clone()
-        .or_else(|| credentials::secret_from_omp(omp_provider, false))
+        .or_else(|| credentials::secret_from_omp(omp_provider, cred.oauth_account, false))
 }
 
 const ANTIGRAVITY_QUOTA_URL: &str =
@@ -327,9 +328,6 @@ fn push_antigravity_bucket(
     bucket: &Value,
     group_name: Option<&str>,
 ) {
-    if bucket.get("disabled").and_then(Value::as_bool) == Some(true) {
-        return;
-    }
     let Some(bucket_id) = bucket
         .get("bucketId")
         .and_then(Value::as_str)
@@ -337,7 +335,8 @@ fn push_antigravity_bucket(
     else {
         return;
     };
-    // 未返回额度不代表 100% 或 0%；只显示接口确实返回的有限数值。
+    // disabled 仅表示暂不可用，不能丢掉仍带有额度和恢复时间的窗口。
+    // 只显示接口确实返回的有限数值；缺失或无效时不臆造 0% 或 100%。
     let Some(remaining) =
         number(bucket.get("remainingFraction")).filter(|fraction| fraction.is_finite())
     else {
@@ -1677,7 +1676,7 @@ async fn fetch_devin_api(client: &reqwest::Client, cred: StoredCred) -> Provider
     // 与 fetch_with_refresh 同语义：401 才强制刷新重试一次
     let result = match result {
         Err(err) if err.starts_with("HTTP 401") => {
-            match credentials::secret_from_omp("devin", true) {
+            match credentials::secret_from_omp("devin", cred.oauth_account, true) {
                 Some(fresh) if fresh != token => {
                     post_devin_user_status(client, &fresh, cred.kind.as_deref()).await
                 }
@@ -2354,6 +2353,40 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_exhausted_weekly_keeps_disabled_short_window() {
+        for remaining in [0.02915344, 0.0] {
+            let report = parse_antigravity(
+                None,
+                serde_json::json!({"groups": [{
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        {"bucketId": "3p-weekly", "window": "weekly",
+                         "remainingFraction": 0, "resetTime": "2026-10-24T15:10:58Z"},
+                        {"bucketId": "3p-5h", "window": "5h", "disabled": true,
+                         "remainingFraction": remaining, "resetTime": "2026-10-20T14:30:50Z"}
+                    ]
+                }]}),
+            );
+            let short = report
+                .windows
+                .iter()
+                .find(|window| window.id == "antigravity-3p-5h")
+                .expect("disabled quota with a reported value must remain visible");
+            assert!((short.used_fraction - (1.0 - remaining)).abs() < 1e-9);
+            assert_eq!(
+                short.reset_at,
+                Some(Utc.with_ymd_and_hms(2026, 10, 20, 14, 30, 50).unwrap())
+            );
+            let weekly = report
+                .windows
+                .iter()
+                .find(|window| window.id == "antigravity-3p-weekly")
+                .expect("exhausted weekly quota must remain visible");
+            assert_eq!(weekly.used_fraction, 1.0);
+        }
+    }
+
+    #[test]
     fn antigravity_flat_buckets_distinguish_zero_from_unknown() {
         let report = parse_antigravity(
             None,
@@ -2366,9 +2399,11 @@ mod tests {
             ]}),
         );
         assert!(report.error.is_none(), "{:?}", report.error);
-        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.windows.len(), 2);
         assert_eq!(report.windows[0].id, "antigravity-gemini-5h");
         assert_eq!(report.windows[0].used_fraction, 1.0);
+        assert_eq!(report.windows[1].id, "antigravity-3p-5h");
+        assert!((report.windows[1].used_fraction - 0.1).abs() < 1e-9);
     }
 
     #[test]

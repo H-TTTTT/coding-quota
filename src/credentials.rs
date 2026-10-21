@@ -36,6 +36,10 @@ pub struct StoredCred {
     /// omp 凭据类型（"oauth" / "api_key"）：Devin 的 token 进 protobuf metadata
     /// 时 OAuth 需要加 devin-session-token$ 前缀，API key 不加。
     pub kind: Option<String>,
+    /// 同 provider 下第几个 active OAuth 账号（1-based，按 rowid 升序），
+    /// 供 `omp token <provider> --account <N>` 绑定当前卡片对应的凭据行，
+    /// 避免多账号时 401 刷新切到另一个账号的 token。API key 凭据为 None。
+    pub oauth_account: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -318,7 +322,8 @@ fn load_from_sqlite(path: &Path, set: &mut CredentialSet) -> Result<()> {
     let db = open_sqlite_readonly(path)?;
     let mut stmt = db.conn().prepare(
         "SELECT provider, credential_type, COALESCE(identity_key, ''), data
-         FROM auth_credentials WHERE disabled_cause IS NULL",
+         FROM auth_credentials WHERE disabled_cause IS NULL
+         ORDER BY rowid ASC",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -329,9 +334,16 @@ fn load_from_sqlite(path: &Path, set: &mut CredentialSet) -> Result<()> {
         ))
     })?;
 
+    let mut oauth_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for row in rows {
         let (provider, credential_type, identity_key, data) = row?;
-        let cred = parse_cred(&provider, &credential_type, &identity_key, &data);
+        let mut cred = parse_cred(&provider, &credential_type, &identity_key, &data);
+        if credential_type == "oauth" {
+            let index = oauth_counts.entry(provider.clone()).or_insert(0);
+            *index += 1;
+            cred.oauth_account = Some(*index);
+        }
         match provider.as_str() {
             "openai-codex" | "openai" | "codex" => {
                 if set.codex.is_none() || provider == "openai-codex" {
@@ -395,6 +407,7 @@ fn parse_cred(provider: &str, credential_type: &str, identity_key: &str, data: &
         plan,
         project_id,
         kind: Some(credential_type.trim().to_string()),
+        oauth_account: None,
     }
 }
 
@@ -461,12 +474,20 @@ fn api_key_cred(key: &str) -> StoredCred {
         plan: None,
         project_id: None,
         kind: Some("api_key".into()),
+        oauth_account: None,
     }
 }
 
-pub fn secret_from_omp(provider: &str, force_refresh: bool) -> Option<String> {
+pub fn secret_from_omp(
+    provider: &str,
+    oauth_account: Option<usize>,
+    force_refresh: bool,
+) -> Option<String> {
     let mut cmd = hidden_command("omp");
     cmd.arg("token").arg(provider);
+    if let Some(account) = oauth_account {
+        cmd.arg("--account").arg(account.to_string());
+    }
     if force_refresh {
         cmd.arg("--force-refresh");
     }
@@ -475,6 +496,9 @@ pub fn secret_from_omp(provider: &str, force_refresh: bool) -> Option<String> {
     }
     // Windows build: omp lives inside WSL and is not on the Windows PATH.
     let mut shell = format!("\"$HOME/.bun/bin/omp\" token {provider}");
+    if let Some(account) = oauth_account {
+        shell.push_str(&format!(" --account {account}"));
+    }
     if force_refresh {
         shell.push_str(" --force-refresh");
     }
@@ -861,6 +885,45 @@ mod tests {
                 .as_ref()
                 .expect("login must restore the provider");
             assert_eq!(cred.project_id.as_deref(), Some("ag-proj-42"));
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn multiple_oauth_accounts_preserve_1_based_account_index_for_refresh() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "coding-quota-multi-oauth-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let result = (|| -> Result<()> {
+            let db = rusqlite::Connection::open(&path)?;
+            db.execute_batch(
+                "CREATE TABLE auth_credentials (
+                    provider TEXT, credential_type TEXT, identity_key TEXT,
+                    data TEXT, disabled_cause TEXT
+                 );
+                 INSERT INTO auth_credentials VALUES
+                    ('google-antigravity', 'oauth', 'email:first@example.com',
+                     '{\"access\":\"tok-1\",\"email\":\"first@example.com\",\"projectId\":\"proj-shared\"}', NULL),
+                    ('google-antigravity', 'api_key', '', '{\"key\":\"ignored-key\"}', NULL),
+                    ('google-antigravity', 'oauth', 'email:disabled@example.com',
+                     '{\"access\":\"tok-disabled\",\"email\":\"disabled@example.com\",\"projectId\":\"proj-shared\"}', 'deleted'),
+                    ('google-antigravity', 'oauth', 'email:second@example.com',
+                     '{\"access\":\"tok-2\",\"email\":\"second@example.com\",\"projectId\":\"proj-shared\"}', NULL);",
+            )?;
+            let mut set = CredentialSet::default();
+            load_from_sqlite(&path, &mut set)?;
+            let cred = set.antigravity.expect("second active OAuth row selected");
+            assert_eq!(cred.identity.as_deref(), Some("second@example.com"));
+            assert_eq!(cred.access.as_deref(), Some("tok-2"));
+            assert_eq!(
+                cred.oauth_account,
+                Some(2),
+                "active OAuth rows must carry their 1-based omp --account index so 401 refresh never switches to account 1"
+            );
             Ok(())
         })();
         let _ = std::fs::remove_file(&path);

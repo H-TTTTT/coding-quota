@@ -23,6 +23,8 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- 修复同平台存在多个 omp OAuth 账号时，token 过期 401 刷新短暂切到另一账号额度（如 Google Antigravity 卡片偶发刷出满额度后又恢复）：SQLite 读取按 `rowid ASC` 稳定排序并为每条启用中的 OAuth 凭据记录 1-based `--account` 序号；调用 `omp token <provider>` 取 token 或 `--force-refresh` 刷新时显式绑定 `--account <N>`，只刷新并返回当前卡片对应账号的 token，不再触发 omp 跨账号额度排序或轮换。
+- 修复 Antigravity 共享 5 小时额度在被官方标记 `disabled` 后整行消失：仍有有效额度数据的窗口保留真实剩余值（包括 0%）和恢复时间，不因暂不可用而隐藏；周额度照常显示，缺失或无效的额度仍不伪造。GUI、TUI 与 JSON 使用同一解析结果。
 - 放宽过短的连接建立时限：从 5 秒改为 15 秒，整个请求仍受 20 秒总时限约束。连接建立时限覆盖 DNS、TCP、TLS，不是每个 IP 的独立 TCP 超时，也不保证换址或自动重试。同名同路径的 DeepSeek 对照中，5 秒版本两次超时、15 秒版本两次成功；后续全量检查仍观察到少量间歇超时，因此不归因于特定 VPN、不承诺首次失败会自动暖通隧道。未改动代理、DNS、凭据或 TLS 校验。
 - 修复 Cursor 卡片始终显示「无凭据」：凭据映射表中的 Cursor 分支曾被相邻平台的新增改动整行覆盖，导致 omp 中已登录的 Cursor 账号无法进入凭据集合，与是否重新登录无关。恢复该分支，并新增覆盖全部平台的映射回归测试，任何平台的映射被漏写或误删都会立即测试失败。
 - 修复任务管理器中 exe 图标与「编程额度」子窗口图标不一致：窗口首帧初始化后使用 exe 内嵌资源 1 的系统大、小图标，替换 eframe 默认的「e」图标。通过消息队列延后应用，避免框架首帧设置覆盖；复用现有 `icon.ico`，无需新增图片或依赖。

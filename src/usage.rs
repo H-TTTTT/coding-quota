@@ -1,8 +1,8 @@
 //! 本机 OMP 会话的 token 用量：增量扫描 `~/.omp/agent/sessions` 下的 JSONL。
 //!
 //! 每轮 `message` 行的 `message.usage` 记录该轮 input / output / reasoning /
-//! cacheRead / cacheWrite / totalTokens；按平台聚合成近 1 天 / 7 天 / 30 天与
-//! 本机累计。「本机累计」只是当前设备仍保留的日志合计，不等于服务端账号累计。
+//! cacheRead / cacheWrite / totalTokens；按平台聚合成当日（北京时间 0 点清零）/
+//! 近 7 天 / 30 天与本机累计。「本机累计」只是当前设备仍保留的日志合计，不等于服务端账号累计。
 //! 文件按 (mtime, size) 缓存解析结果，未变化的文件不重复解析；扫描结果在进程内
 //! 保留 120 秒，刷新循环里只有首次扫描是全量的。
 
@@ -94,29 +94,39 @@ fn rows_for(provider: ProviderId) -> Vec<UsageRow> {
 fn is_gemini_model(model: &str) -> bool {
     model.to_ascii_lowercase().starts_with("gemini")
 }
-/// 按事件时间聚合为 1d / 7d / 30d / 本机累计四档；零值档不输出。
+/// 当日北京时间 00:00:00 对应的 UTC 秒级时间戳（每天 0 点清零）。
+fn beijing_midnight_cutoff(now: i64) -> i64 {
+    const BEIJING_OFFSET: i64 = 8 * 3_600;
+    const DAY_SECS: i64 = 86_400;
+    let beijing_now = now.saturating_add(BEIJING_OFFSET);
+    beijing_now.div_euclid(DAY_SECS) * DAY_SECS - BEIJING_OFFSET
+}
+
+/// 按事件时间聚合为 1d（北京时间 0 点起）/ 7d / 30d / 本机累计四档；零值档不输出。
 fn aggregate(events: Vec<UsageEvent>) -> Vec<UsageRow> {
-    /// (id, 英文说明, 偏移秒)；「本机累计」无时间下限。
-    const BUCKETS: [(&str, &str, i64); 4] = [
-        ("1d", "last 1 day", 86_400),
-        ("7d", "last 7 days", 7 * 86_400),
-        ("30d", "last 30 days", 30 * 86_400),
-        ("all", "local total", i64::MAX),
+    aggregate_at(events, chrono::Utc::now().timestamp())
+}
+
+fn aggregate_at(events: Vec<UsageEvent>, now: i64) -> Vec<UsageRow> {
+    // (id, 英文说明, 下限秒级时间戳)；1d 为当日北京时间 0 点，「本机累计」无时间下限。
+    let buckets: [(&str, &str, i64); 4] = [
+        ("1d", "last 1 day", beijing_midnight_cutoff(now)),
+        ("7d", "last 7 days", now.saturating_sub(7 * 86_400)),
+        ("30d", "last 30 days", now.saturating_sub(30 * 86_400)),
+        ("all", "local total", i64::MIN),
     ];
-    let now = chrono::Utc::now().timestamp();
     let mut models: [HashMap<String, u64>; 4] = Default::default();
     let mut totals = [0_u64; 4];
     for event in events {
-        for (index, (_, _, offset)) in BUCKETS.iter().enumerate() {
-            let cutoff = now.saturating_sub(*offset);
-            if event.timestamp >= cutoff {
+        for (index, (_, _, cutoff)) in buckets.iter().enumerate() {
+            if event.timestamp >= *cutoff {
                 totals[index] += event.total_tokens;
                 *models[index].entry(event.model.clone()).or_default() += event.total_tokens;
             }
         }
     }
     let mut rows = Vec::new();
-    for ((id, label, _), (total, models)) in BUCKETS.iter().zip(totals.into_iter().zip(models)) {
+    for ((id, label, _), (total, models)) in buckets.iter().zip(totals.into_iter().zip(models)) {
         if total == 0 {
             continue;
         }
@@ -373,20 +383,24 @@ mod tests {
     /// 时间桶按事件时间归入 1d/7d/30d/累计；模型明细按用量降序。
     #[test]
     fn aggregate_buckets_by_event_time_with_model_details() {
-        let now = chrono::Utc::now().timestamp();
+        // 固定在北京时间 2026-10-21 12:00:00（04:00:00Z），避免跨零点导致断言受执行时刻影响。
+        let now = parse_timestamp("2026-10-21T12:00:00+08:00").unwrap();
         let event = |hours_ago: i64, model: &str, total: u64| UsageEvent {
             provider: ProviderId::Codex,
             timestamp: now - hours_ago * 3600,
             model: model.to_string(),
             total_tokens: total,
         };
-        let rows = aggregate(vec![
-            event(1, "gpt-6-astra", 1_000),
-            event(72, "gpt-6-astra", 10_000),
-            event(24 * 10, "gpt-5.6-luna", 100_000),
-            event(24 * 40, "gpt-5.6-luna", 1_000_000),
-            event(2, "gpt-6-astra", 50),
-        ]);
+        let rows = aggregate_at(
+            vec![
+                event(1, "gpt-6-astra", 1_000),
+                event(72, "gpt-6-astra", 10_000),
+                event(24 * 10, "gpt-5.6-luna", 100_000),
+                event(24 * 40, "gpt-5.6-luna", 1_000_000),
+                event(2, "gpt-6-astra", 50),
+            ],
+            now,
+        );
         let totals: Vec<(String, u64)> = rows
             .iter()
             .map(|row| (row.id.clone(), row.total_tokens))
@@ -409,6 +423,39 @@ mod tests {
         assert_eq!(monthly.models[0].name, "gpt-5.6-luna");
         assert_eq!(monthly.models[0].total_tokens, 100_000);
         assert!(rows.iter().all(|row| row.source == "local"));
+    }
+
+    /// 1 天用量按北京时间每日 00:00:00 清零，而非滚动 24 小时。
+    #[test]
+    fn daily_bucket_resets_at_beijing_midnight() {
+        // 当前为北京时间 2026-10-21 00:05:00（距昨夜 23:59:59 仅过 5 分钟）。
+        let now = parse_timestamp("2026-10-21T00:05:00+08:00").unwrap();
+        let event = |ts: &str, total: u64| UsageEvent {
+            provider: ProviderId::Codex,
+            timestamp: parse_timestamp(ts).unwrap(),
+            model: "gpt-5.4".into(),
+            total_tokens: total,
+        };
+        let before_midnight_only =
+            aggregate_at(vec![event("2026-10-20T23:59:59+08:00", 8_000)], now);
+        assert!(
+            before_midnight_only.iter().all(|row| row.id != "1d"),
+            "昨夜 23:59:59 的用量在 00:00 后必须从 1d 清零"
+        );
+        assert_eq!(before_midnight_only[0].id, "7d");
+        assert_eq!(before_midnight_only[0].total_tokens, 8_000);
+
+        let across_midnight = aggregate_at(
+            vec![
+                event("2026-10-20T23:59:59+08:00", 8_000),
+                event("2026-10-21T00:00:00+08:00", 300),
+            ],
+            now,
+        );
+        assert_eq!(across_midnight[0].id, "1d");
+        assert_eq!(across_midnight[0].total_tokens, 300);
+        assert_eq!(across_midnight[1].id, "7d");
+        assert_eq!(across_midnight[1].total_tokens, 8_300);
     }
 
     /// (mtime, size) 未变化的文件不重新解析；变化的文件重新解析。

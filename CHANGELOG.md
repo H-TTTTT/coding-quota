@@ -24,6 +24,7 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- 消除每轮刷新与用量扫描无条件拉起 `wsl.exe` 子进程导致的杀毒软件拦截：Windows 用户名与 WSL 用户名不同时，直接通过文件系统枚举 `\\wsl.localhost\<distro>\home\*`（及 `\\wsl$`）定位 `.omp/agent/agent.db` 并缓存路径，仅在纯文件探测全部未命中时才兜底调用一次 `wsl.exe`；部署二进制改由 WSL `cp` 直接替换，避免被终端安全软件标记为 `powershell.exe` 释放的可疑程序。
 - 修复同平台存在多个 omp OAuth 账号时，token 过期 401 刷新短暂切到另一账号额度（如 Google Antigravity 卡片偶发刷出满额度后又恢复）：SQLite 读取按 `rowid ASC` 稳定排序并为每条启用中的 OAuth 凭据记录 1-based `--account` 序号；调用 `omp token <provider>` 取 token 或 `--force-refresh` 刷新时显式绑定 `--account <N>`，只刷新并返回当前卡片对应账号的 token，不再触发 omp 跨账号额度排序或轮换。
 - 修复 Antigravity 共享 5 小时额度在被官方标记 `disabled` 后整行消失：仍有有效额度数据的窗口保留真实剩余值（包括 0%）和恢复时间，不因暂不可用而隐藏；周额度照常显示，缺失或无效的额度仍不伪造。GUI、TUI 与 JSON 使用同一解析结果。
 - 放宽过短的连接建立时限：从 5 秒改为 15 秒，整个请求仍受 20 秒总时限约束。连接建立时限覆盖 DNS、TCP、TLS，不是每个 IP 的独立 TCP 超时，也不保证换址或自动重试。同名同路径的 DeepSeek 对照中，5 秒版本两次超时、15 秒版本两次成功；后续全量检查仍观察到少量间歇超时，因此不归因于特定 VPN、不承诺首次失败会自动暖通隧道。未改动代理、DNS、凭据或 TLS 校验。

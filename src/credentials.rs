@@ -129,6 +129,13 @@ fn find_omp_db() -> Option<PathBuf> {
         }
     }
 
+    static CACHED_DB: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    if let Some(cached) = CACHED_DB.get() {
+        if cached.is_file() {
+            return Some(cached.clone());
+        }
+    }
+
     let mut candidates = Vec::new();
     for key in ["HOME", "USERPROFILE"] {
         if let Ok(root) = std::env::var(key) {
@@ -141,16 +148,17 @@ fn find_omp_db() -> Option<PathBuf> {
         candidates.push(PathBuf::from(format!("{drive}{home_path}")).join(".omp/agent/agent.db"));
     }
     candidates.extend(wsl_unc_candidates());
-    if let Some(path) = wsl_db_via_wsl_exe() {
-        candidates.push(path);
-    }
-
     for path in candidates {
         if path.is_file() {
+            let _ = CACHED_DB.set(path.clone());
             return Some(path);
         }
     }
-    None
+
+    // 仅当纯文件探测全部未命中时才兜底调用一次 wsl.exe，避免每轮刷新拉起子进程触发安全软件拦截。
+    let path = wsl_db_via_wsl_exe()?;
+    let _ = CACHED_DB.set(path.clone());
+    Some(path)
 }
 
 /// OMP 会话日志目录：与凭据库同目录（`~/.omp/agent/sessions`）。
@@ -197,6 +205,18 @@ fn wsl_unc_candidates() -> Vec<PathBuf> {
                 r"\\wsl$\{distro}{}",
                 suffix.replace('/', "\\")
             )));
+        }
+    }
+    // Windows 用户名与 WSL 用户名不同（如 Windows 为 xuhaitao、WSL 为 x06579）时，
+    // 直接枚举 \\wsl.localhost\<distro>\home 下的目录即可定位凭据库，无需拉起 wsl.exe。
+    for distro in distros.iter().flatten() {
+        for prefix in [r"\\wsl.localhost", r"\\wsl$"] {
+            let home_root = PathBuf::from(format!(r"{prefix}\{distro}\home"));
+            if let Ok(entries) = std::fs::read_dir(home_root) {
+                for entry in entries.flatten() {
+                    out.push(entry.path().join(r".omp\agent\agent.db"));
+                }
+            }
         }
     }
     out

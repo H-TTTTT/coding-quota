@@ -3,10 +3,12 @@ use crate::credentials::{self, CredentialSet, StoredCred};
 use crate::model::{
     CreditBalance, MoneyBalance, ProviderId, ProviderReport, QuotaWindow, Snapshot,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, TimeZone, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
 use serde_json::Value;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -1119,30 +1121,34 @@ fn parse_minimax(identity: Option<String>, body: Value) -> ProviderReport {
     )
 }
 
-/// MiniMax Code 把访问令牌写在本机 OAuth 文件里。过期后不代它刷新：
-/// 刷新会轮换 refresh token，写坏文件会把用户从 MiniMax Code 登出。
+/// MiniMax Code 把访问令牌写在本机 OAuth 文件里。访问令牌过期后，积分和
+/// 重置卡接口会 401，因此这里按 MiniMax Code 官方 `oauth2/token` 协议安全续期：
+/// 只刷新当前（generation 最大）记录，保留其它记录与字段，原子写回并保存
+/// 轮换后的 refresh token；失败时不删除凭据、不伪造额度。
 struct McodeSession {
     access_token: String,
     origin: &'static str,
     agent_origin: &'static str,
 }
 
-fn load_mcode_session() -> Option<McodeSession> {
+const MCODE_REGIONS: [(&str, &str, &str); 3] = [
+    ("cn", "https://www.minimaxi.com", "https://agent.minimax.cn"),
+    ("en", "https://www.minimax.io", "https://agent.minimax.io"),
+    (
+        "global",
+        "https://www.minimax.io",
+        "https://agent.minimax.io",
+    ),
+];
+
+async fn load_mcode_session(client: &reqwest::Client) -> Option<McodeSession> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    let root = std::path::PathBuf::from(home)
+    let root = PathBuf::from(home)
         .join(".minimax")
         .join("auth")
         .join("prod");
     let mut best: Option<(i64, McodeSession)> = None;
-    for (region, origin, agent_origin) in [
-        ("cn", "https://www.minimaxi.com", "https://agent.minimax.cn"),
-        ("en", "https://www.minimax.io", "https://agent.minimax.io"),
-        (
-            "global",
-            "https://www.minimax.io",
-            "https://agent.minimax.io",
-        ),
-    ] {
+    for (region, origin, agent_origin) in MCODE_REGIONS {
         let path = root.join(region).join("mcode-public").join("auth.json");
         let Ok(text) = std::fs::read_to_string(path) else {
             continue;
@@ -1170,7 +1176,18 @@ fn load_mcode_session() -> Option<McodeSession> {
             ));
         }
     }
-    best.map(|(_, session)| session)
+    if best.is_some() {
+        return best.map(|(_, session)| session);
+    }
+    // 没有任何未过期访问令牌：按官方协议续期，而不是让积分/重置卡静默消失。
+    for (region, origin, agent_origin) in MCODE_REGIONS {
+        if let Some(session) =
+            refresh_mcode_session(client, &root, region, origin, agent_origin).await
+        {
+            return Some(session);
+        }
+    }
+    None
 }
 
 fn select_mcode_access_token(auth: &Value, now_ms: i64) -> Option<(i64, String)> {
@@ -1209,6 +1226,190 @@ fn select_mcode_access_token(auth: &Value, now_ms: i64) -> Option<(i64, String)>
     best
 }
 
+async fn refresh_mcode_session(
+    client: &reqwest::Client,
+    root: &Path,
+    region: &str,
+    origin: &'static str,
+    agent_origin: &'static str,
+) -> Option<McodeSession> {
+    let base = root.join(region).join("mcode-public");
+    let auth_path = base.join("auth.json");
+    let state_path = base.join("auth-state.json");
+    let mut auth = read_json_file(&auth_path)?;
+    let state = read_json_file(&state_path).unwrap_or(Value::Null);
+    let now = Utc::now().timestamp_millis();
+
+    let records = auth.get_mut("records")?.as_object_mut()?;
+    let current_key = records
+        .iter()
+        .max_by_key(|(_, record)| {
+            record
+                .get("generation")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+        })
+        .map(|(key, _)| key.clone())?;
+    let record = records.get(&current_key)?.clone();
+    let expires_at = record
+        .get("expiresAtMs")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if expires_at > now.saturating_add(15_000) {
+        return None;
+    }
+    let refresh_token = record.get("refreshToken")?.as_str()?.to_string();
+    if refresh_token.trim().is_empty() {
+        return None;
+    }
+    let old_generation = record
+        .get("generation")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let state_generation = state.get("generation").and_then(Value::as_i64).unwrap_or(0);
+    let login_epoch = record.get("loginEpoch").cloned();
+    let old_scopes = record.get("scopes").cloned();
+
+    let token_endpoint = if region == "cn" {
+        "https://account.minimax.cn/oauth2/token"
+    } else {
+        "https://account.minimax.io/oauth2/token"
+    };
+    let body = post_form(
+        client,
+        token_endpoint,
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+            ("client_id", "mcode-public"),
+            ("scope", "agent.default"),
+            ("audience", "agent-backend"),
+        ],
+    )
+    .await
+    .ok()?;
+    if body.get("error").is_some() {
+        return None;
+    }
+    let access_token = body.get("access_token")?.as_str()?.to_string();
+    let new_refresh = body
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .unwrap_or(&refresh_token)
+        .to_string();
+    let expires_in = body.get("expires_in").and_then(Value::as_f64)?;
+    if !expires_in.is_finite() || expires_in <= 0.0 {
+        return None;
+    }
+    let is_bearer = body
+        .get("token_type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("bearer"));
+    if !is_bearer {
+        return None;
+    }
+
+    let new_generation = old_generation.max(state_generation) + 1;
+    let new_expires_at = now.saturating_add((expires_in * 1000.0) as i64);
+    let scopes = match body.get("scope").and_then(Value::as_str) {
+        Some(scope) => Value::Array(
+            scope
+                .split_whitespace()
+                .map(|item| Value::String(item.to_string()))
+                .collect(),
+        ),
+        None => old_scopes.unwrap_or_else(|| serde_json::json!(["agent.default"])),
+    };
+
+    let mut new_record = record.clone();
+    let object = new_record.as_object_mut()?;
+    object.insert("schemaVersion".into(), Value::from(1));
+    object.insert("accessToken".into(), Value::String(access_token.clone()));
+    object.insert("refreshToken".into(), Value::String(new_refresh));
+    object.insert("tokenType".into(), Value::String("Bearer".into()));
+    object.insert("clientId".into(), Value::String("mcode-public".into()));
+    object.insert("scopes".into(), scopes.clone());
+    object.insert("audience".into(), Value::String("agent-backend".into()));
+    object.insert("expiresAtMs".into(), Value::from(new_expires_at));
+    object.insert("generation".into(), Value::from(new_generation));
+    if let Some(epoch) = login_epoch {
+        object.insert("loginEpoch".into(), epoch);
+    }
+    if let Some(claims) = decode_jwt_payload(&access_token) {
+        if let Some(subject) = claims.get("sub").and_then(Value::as_str) {
+            object.insert("subject".into(), Value::String(subject.to_string()));
+        }
+        if let Some(account_id) = claims.get("account_id").and_then(Value::as_str) {
+            object.insert("accountId".into(), Value::String(account_id.to_string()));
+        }
+    }
+    records.insert(current_key, new_record);
+
+    let mut new_state = if state.is_object() {
+        state.clone()
+    } else {
+        serde_json::json!({})
+    };
+    let state_object = new_state.as_object_mut()?;
+    state_object.insert("schemaVersion".into(), Value::from(2));
+    state_object.insert("status".into(), Value::String("authenticated".into()));
+    state_object.insert("storeKind".into(), Value::String("file".into()));
+    state_object.insert("clientId".into(), Value::String("mcode-public".into()));
+    state_object.insert("scopes".into(), scopes);
+    state_object.insert("audience".into(), Value::String("agent-backend".into()));
+    state_object.insert("buildEnv".into(), Value::String("prod".into()));
+    state_object.insert("region".into(), Value::String(region.to_string()));
+    state_object.insert("generation".into(), Value::from(new_generation));
+    state_object.insert("expiresAtMs".into(), Value::from(new_expires_at));
+
+    write_json_atomic(&auth_path, &auth).ok()?;
+    write_json_atomic(&state_path, &new_state).ok()?;
+    Some(McodeSession {
+        access_token,
+        origin,
+        agent_origin,
+    })
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_json_atomic(path: &Path, value: &Value) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.coding-quota-tmp");
+    let text = serde_json::to_string_pretty(value).map_err(std::io::Error::other)? + "\n";
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(tmp, path)
+}
+
+async fn post_form(
+    client: &reqwest::Client,
+    url: &str,
+    fields: &[(&str, &str)],
+) -> Result<Value, String> {
+    let response = client
+        .post(url)
+        .form(fields)
+        .send()
+        .await
+        .map_err(|err| brief(&err))?;
+    let status = response.status();
+    let text = response.text().await.map_err(|err| brief(&err))?;
+    if !status.is_success() {
+        return Err(http_error(status, &text));
+    }
+    serde_json::from_str(&text).map_err(|_| "invalid JSON".to_string())
+}
+
+fn decode_jwt_payload(token: &str) -> Option<Value> {
+    let mut parts = token.split('.');
+    let _ = parts.next()?;
+    let payload = parts.next()?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
+
 fn mcode_headers(token: &str, origin: &str) -> HeaderMap {
     let mut headers = bearer(token);
     if let Ok(value) = HeaderValue::from_str(origin) {
@@ -1221,7 +1422,7 @@ fn mcode_headers(token: &str, origin: &str) -> HeaderMap {
 }
 
 async fn attach_minimax_account(client: &reqwest::Client, report: &mut ProviderReport) {
-    let Some(session) = load_mcode_session() else {
+    let Some(session) = load_mcode_session(client).await else {
         return;
     };
     // 用量弹窗的「积分」来自会员信息，不来自 token_plan_credit.remaining_credits。

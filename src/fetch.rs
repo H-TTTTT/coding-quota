@@ -620,7 +620,7 @@ const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CLAUDE_TRACE_URL: &str = "https://api.anthropic.com/cdn-cgi/trace";
 const CLAUDE_TRACE_FALLBACK_URL: &str = "https://claude.ai/cdn-cgi/trace";
 /// 与 WSL 内正版 `@anthropic-ai/claude-code` 保持一致的客户端标识，避免暴露第三方自研 UA。
-const CLAUDE_CLI_UA: &str = "claude-cli/2.1.309 (external, cli)";
+const CLAUDE_CLI_UA: &str = "claude-cli/2.1.310 (external, cli)";
 
 /// 套餐名很少变：进程内按账号记住 6 小时，避免每轮刷新都多查一次 profile。
 /// usage 接口限流很紧（与 omp / Claude Code 共用同一账号额度，omp 遇到 429 也不重试）。
@@ -644,8 +644,18 @@ fn remember_claude_plan(identity: Option<&str>, plan: &str) {
     }
 }
 
+const CLAUDE_DEFAULT_EXPECTED_IP: &str = "192.220.35.115";
+
 fn claude_trace_is_us(trace: &str) -> bool {
-    trace.lines().any(|line| line.trim() == "loc=US")
+    let expected_ip = std::env::var("CLAUDE_EXPECTED_IP")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| CLAUDE_DEFAULT_EXPECTED_IP.to_string());
+    let want_ip = format!("ip={expected_ip}");
+    let has_us = trace.lines().any(|line| line.trim() == "loc=US");
+    let has_ip = trace.lines().any(|line| line.trim() == want_ip);
+    has_us && has_ip
 }
 
 fn claude_trace_summary(trace: &str) -> String {
@@ -695,7 +705,7 @@ async fn verify_claude_us_egress(client: &reqwest::Client) -> Result<(), String>
         Ok(())
     } else {
         Err(format!(
-            "blocked: Claude egress is not US ({})",
+            "blocked: Claude egress is not dedicated residential US IP ({})",
             claude_trace_summary(&trace)
         ))
     }
@@ -3492,6 +3502,7 @@ mod tests {
         assert!(claude_trace_is_us(
             "fl=1164f88\nip=192.220.35.115\nloc=US\ncolo=LAX\n"
         ));
+        assert!(!claude_trace_is_us("ip=104.224.153.31\nloc=US\ncolo=LAX\n"));
         assert!(!claude_trace_is_us("ip=1.2.3.4\nloc=CN\ncolo=HKG\n"));
         assert!(!claude_trace_is_us("ip=1.2.3.4\nloc=HK\n"));
         assert!(!claude_trace_is_us(""));
@@ -3502,7 +3513,7 @@ mod tests {
         let headers = claude_headers("probe-token");
         assert_eq!(
             headers.get(USER_AGENT).and_then(|v| v.to_str().ok()),
-            Some("claude-cli/2.1.309 (external, cli)")
+            Some("claude-cli/2.1.310 (external, cli)")
         );
         assert_eq!(
             headers.get("anthropic-beta").and_then(|v| v.to_str().ok()),

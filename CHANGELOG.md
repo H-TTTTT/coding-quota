@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
-- 支持直接只读复用 WSL / 本机正版 Claude Code（`~/.claude/.credentials.json` 与 `~/.claude.json`）的 OAuth 凭据与本地会话用量（`~/.claude/projects/**/*.jsonl`）：当 omp `agent.db` 中未登录 `anthropic` 时自动回退读取，省去 `/api/oauth/profile` 请求且不主动抢刷 `refresh_token`；每次请求 Claude 官方额度前先经无凭据的 `api.anthropic.com/cdn-cgi/trace`（兜底 `claude.ai/cdn-cgi/trace`）校验出口为 `loc=US`，非美国出口立即本地熔断不发 Token，请求头对齐正版 `claude-cli` UA。
+- 支持直接只读复用 WSL / 本机正版 Claude Code（`~/.claude/.credentials.json` 与 `~/.claude.json`）的 OAuth 凭据与本地会话用量（`~/.claude/projects/**/*.jsonl`）：当 omp `agent.db` 中未登录 `anthropic` 时自动回退读取，省去 `/api/oauth/profile` 请求且不主动抢刷 `refresh_token`；每次请求 Claude 官方额度前先经无凭据的 `api.anthropic.com/cdn-cgi/trace`（兜底 `claude.ai/cdn-cgi/trace`）严格校验出口同时满足 `loc=US` 且 `ip=192.220.35.115`（可通过 `CLAUDE_EXPECTED_IP` 覆盖），非专属美国家宽出口立即本地熔断不发 Token，请求头对齐正版 `claude-cli/2.1.310 (external, cli)` UA。
 - MiniMax 卡片在本机 MiniMax Code 登录态仍有效时，额外显示积分余额和周重置卡库存。额度窗口仍来自订阅 Key 的 `token_plan/remains`；积分与用量弹窗一致，读 `POST /matrix/api/v1/commerce/get_membership_info` 的 `op_credit_summary.total_remaining_amount`（该字段缺失时才用 `opcredit_balance`，确认为 0 也显示），不使用 `token_plan_credit.remaining_credits`。重置卡只读 `reset_card/list` 的数量和最早到期日。登录过期或接口失败时不编造 0，也不改写 MiniMax Code 的登录文件。
 - 新增 MiniMax 国内编程套餐卡片：自动读取 omp 中有效的 `minimax-code-cn` 套餐 API key，只读查询官方 `GET https://api.minimaxi.com/v1/token_plan/remains`。显示 5 小时和每周剩余额度、重置倒计时，接入 GUI、TUI、托盘显示开关、拖拽排序、快照、JSON 与本机用量统计；可用 `--provider minimax` / `minimax-code-cn` 单独查询。以官方剩余百分比为准，计数字段为零时不伪造套餐容量；0% 剩余正常显示，未启用或缺少额度的窗口不伪造可用额度。读取实时 SQLite WAL，支持刚新增的凭据与软删除登出。
 - 托盘菜单新增「刷新频率」选项（1 / 3 / 5 / 10 / 30 分钟，默认 5 分钟），选择立即生效，持久化在 `%APPDATA%\coding-quota\refresh_interval_secs.txt`。

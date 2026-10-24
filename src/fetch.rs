@@ -1182,7 +1182,23 @@ async fn load_mcode_session(client: &reqwest::Client) -> Option<McodeSession> {
     // 没有任何未过期访问令牌：按官方协议续期，而不是让积分/重置卡静默消失。
     for (region, origin, agent_origin) in MCODE_REGIONS {
         if let Some(session) =
-            refresh_mcode_session(client, &root, region, origin, agent_origin).await
+            refresh_mcode_session(client, &root, region, origin, agent_origin, false).await
+        {
+            return Some(session);
+        }
+    }
+    None
+}
+
+async fn force_refresh_mcode_session(client: &reqwest::Client) -> Option<McodeSession> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let root = PathBuf::from(home)
+        .join(".minimax")
+        .join("auth")
+        .join("prod");
+    for (region, origin, agent_origin) in MCODE_REGIONS {
+        if let Some(session) =
+            refresh_mcode_session(client, &root, region, origin, agent_origin, true).await
         {
             return Some(session);
         }
@@ -1191,39 +1207,37 @@ async fn load_mcode_session(client: &reqwest::Client) -> Option<McodeSession> {
 }
 
 fn select_mcode_access_token(auth: &Value, now_ms: i64) -> Option<(i64, String)> {
-    let mut best: Option<(i64, String)> = None;
     let records = auth.get("records")?.as_object()?;
-    for record in records.values() {
-        if record.get("tokenType").and_then(Value::as_str) != Some("Bearer") {
-            continue;
-        }
-        if record.get("clientId").and_then(Value::as_str) != Some("mcode-public") {
-            continue;
-        }
-        let Some(expires_at) = record.get("expiresAtMs").and_then(Value::as_i64) else {
-            continue;
-        };
-        // 留 15 秒，避免请求发出时刚好过期。
-        if expires_at <= now_ms.saturating_add(15_000) {
-            continue;
-        }
-        let Some(token) = record
-            .get("accessToken")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-        else {
-            continue;
-        };
-        let replace = best
-            .as_ref()
-            .map(|(best_exp, _)| expires_at > *best_exp)
-            .unwrap_or(true);
-        if replace {
-            best = Some((expires_at, token.to_string()));
-        }
+    // 存在多代记录时只看最新 generation；同一代内再按 expiresAtMs 取最新。
+    let current = records
+        .values()
+        .filter(|record| {
+            record.get("tokenType").and_then(Value::as_str) == Some("Bearer")
+                && record.get("clientId").and_then(Value::as_str) == Some("mcode-public")
+        })
+        .max_by_key(|record| {
+            (
+                record
+                    .get("generation")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                record
+                    .get("expiresAtMs")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+            )
+        })?;
+    let expires_at = current.get("expiresAtMs").and_then(Value::as_i64)?;
+    // 留 15 秒，避免请求发出时刚好过期。
+    if expires_at <= now_ms.saturating_add(15_000) {
+        return None;
     }
-    best
+    let token = current
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())?;
+    Some((expires_at, token.to_string()))
 }
 
 async fn refresh_mcode_session(
@@ -1232,6 +1246,7 @@ async fn refresh_mcode_session(
     region: &str,
     origin: &'static str,
     agent_origin: &'static str,
+    force: bool,
 ) -> Option<McodeSession> {
     let base = root.join(region).join("mcode-public");
     let auth_path = base.join("auth.json");
@@ -1255,7 +1270,7 @@ async fn refresh_mcode_session(
         .get("expiresAtMs")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    if expires_at > now.saturating_add(15_000) {
+    if !force && expires_at > now.saturating_add(15_000) {
         return None;
     }
     let refresh_token = record.get("refreshToken")?.as_str()?.to_string();
@@ -1425,23 +1440,66 @@ async fn attach_minimax_account(client: &reqwest::Client, report: &mut ProviderR
     let Some(session) = load_mcode_session(client).await else {
         return;
     };
-    // 用量弹窗的「积分」来自会员信息，不来自 token_plan_credit.remaining_credits。
-    let credit_headers = mcode_headers(&session.access_token, session.agent_origin);
-    let credit_url = format!(
-        "{}/matrix/api/v1/commerce/get_membership_info",
-        session.agent_origin
-    );
-    if let Ok(body) = post_json(client, &credit_url, credit_headers).await {
-        apply_minimax_credits(report, &body);
+    if query_minimax_account_once(client, &session, report).await {
+        if let Some(refreshed) = force_refresh_mcode_session(client).await {
+            let _ = query_minimax_account_once(client, &refreshed, report).await;
+        }
     }
-    let headers = mcode_headers(&session.access_token, session.origin);
-    let card_url = format!(
-        "{}/backend/account/reset_card/list?page=1&size=100",
-        session.origin
-    );
-    if let Ok(body) = get_json(client, &card_url, headers).await {
-        apply_minimax_reset_cards(report, &body);
+}
+
+/// 返回是否遇到服务端拒绝当前访问令牌（HTTP 401 或 status_code == 1004），供上层触发一次强制续期重试。
+async fn query_minimax_account_once(
+    client: &reqwest::Client,
+    session: &McodeSession,
+    report: &mut ProviderReport,
+) -> bool {
+    let mut unauthorized = false;
+    if report.credit_balance.is_none() {
+        // 用量弹窗的「积分」来自会员信息，不来自 token_plan_credit.remaining_credits。
+        let credit_headers = mcode_headers(&session.access_token, session.agent_origin);
+        let credit_url = format!(
+            "{}/matrix/api/v1/commerce/get_membership_info",
+            session.agent_origin
+        );
+        match post_json(client, &credit_url, credit_headers).await {
+            Ok(body) => {
+                if body
+                    .pointer("/base_resp/status_code")
+                    .and_then(Value::as_i64)
+                    == Some(1004)
+                {
+                    unauthorized = true;
+                } else {
+                    apply_minimax_credits(report, &body);
+                }
+            }
+            Err(err) if err.contains("401") => unauthorized = true,
+            Err(_) => {}
+        }
     }
+    if report.windows.iter().all(|w| w.resets_left.is_none()) && report.resets_left.is_none() {
+        let headers = mcode_headers(&session.access_token, session.origin);
+        let card_url = format!(
+            "{}/backend/account/reset_card/list?page=1&size=100",
+            session.origin
+        );
+        match get_json(client, &card_url, headers).await {
+            Ok(body) => {
+                if body
+                    .pointer("/base_resp/status_code")
+                    .and_then(Value::as_i64)
+                    == Some(1004)
+                {
+                    unauthorized = true;
+                } else {
+                    apply_minimax_reset_cards(report, &body);
+                }
+            }
+            Err(err) if err.contains("401") => unauthorized = true,
+            Err(_) => {}
+        }
+    }
+    unauthorized
 }
 
 fn apply_minimax_credits(report: &mut ProviderReport, body: &Value) {
@@ -3036,6 +3094,29 @@ mod tests {
         assert_eq!(
             select_mcode_access_token(&auth, 1_000).map(|(_, token)| token),
             Some("fresh-token".to_string())
+        );
+
+        let multi_gen = serde_json::json!({
+            "records": {
+                "old": {
+                    "tokenType": "Bearer",
+                    "clientId": "mcode-public",
+                    "generation": 5,
+                    "expiresAtMs": 90_000,
+                    "accessToken": "old-gen-token"
+                },
+                "current_expired": {
+                    "tokenType": "Bearer",
+                    "clientId": "mcode-public",
+                    "generation": 30,
+                    "expiresAtMs": 10_000,
+                    "accessToken": "current-gen-token"
+                }
+            }
+        });
+        assert!(
+            select_mcode_access_token(&multi_gen, 20_000).is_none(),
+            "expired current generation must trigger refresh instead of falling back to an older generation"
         );
     }
 

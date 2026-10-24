@@ -23,7 +23,7 @@ All notable changes to this project are documented in this file.
 - 重置卡显示到期时间：智谱重置卡库存接口的每条记录带 `expireTime`，Codex 新增只读查询 `wham/rate-limit-reset-credits` 明细端点拿每张卡的 `expires_at`（数量仍以 usage 端点为准，明细失败只是无日期）。「重置卡：剩余 X 次」行追加可用卡中最早一张的到期日（北京时间 MM-DD，如「重置卡：剩余 5 次 · 最早 10-18 到期」）；GUI、TUI、快照与 `--json`（`resets_expire` 字段）一致。不可用卡、已兑换卡与解析失败的日期不参与计算，`expires_at: null`（永不过期）的卡也不参与。绝不调用消耗重置卡的 consume 接口。
 
 ### Fixed
-- 修复 MiniMax 积分和重置卡因本机 MiniMax Code 访问令牌过期而消失：没有可用访问令牌时，现在按官方 `oauth2/token` 协议自动续期，仅刷新当前（generation 最大）记录并原子写回 `auth.json` / `auth-state.json`，保留其它记录与轮换后的 refresh token；续期失败时不删除凭据、不伪造额度。隔离副本实测过期令牌可自动刷新并恢复积分与重置卡显示。
+- 修复 MiniMax 积分和重置卡因本机 MiniMax Code 访问令牌过期或被服务端提前吊销（401 / `status_code=1004`）而消失：只读取最新 `generation` 的凭据记录（不回退旧代记录），当本地已过期或接口返回未授权时按官方 `oauth2/token` 协议自动续期并重试一次，原子写回 `auth.json` / `auth-state.json` 并保留轮换后的 refresh token；续期失败时不删除凭据、不伪造额度。
 
 - 消除每轮刷新与用量扫描无条件拉起 `wsl.exe` 子进程导致的杀毒软件拦截：Windows 用户名与 WSL 用户名不同时，直接通过文件系统枚举 `\\wsl.localhost\<distro>\home\*`（及 `\\wsl$`）定位 `.omp/agent/agent.db` 并缓存路径，仅在纯文件探测全部未命中时才兜底调用一次 `wsl.exe`；部署二进制改由 WSL `cp` 直接替换，避免被终端安全软件标记为 `powershell.exe` 释放的可疑程序。
 - 修复同平台存在多个 omp OAuth 账号时，token 过期 401 刷新短暂切到另一账号额度（如 Google Antigravity 卡片偶发刷出满额度后又恢复）：SQLite 读取按 `rowid ASC` 稳定排序并为每条启用中的 OAuth 凭据记录 1-based `--account` 序号；调用 `omp token <provider>` 取 token 或 `--force-refresh` 刷新时显式绑定 `--account <N>`，只刷新并返回当前卡片对应账号的 token，不再触发 omp 跨账号额度排序或轮换。

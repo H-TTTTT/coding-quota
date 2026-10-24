@@ -205,7 +205,10 @@ fn candidate_homes(omp_db: Option<&Path>) -> Vec<PathBuf> {
     if let (Ok(drive), Ok(home_path)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
         push_unique(PathBuf::from(format!("{drive}{home_path}")));
     }
-    if omp_db.is_none() {
+    // omp 的 agent.db 可能在 Windows 用户目录下（如 C:\Users\<user>\.omp\agent\agent.db），
+    // 而 Claude Code 登录在 WSL（\\wsl.localhost\<distro>\home\<user>\.claude），
+    // 因此除非显式指定了 CODING_QUOTA_DB，否则始终枚举 WSL home 目录。
+    if std::env::var_os("CODING_QUOTA_DB").is_none() {
         let distros = [
             std::env::var("WSL_DISTRO_NAME").ok(),
             Some("Ubuntu-24.04".into()),

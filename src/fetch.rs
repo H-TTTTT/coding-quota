@@ -162,6 +162,20 @@ async fn maybe_fetch(
         }
         return Some(ProviderReport::missing(provider));
     };
+    // 正版 Claude Code 凭据由 WSL 内的 `claude` 自行续期：本地已过期时直接返回简短提示，
+    // 既不向 Anthropic 发送明知 401 的请求，也不写入指数退避（用户在 WSL 刷新后下一轮即可恢复）。
+    if provider == ProviderId::Claude
+        && cred.kind.as_deref() == Some("claude_code_oauth")
+        && cred
+            .expires_ms
+            .is_some_and(|exp| exp <= chrono::Utc::now().timestamp_millis())
+    {
+        return Some(ProviderReport::err(
+            ProviderId::Claude,
+            cred.identity,
+            "HTTP 401 登录令牌已过期",
+        ));
+    }
     // 连续失败、还在退避中的平台：本轮只回一条说明，旧额度由缓存回填
     if let Some(report) = deferred_report(provider, cred.identity.clone()) {
         return Some(report);
@@ -208,7 +222,9 @@ where
     };
     match request(client, &token).await {
         Ok(body) => Ok((token, body)),
-        Err(err) if err.starts_with("HTTP 401") => {
+        Err(err)
+            if err.starts_with("HTTP 401") && cred.kind.as_deref() != Some("claude_code_oauth") =>
+        {
             let Some(fresh) = credentials::secret_from_omp(omp_provider, cred.oauth_account, true)
             else {
                 return Err(err);
@@ -601,6 +617,10 @@ fn glm_count_window(
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+const CLAUDE_TRACE_URL: &str = "https://api.anthropic.com/cdn-cgi/trace";
+const CLAUDE_TRACE_FALLBACK_URL: &str = "https://claude.ai/cdn-cgi/trace";
+/// 与 WSL 内正版 `@anthropic-ai/claude-code` 保持一致的客户端标识，避免暴露第三方自研 UA。
+const CLAUDE_CLI_UA: &str = "claude-cli/2.1.309 (external, cli)";
 
 /// 套餐名很少变：进程内按账号记住 6 小时，避免每轮刷新都多查一次 profile。
 /// usage 接口限流很紧（与 omp / Claude Code 共用同一账号额度，omp 遇到 429 也不重试）。
@@ -624,10 +644,73 @@ fn remember_claude_plan(identity: Option<&str>, plan: &str) {
     }
 }
 
+fn claude_trace_is_us(trace: &str) -> bool {
+    trace.lines().any(|line| line.trim() == "loc=US")
+}
+
+fn claude_trace_summary(trace: &str) -> String {
+    let info: Vec<&str> = trace
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.starts_with("ip=") || line.starts_with("loc=") || line.starts_with("colo=")
+        })
+        .collect();
+    if info.is_empty() {
+        "trace empty".into()
+    } else {
+        info.join(" ")
+    }
+}
+
+/// 每次查询 Claude 官方额度前先用无凭据请求检验目标域名出口是否为美国节点（`loc=US`）。
+/// 若笔记本切换网络或软路由分流失效，立即在本地熔断，绝不携带 OAuth Token 裸连。
+async fn verify_claude_us_egress(client: &reqwest::Client) -> Result<(), String> {
+    let override_url = std::env::var("CLAUDE_TRACE_URL_OVERRIDE")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let primary = override_url.as_deref().unwrap_or(CLAUDE_TRACE_URL);
+    let fetch_trace = |url: String| async move {
+        let response = client
+            .get(&url)
+            .header(USER_AGENT, HeaderValue::from_static(CLAUDE_CLI_UA))
+            .send()
+            .await
+            .map_err(|err| brief(&err))?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status().as_u16()));
+        }
+        response.text().await.map_err(|err| brief(&err))
+    };
+    let trace = match fetch_trace(primary.to_string()).await {
+        Ok(text) if !text.trim().is_empty() => text,
+        Err(err) if override_url.is_some() => {
+            return Err(format!("blocked: Claude egress trace failed ({err})"));
+        }
+        _ => fetch_trace(CLAUDE_TRACE_FALLBACK_URL.to_string())
+            .await
+            .map_err(|err| format!("blocked: Claude egress trace failed ({err})"))?,
+    };
+    if claude_trace_is_us(&trace) {
+        Ok(())
+    } else {
+        Err(format!(
+            "blocked: Claude egress is not US ({})",
+            claude_trace_summary(&trace)
+        ))
+    }
+}
+
 /// Claude 订阅（Pro / Max）额度：Claude Code `/usage` 用的同一个 OAuth 接口。
-/// profile 只用来识别套餐，失败不影响额度显示；两者用同一 token，401 时一起刷新重试。
+/// profile 只用来识别套餐，失败不影响额度显示；若凭据文件已带套餐名则直接省去 profile 请求。
 async fn fetch_claude(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
     let identity = cred.identity.clone();
+    if let Err(err) = verify_claude_us_egress(client).await {
+        return ProviderReport::err(ProviderId::Claude, identity, err);
+    }
+    if let Some(plan) = cred.plan.as_deref() {
+        remember_claude_plan(identity.as_deref(), plan);
+    }
     let remembered = remembered_claude_plan(identity.as_deref());
     let need_profile = remembered.is_none();
     match fetch_with_refresh(client, &cred, "anthropic", move |client, token| {
@@ -1773,6 +1856,7 @@ fn bearer(token: &str) -> HeaderMap {
 /// 与 Claude Code / omp 一致带上 OAuth beta 头：目前服务端不强制，防日后收紧。
 fn claude_headers(token: &str) -> HeaderMap {
     let mut headers = bearer(token);
+    headers.insert(USER_AGENT, HeaderValue::from_static(CLAUDE_CLI_UA));
     headers.insert(
         "anthropic-beta",
         HeaderValue::from_static("oauth-2025-04-20"),
@@ -1855,18 +1939,19 @@ fn brief(err: &reqwest::Error) -> String {
     }
 }
 
-fn snippet(text: &str) -> String {
-    let flat: String = text.chars().filter(|c| !c.is_control()).take(120).collect();
-    sanitize(&flat)
-}
-
-/// HTTP 错误压成一行。429 的响应体（各家都是一大段 JSON）对用户没有信息量，
-/// 原样塞进挂件会把窗口撑到最大宽度，只说限流即可。
-fn http_error(status: reqwest::StatusCode, text: &str) -> String {
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        "HTTP 429 请求过于频繁，稍后自动重试".to_string()
-    } else {
-        format!("HTTP {status}: {}", snippet(text))
+/// HTTP 错误压成一行简短中文（保留 `HTTP <code>` 前缀供 401 刷新等内部判断）。
+/// 各家响应体往往是一大段 JSON 或 HTML，原样塞进挂件既把窗口横向撑宽又突兀刺眼。
+fn http_error(status: reqwest::StatusCode, _text: &str) -> String {
+    use reqwest::StatusCode;
+    match status {
+        StatusCode::UNAUTHORIZED => "HTTP 401 登录令牌已过期".to_string(),
+        StatusCode::FORBIDDEN => "HTTP 403 访问被拒绝".to_string(),
+        StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => {
+            format!("HTTP {} 请求超时", status.as_u16())
+        }
+        StatusCode::TOO_MANY_REQUESTS => "HTTP 429 请求过于频繁，稍后自动重试".to_string(),
+        s if s.is_server_error() => format!("HTTP {} 服务端暂不可用", s.as_u16()),
+        s => format!("HTTP {}", s.as_u16()),
     }
 }
 
@@ -3400,5 +3485,28 @@ mod tests {
                 word = window.1
             );
         }
+    }
+
+    #[test]
+    fn claude_egress_guard_requires_loc_us_and_headers_match_official_cli() {
+        assert!(claude_trace_is_us(
+            "fl=1164f88\nip=192.220.35.115\nloc=US\ncolo=LAX\n"
+        ));
+        assert!(!claude_trace_is_us("ip=1.2.3.4\nloc=CN\ncolo=HKG\n"));
+        assert!(!claude_trace_is_us("ip=1.2.3.4\nloc=HK\n"));
+        assert!(!claude_trace_is_us(""));
+        assert_eq!(
+            claude_trace_summary("fl=1\nip=192.220.35.115\nloc=CN\ncolo=SJC\n"),
+            "ip=192.220.35.115 loc=CN colo=SJC"
+        );
+        let headers = claude_headers("probe-token");
+        assert_eq!(
+            headers.get(USER_AGENT).and_then(|v| v.to_str().ok()),
+            Some("claude-cli/2.1.309 (external, cli)")
+        );
+        assert_eq!(
+            headers.get("anthropic-beta").and_then(|v| v.to_str().ok()),
+            Some("oauth-2025-04-20")
+        );
     }
 }

@@ -169,18 +169,33 @@ fn refresh_if_stale() {
         }
     }
     let mut store = guard.take().unwrap_or_default();
-    let root = credentials::omp_sessions_root();
-    if let Some(root) = root.as_deref() {
-        scan_root(&mut store, root);
+    let mut roots = Vec::new();
+    if let Some(root) = credentials::omp_sessions_root() {
+        roots.push(root);
+    }
+    for root in credentials::claude_projects_roots() {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    if !roots.is_empty() {
+        scan_roots(&mut store, &roots);
     }
     store.scanned_at = Some(Instant::now());
     *guard = Some(store);
 }
 
-/// 增量扫描：新文件与 (mtime, size) 变化的文件重新解析，其余复用缓存。
+#[cfg(test)]
 fn scan_root(store: &mut Store, root: &Path) {
+    scan_roots(store, &[root.to_path_buf()]);
+}
+
+/// 增量扫描：新文件与 (mtime, size) 变化的文件重新解析，其余复用缓存。
+fn scan_roots(store: &mut Store, roots: &[PathBuf]) {
     let mut current: Vec<PathBuf> = Vec::new();
-    collect_jsonl(root, &mut current);
+    for root in roots {
+        collect_jsonl(root, &mut current);
+    }
     let mut next: HashMap<PathBuf, (FileKey, Vec<UsageEvent>)> = HashMap::new();
     for path in current {
         let Ok(meta) = std::fs::metadata(&path) else {
@@ -218,7 +233,8 @@ fn parse_file(path: &Path) -> Vec<UsageEvent> {
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
-    let mut events = Vec::new();
+    let mut events: Vec<UsageEvent> = Vec::new();
+    let mut claude_msg_index: HashMap<String, usize> = HashMap::new();
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else {
             continue;
@@ -234,10 +250,16 @@ fn parse_file(path: &Path) -> Vec<UsageEvent> {
             .get("message")
             .filter(|message| message.is_object())
             .unwrap_or(&row);
+        let model_raw = message.get("model").and_then(Value::as_str);
+        let is_claude_native = message.get("provider").is_none()
+            && (row.get("type").and_then(Value::as_str) == Some("assistant")
+                || message.get("role").and_then(Value::as_str) == Some("assistant"))
+            && model_raw.is_some_and(|m| m.starts_with("claude-"));
         let Some(provider) = message
             .get("provider")
             .and_then(Value::as_str)
             .and_then(provider_id)
+            .or_else(|| is_claude_native.then_some(ProviderId::Claude))
         else {
             continue;
         };
@@ -246,6 +268,7 @@ fn parse_file(path: &Path) -> Vec<UsageEvent> {
         };
         let total = usage
             .get("totalTokens")
+            .or_else(|| usage.get("total_tokens"))
             .and_then(as_u64)
             .unwrap_or_else(|| {
                 [
@@ -254,6 +277,10 @@ fn parse_file(path: &Path) -> Vec<UsageEvent> {
                     "reasoningTokens",
                     "cacheRead",
                     "cacheWrite",
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
                 ]
                 .iter()
                 .map(|key| usage.get(*key).and_then(as_u64).unwrap_or(0))
@@ -262,23 +289,33 @@ fn parse_file(path: &Path) -> Vec<UsageEvent> {
         if total == 0 {
             continue;
         }
-        let model = message
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("未标记模型")
-            .to_string();
+        let model = model_raw.unwrap_or("未标记模型").to_string();
         let timestamp = row
             .get("timestamp")
             .or_else(|| message.get("timestamp"))
             .and_then(Value::as_str)
             .and_then(parse_timestamp)
             .unwrap_or(0);
-        events.push(UsageEvent {
+        let event = UsageEvent {
             provider,
             timestamp,
             model,
             total_tokens: total,
-        });
+        };
+        if is_claude_native {
+            if let Some(msg_id) = message
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                if let Some(&idx) = claude_msg_index.get(msg_id) {
+                    events[idx] = event;
+                    continue;
+                }
+                claude_msg_index.insert(msg_id.to_string(), events.len());
+            }
+        }
+        events.push(event);
     }
     events
 }
@@ -495,5 +532,55 @@ mod tests {
         assert!(!is_gemini_model("claude-opus-4-6"));
         assert!(!is_gemini_model("claude-3-7-sonnet"));
         assert!(!is_gemini_model("gpt-4o"));
+    }
+
+    #[test]
+    fn parse_file_supports_claude_code_native_assistant_jsonl_and_dedupes_message_id() {
+        let dir = std::env::temp_dir().join(format!("cq-claude-usage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = write_session(
+            &dir,
+            "claude.jsonl",
+            &[
+                serde_json::json!({
+                    "type": "assistant",
+                    "timestamp": "2026-10-23T01:00:00Z",
+                    "message": {
+                        "id": "msg_01stream",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4-5-20250929",
+                        "usage": {
+                            "input_tokens": 100,
+                            "cache_creation_input_tokens": 200,
+                            "cache_read_input_tokens": 300,
+                            "output_tokens": 10
+                        }
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "assistant",
+                    "timestamp": "2026-10-23T01:00:02Z",
+                    "message": {
+                        "id": "msg_01stream",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4-5-20250929",
+                        "usage": {
+                            "input_tokens": 100,
+                            "cache_creation_input_tokens": 200,
+                            "cache_read_input_tokens": 300,
+                            "output_tokens": 50
+                        }
+                    }
+                })
+                .to_string(),
+            ],
+        );
+        let events = parse_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(events.len(), 1, "同一 message.id 的流式分片只保留最终一条");
+        assert_eq!(events[0].provider, ProviderId::Claude);
+        assert_eq!(events[0].model, "claude-sonnet-4-5-20250929");
+        assert_eq!(events[0].total_tokens, 650);
     }
 }

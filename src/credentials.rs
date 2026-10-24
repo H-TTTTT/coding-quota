@@ -117,6 +117,9 @@ pub fn load() -> Result<CredentialSet> {
         set.db_path = Some(path.clone());
         load_from_sqlite(&path, &mut set)?;
     }
+    if set.claude.is_none() {
+        set.claude = load_claude_code_cred(set.db_path.as_deref());
+    }
     apply_env_overrides(&mut set);
     Ok(set)
 }
@@ -166,6 +169,122 @@ pub fn omp_sessions_root() -> Option<PathBuf> {
     find_omp_db().and_then(|db| db.parent().map(|dir| dir.join("sessions")))
 }
 
+/// Claude Code 会话日志目录列表（`~/.claude/projects`），供本地 Token 统计只读扫描。
+pub fn claude_projects_roots() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for home in candidate_homes(find_omp_db().as_deref()) {
+        let dir = home.join(".claude").join("projects");
+        if dir.is_dir() && !out.contains(&dir) {
+            out.push(dir);
+        }
+    }
+    out
+}
+
+fn candidate_homes(omp_db: Option<&Path>) -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    let mut push_unique = |path: PathBuf| {
+        if !homes.contains(&path) {
+            homes.push(path);
+        }
+    };
+    if let Some(home) = omp_db
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    {
+        push_unique(home.to_path_buf());
+    }
+    for key in ["HOME", "USERPROFILE"] {
+        if let Ok(root) = std::env::var(key) {
+            if !root.is_empty() {
+                push_unique(PathBuf::from(root));
+            }
+        }
+    }
+    if let (Ok(drive), Ok(home_path)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
+        push_unique(PathBuf::from(format!("{drive}{home_path}")));
+    }
+    if omp_db.is_none() {
+        let distros = [
+            std::env::var("WSL_DISTRO_NAME").ok(),
+            Some("Ubuntu-24.04".into()),
+            Some("Ubuntu".into()),
+            Some("Ubuntu-22.04".into()),
+            Some("Debian".into()),
+        ];
+        for distro in distros.iter().flatten() {
+            for prefix in [r"\\wsl.localhost", r"\\wsl$"] {
+                let home_root = PathBuf::from(format!(r"{prefix}\{distro}\home"));
+                if let Ok(entries) = std::fs::read_dir(home_root) {
+                    for entry in entries.flatten() {
+                        push_unique(entry.path());
+                    }
+                }
+            }
+        }
+    }
+    homes
+}
+
+fn load_claude_code_cred(omp_db: Option<&Path>) -> Option<StoredCred> {
+    for home in candidate_homes(omp_db) {
+        if let Some(cred) = load_claude_code_cred_from_home(&home) {
+            return Some(cred);
+        }
+    }
+    None
+}
+
+/// 只读加载正版 Claude Code CLI 的 `~/.claude/.credentials.json` 与 `~/.claude.json`。
+/// 标记 `kind = "claude_code_oauth"` 且 `oauth_account = None`，后续遇到 401 绝不调用
+/// omp 抢刷 refresh_token，续期完全由用户在 WSL 启动正版 `claude` 时自行完成。
+fn load_claude_code_cred_from_home(home: &Path) -> Option<StoredCred> {
+    let cred_path = home.join(".claude").join(".credentials.json");
+    let raw = std::fs::read_to_string(cred_path).ok()?;
+    let root: Value = serde_json::from_str(&raw).ok()?;
+    let oauth = root.get("claudeAiOauth")?;
+    let access = first_string(oauth, &["accessToken", "access_token", "access"])?;
+    let expires_ms = first_i64(oauth, &["expiresAt", "expires_at", "expires"]);
+    let plan = claude_code_plan(oauth);
+    let identity = std::fs::read_to_string(home.join(".claude.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|val| {
+            val.get("oauthAccount")
+                .and_then(|acct| first_string(acct, &["emailAddress", "email"]))
+        });
+    Some(StoredCred {
+        identity,
+        access: Some(access),
+        expires_ms,
+        account_id: None,
+        plan,
+        project_id: None,
+        kind: Some("claude_code_oauth".into()),
+        oauth_account: None,
+    })
+}
+
+fn claude_code_plan(oauth: &Value) -> Option<String> {
+    let tier = first_string(oauth, &["rateLimitTier", "rate_limit_tier"]).unwrap_or_default();
+    for (marker, name) in [("max_20x", "Max 20x"), ("max_5x", "Max 5x")] {
+        if tier.contains(marker) {
+            return Some(name.to_string());
+        }
+    }
+    let sub = first_string(oauth, &["subscriptionType", "subscription_type"])?;
+    let sub = sub.strip_prefix("claude_").unwrap_or(&sub);
+    let mut chars = sub.chars();
+    let first = chars.next()?;
+    Some(
+        first
+            .to_uppercase()
+            .chain(chars)
+            .collect::<String>()
+            .replace('_', " "),
+    )
+}
 fn wsl_unc_candidates() -> Vec<PathBuf> {
     let mut homes = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
@@ -948,5 +1067,40 @@ mod tests {
         })();
         let _ = std::fs::remove_file(&path);
         result
+    }
+
+    #[test]
+    fn claude_code_credentials_file_loads_token_plan_and_email_without_omp_row() -> Result<()> {
+        let home = std::env::temp_dir().join(format!(
+            "cq-claude-code-home-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir)?;
+        std::fs::write(
+            claude_dir.join(".credentials.json"),
+            r#"{
+                "claudeAiOauth": {
+                    "accessToken": "cc-access-token",
+                    "refreshToken": "cc-refresh-token",
+                    "expiresAt": 1792746737902,
+                    "subscriptionType": "pro",
+                    "rateLimitTier": "default_claude_ai"
+                }
+            }"#,
+        )?;
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"oauthAccount": {"emailAddress": "ht9989@gmail.com"}}"#,
+        )?;
+        let cred = load_claude_code_cred_from_home(&home).expect("claude code cred loaded");
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(cred.access.as_deref(), Some("cc-access-token"));
+        assert_eq!(cred.plan.as_deref(), Some("Pro"));
+        assert_eq!(cred.identity.as_deref(), Some("ht9989@gmail.com"));
+        assert_eq!(cred.kind.as_deref(), Some("claude_code_oauth"));
+        assert_eq!(cred.oauth_account, None);
+        Ok(())
     }
 }

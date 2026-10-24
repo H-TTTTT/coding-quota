@@ -883,7 +883,26 @@ fn error_cn(error: &str) -> String {
         other if other.starts_with("missing token") => {
             other.replacen("missing token", "缺少访问令牌", 1)
         }
-        other => other.to_string(),
+        other
+            if other.contains("401")
+                || other.contains("expired")
+                || other.contains("authentication_error")
+                || other.contains("过期") =>
+        {
+            "登录令牌已过期".into()
+        }
+        other if other.contains("403") => "访问被拒绝".into(),
+        other if other.contains("429") || other.contains("频繁") => "请求过于频繁".into(),
+        other if other.contains("not US") || other.contains("egress") => "非美国出口已拦截".into(),
+        other => other
+            .split(['{', '\n', '\r'])
+            .next()
+            .unwrap_or(other)
+            .trim()
+            .trim_end_matches([':', '：', ' '])
+            .chars()
+            .take(32)
+            .collect(),
     }
 }
 

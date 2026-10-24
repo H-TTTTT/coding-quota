@@ -819,16 +819,47 @@ fn remaining_text(report: &ProviderReport, window: &QuotaWindow) -> String {
     }
 }
 
+/// 将底层错误收敛为简短中文短语，剥离任何残留 JSON/多行堆栈，防止把挂件窗口撑宽。
+fn short_error_cn(error: &str) -> String {
+    match error {
+        "no credential found" => "未找到凭据".into(),
+        "invalid quota payload" => "额度响应格式无效".into(),
+        "no endpoint responded" => "额度接口无响应".into(),
+        other if other.starts_with("missing token") => "缺少访问令牌".into(),
+        other
+            if other.contains("401")
+                || other.contains("expired")
+                || other.contains("authentication_error")
+                || other.contains("过期") =>
+        {
+            "登录令牌已过期".into()
+        }
+        other if other.contains("403") => "访问被拒绝".into(),
+        other if other.contains("429") || other.contains("频繁") => "请求过于频繁".into(),
+        other if other.contains("not US") || other.contains("egress") => "非美国出口已拦截".into(),
+        other => {
+            let head = other
+                .split(['{', '\n', '\r'])
+                .next()
+                .unwrap_or(other)
+                .trim();
+            let trimmed = head.trim_end_matches([':', '：', ' ']);
+            trimmed.chars().take(28).collect()
+        }
+    }
+}
+
 /// 失败提示文案。带回填数据时标明显示的是上一轮的数据（时间取旧报表的
 /// fetched_at，「x分钟前」如实反映数据年龄）。
 fn error_text(report: &ProviderReport) -> String {
     let Some(error) = &report.error else {
         return String::new();
     };
+    let brief = short_error_cn(error);
     if !report.has_data() {
-        error.clone()
+        brief
     } else {
-        format!("更新失败，显示{}数据：{error}", ago_cn(report.fetched_at))
+        format!("{}数据 · {brief}", ago_cn(report.fetched_at))
     }
 }
 
@@ -1077,9 +1108,14 @@ fn draw_report(ui: &mut egui::Ui, report: &ProviderReport) -> egui::Rect {
             }
             // 有回填额度或余额时，保留旧值并附上错误与数据年龄。
             if report.error.is_some() {
+                let err_color = if stale {
+                    egui::Color32::from_rgb(205, 175, 130)
+                } else {
+                    egui::Color32::from_rgb(215, 105, 95)
+                };
                 ui.label(
                     egui::RichText::new(error_text(report))
-                        .color(egui::Color32::from_rgb(190, 50, 40))
+                        .color(err_color)
                         .small(),
                 );
                 if !stale {

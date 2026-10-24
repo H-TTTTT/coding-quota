@@ -6,6 +6,7 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- 支持直接只读复用 WSL / 本机正版 Claude Code（`~/.claude/.credentials.json` 与 `~/.claude.json`）的 OAuth 凭据与本地会话用量（`~/.claude/projects/**/*.jsonl`）：当 omp `agent.db` 中未登录 `anthropic` 时自动回退读取，省去 `/api/oauth/profile` 请求且不主动抢刷 `refresh_token`；每次请求 Claude 官方额度前先经无凭据的 `api.anthropic.com/cdn-cgi/trace`（兜底 `claude.ai/cdn-cgi/trace`）校验出口为 `loc=US`，非美国出口立即本地熔断不发 Token，请求头对齐正版 `claude-cli` UA。
 - MiniMax 卡片在本机 MiniMax Code 登录态仍有效时，额外显示积分余额和周重置卡库存。额度窗口仍来自订阅 Key 的 `token_plan/remains`；积分与用量弹窗一致，读 `POST /matrix/api/v1/commerce/get_membership_info` 的 `op_credit_summary.total_remaining_amount`（该字段缺失时才用 `opcredit_balance`，确认为 0 也显示），不使用 `token_plan_credit.remaining_credits`。重置卡只读 `reset_card/list` 的数量和最早到期日。登录过期或接口失败时不编造 0，也不改写 MiniMax Code 的登录文件。
 - 新增 MiniMax 国内编程套餐卡片：自动读取 omp 中有效的 `minimax-code-cn` 套餐 API key，只读查询官方 `GET https://api.minimaxi.com/v1/token_plan/remains`。显示 5 小时和每周剩余额度、重置倒计时，接入 GUI、TUI、托盘显示开关、拖拽排序、快照、JSON 与本机用量统计；可用 `--provider minimax` / `minimax-code-cn` 单独查询。以官方剩余百分比为准，计数字段为零时不伪造套餐容量；0% 剩余正常显示，未启用或缺少额度的窗口不伪造可用额度。读取实时 SQLite WAL，支持刚新增的凭据与软删除登出。
 - 托盘菜单新增「刷新频率」选项（1 / 3 / 5 / 10 / 30 分钟，默认 5 分钟），选择立即生效，持久化在 `%APPDATA%\coding-quota\refresh_interval_secs.txt`。
@@ -24,6 +25,7 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 - 修复 MiniMax 积分和重置卡因本机 MiniMax Code 访问令牌过期或被服务端提前吊销（401 / `status_code=1004`）而消失：只读取最新 `generation` 的凭据记录（不回退旧代记录），当本地已过期或接口返回未授权时按官方 `oauth2/token` 协议自动续期并重试一次，原子写回 `auth.json` / `auth-state.json` 并保留轮换后的 refresh token；续期失败时不删除凭据、不伪造额度。
+- 精简 HTTP 报错与旧数据回填提示：401/403/408/5xx 统一收敛为简短中文短语（如 `HTTP 401 登录令牌已过期`、`HTTP 5xx 服务端暂不可用`），不再拼接服务端返回的原始 JSON 撑宽挂件窗口；有缓存额度回填时简化为单行柔和暖色提示（如 `16小时前数据 · 登录令牌已过期`），并对本地已知过期的 Claude Code 令牌跳过网络请求与指数退避，WSL 刷新令牌后下一轮即恢复。
 
 - 消除每轮刷新与用量扫描无条件拉起 `wsl.exe` 子进程导致的杀毒软件拦截：Windows 用户名与 WSL 用户名不同时，直接通过文件系统枚举 `\\wsl.localhost\<distro>\home\*`（及 `\\wsl$`）定位 `.omp/agent/agent.db` 并缓存路径，仅在纯文件探测全部未命中时才兜底调用一次 `wsl.exe`；部署二进制改由 WSL `cp` 直接替换，避免被终端安全软件标记为 `powershell.exe` 释放的可疑程序。
 - 修复同平台存在多个 omp OAuth 账号时，token 过期 401 刷新短暂切到另一账号额度（如 Google Antigravity 卡片偶发刷出满额度后又恢复）：SQLite 读取按 `rowid ASC` 稳定排序并为每条启用中的 OAuth 凭据记录 1-based `--account` 序号；调用 `omp token <provider>` 取 token 或 `--force-refresh` 刷新时显式绑定 `--account <N>`，只刷新并返回当前卡片对应账号的 token，不再触发 omp 跨账号额度排序或轮换。

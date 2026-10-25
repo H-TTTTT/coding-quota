@@ -384,6 +384,14 @@ pub fn label_cn(label: &str) -> String {
                 format!("{days} 天限额")
             } else if let Some(model) = other.strip_prefix("Weekly · ") {
                 format!("每周额度 · {model}")
+            } else if let Some((prefix, rest)) = other.split_once(" · ") {
+                if prefix.starts_with('★')
+                    || prefix.chars().next().is_some_and(|c| c.is_ascii_digit())
+                {
+                    format!("{prefix} · {}", label_cn(rest))
+                } else {
+                    other.to_string()
+                }
             } else {
                 other.to_string()
             }

@@ -41,7 +41,12 @@ pub struct StoredCred {
     /// 避免多账号时 401 刷新切到另一个账号的 token。API key 凭据为 None。
     pub oauth_account: Option<usize>,
 }
-
+#[derive(Debug, Clone)]
+pub struct ClaudeProfile {
+    pub slot: String,
+    pub active: bool,
+    pub cred: StoredCred,
+}
 #[derive(Debug, Clone, Default)]
 pub struct CredentialSet {
     pub db_path: Option<PathBuf>,
@@ -230,8 +235,35 @@ fn candidate_homes(omp_db: Option<&Path>) -> Vec<PathBuf> {
     homes
 }
 
+pub fn load_claude_code_profiles(omp_db: Option<&Path>) -> Vec<ClaudeProfile> {
+    for home in candidate_homes(omp_db) {
+        let profiles = load_claude_code_profiles_from_home(&home);
+        if !profiles.is_empty() {
+            return profiles;
+        }
+    }
+    Vec::new()
+}
+
 fn load_claude_code_cred(omp_db: Option<&Path>) -> Option<StoredCred> {
     for home in candidate_homes(omp_db) {
+        let profiles = load_claude_code_profiles_from_home(&home);
+        if profiles.len() >= 2 {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if let Some(p) = profiles
+                .iter()
+                .find(|p| p.active && p.cred.expires_ms.map_or(true, |exp| exp > now_ms))
+                .or_else(|| {
+                    profiles
+                        .iter()
+                        .find(|p| p.cred.expires_ms.map_or(true, |exp| exp > now_ms))
+                })
+                .or_else(|| profiles.iter().find(|p| p.active))
+                .or_else(|| profiles.first())
+            {
+                return Some(p.cred.clone());
+            }
+        }
         if let Some(cred) = load_claude_code_cred_from_home(&home) {
             return Some(cred);
         }
@@ -243,14 +275,20 @@ fn load_claude_code_cred(omp_db: Option<&Path>) -> Option<StoredCred> {
 /// 标记 `kind = "claude_code_oauth"` 且 `oauth_account = None`，后续遇到 401 绝不调用
 /// omp 抢刷 refresh_token，续期完全由用户在 WSL 启动正版 `claude` 时自行完成。
 fn load_claude_code_cred_from_home(home: &Path) -> Option<StoredCred> {
-    let cred_path = home.join(".claude").join(".credentials.json");
+    load_claude_code_cred_from_files(
+        &home.join(".claude").join(".credentials.json"),
+        &home.join(".claude.json"),
+    )
+}
+
+fn load_claude_code_cred_from_files(cred_path: &Path, state_path: &Path) -> Option<StoredCred> {
     let raw = std::fs::read_to_string(cred_path).ok()?;
     let root: Value = serde_json::from_str(&raw).ok()?;
     let oauth = root.get("claudeAiOauth")?;
     let access = first_string(oauth, &["accessToken", "access_token", "access"])?;
     let expires_ms = first_i64(oauth, &["expiresAt", "expires_at", "expires"]);
     let plan = claude_code_plan(oauth);
-    let identity = std::fs::read_to_string(home.join(".claude.json"))
+    let identity = std::fs::read_to_string(state_path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|val| {
@@ -267,6 +305,64 @@ fn load_claude_code_cred_from_home(home: &Path) -> Option<StoredCred> {
         kind: Some("claude_code_oauth".into()),
         oauth_account: None,
     })
+}
+
+fn load_claude_code_profiles_from_home(home: &Path) -> Vec<ClaudeProfile> {
+    let root = home.join(".claude-profiles");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let current = std::fs::read_to_string(root.join(".current"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let active_cred = load_claude_code_cred_from_home(home);
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(slot) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if slot.starts_with('.') {
+            continue;
+        }
+        let is_active = current.as_deref() == Some(slot.as_str());
+        let slot_cred = load_claude_code_cred_from_files(
+            &path.join(".credentials.json"),
+            &path.join(".claude.json"),
+        );
+        let cred = match (is_active, active_cred.clone(), slot_cred) {
+            (true, Some(act), Some(saved)) => {
+                if act.expires_ms.unwrap_or(0) >= saved.expires_ms.unwrap_or(0) {
+                    act
+                } else {
+                    saved
+                }
+            }
+            (true, Some(act), None) => act,
+            (_, _, Some(saved)) => saved,
+            _ => continue,
+        };
+        out.push(ClaudeProfile {
+            slot,
+            active: is_active,
+            cred,
+        });
+    }
+    out.sort_by(
+        |a, b| match (a.slot.parse::<u32>(), b.slot.parse::<u32>()) {
+            (Ok(na), Ok(nb)) => na.cmp(&nb),
+            _ => a.slot.cmp(&b.slot),
+        },
+    );
+    out
 }
 
 fn claude_code_plan(oauth: &Value) -> Option<String> {

@@ -713,10 +713,14 @@ async fn verify_claude_us_egress(client: &reqwest::Client) -> Result<(), String>
 
 /// Claude 订阅（Pro / Max）额度：Claude Code `/usage` 用的同一个 OAuth 接口。
 /// profile 只用来识别套餐，失败不影响额度显示；若凭据文件已带套餐名则直接省去 profile 请求。
-async fn fetch_claude(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
+async fn fetch_single_claude(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
     let identity = cred.identity.clone();
-    if let Err(err) = verify_claude_us_egress(client).await {
-        return ProviderReport::err(ProviderId::Claude, identity, err);
+    if cred.kind.as_deref() == Some("claude_code_oauth")
+        && cred
+            .expires_ms
+            .is_some_and(|exp| exp <= chrono::Utc::now().timestamp_millis())
+    {
+        return ProviderReport::err(ProviderId::Claude, identity, "HTTP 401 登录令牌已过期");
     }
     if let Some(plan) = cred.plan.as_deref() {
         remember_claude_plan(identity.as_deref(), plan);
@@ -748,6 +752,84 @@ async fn fetch_claude(client: &reqwest::Client, cred: StoredCred) -> ProviderRep
         }
         Err(err) => ProviderReport::err(ProviderId::Claude, identity, err),
     }
+}
+
+fn short_claude_tag(slot: &str, active: bool, identity: Option<&str>) -> String {
+    let name = identity
+        .and_then(|email| email.split('@').next())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("account");
+    if active {
+        format!("★{slot}·{name}")
+    } else {
+        format!("{slot}·{name}")
+    }
+}
+
+async fn fetch_claude(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
+    let identity = cred.identity.clone();
+    if let Err(err) = verify_claude_us_egress(client).await {
+        return ProviderReport::err(ProviderId::Claude, identity, err);
+    }
+    if cred.kind.as_deref() == Some("claude_code_oauth") {
+        let profiles = credentials::load_claude_code_profiles(None);
+        if profiles.len() >= 2 {
+            let total = profiles.len();
+            let mut results = Vec::with_capacity(total);
+            for p in &profiles {
+                results.push(fetch_single_claude(client, p.cred.clone()).await);
+            }
+            let mut windows = Vec::new();
+            let mut active_identity = None;
+            let mut first_plan = None;
+            let mut last_err = None;
+            for (p, rep) in profiles.iter().zip(results.into_iter()) {
+                if p.active {
+                    if let Some(id) = p.cred.identity.as_deref() {
+                        active_identity = Some(format!("★{}: {id} (共{total}号)", p.slot));
+                    }
+                }
+                if first_plan.is_none() && rep.plan.is_some() {
+                    first_plan = rep.plan.clone();
+                }
+                let tag = short_claude_tag(&p.slot, p.active, p.cred.identity.as_deref());
+                if !rep.windows.is_empty() {
+                    for mut w in rep.windows {
+                        w.id = format!("claude-{}-{}", p.slot, w.id);
+                        w.label = format!("{tag} · {}", w.label);
+                        windows.push(w);
+                    }
+                } else if let Some(err) = rep.error {
+                    last_err = Some(format!("{tag}: {err}"));
+                }
+            }
+            let header_identity = active_identity.or_else(|| {
+                profiles.first().and_then(|p| {
+                    p.cred
+                        .identity
+                        .as_ref()
+                        .map(|id| format!("{id} (共{total}号)"))
+                })
+            });
+            if !windows.is_empty() {
+                let mut out = ProviderReport::ok(
+                    ProviderId::Claude,
+                    "Claude",
+                    header_identity,
+                    first_plan,
+                    windows,
+                );
+                out.error = last_err;
+                return out;
+            }
+            return ProviderReport::err(
+                ProviderId::Claude,
+                header_identity,
+                last_err.unwrap_or_else(|| "no quota windows".into()),
+            );
+        }
+    }
+    fetch_single_claude(client, cred).await
 }
 
 /// 旧字段 five_hour / seven_day / seven_day_{opus,sonnet} 与新版 limits 数组

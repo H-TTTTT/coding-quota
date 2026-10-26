@@ -62,6 +62,10 @@ impl Cache {
     pub fn snapshot(&self) -> Vec<ProviderReport> {
         self.reports.values().cloned().collect()
     }
+    /// 获取指定平台仍在有效期内的缓存报表（供多槽位非激活账号只读复用上次额度，避免多账号并发联网）。
+    pub fn get(&self, provider: ProviderId) -> Option<&ProviderReport> {
+        self.reports.get(&provider).filter(|report| usable(report))
+    }
 
     /// 失败或退避中的报表用旧值回填（错误信息与旧数据的 `fetched_at` 都保留，
     /// 界面上的「x 分钟前」才如实反映数据年龄）。没有凭据、或旧值已过期则不回填。
@@ -79,7 +83,9 @@ impl Cache {
         report.plan.clone_from(&stale.plan);
         report.resets_left = stale.resets_left;
         report.credit_balance.clone_from(&stale.credit_balance);
-        report.usage.clone_from(&stale.usage);
+        if report.usage.is_none() {
+            report.usage.clone_from(&stale.usage);
+        }
         report.windows.clone_from(&stale.windows);
         report.fetched_at = stale.fetched_at;
     }

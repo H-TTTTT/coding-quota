@@ -193,9 +193,15 @@ async fn maybe_fetch(
         // Devin 走 CLI 横幅，不使用 CredentialSet 里的凭据
         ProviderId::Devin => fetch_devin(),
     };
-    // 成功清零、失败退避：下一轮不再按原节奏硬撞（Claude 的端点与 Claude Code 共享限流）
+    // 成功清零、失败退避：下一轮不再按原节奏硬撞（Claude 的端点与 Claude Code 共享限流）。
+    // 但 Claude Code 本地令牌过期并未发起网络请求，不计入指数退避，以便 WSL 刷新后下一轮立即恢复。
+    let local_claude_expired = provider == ProviderId::Claude
+        && report
+            .error
+            .as_deref()
+            .is_some_and(|err| err.contains("登录令牌已过期"));
     if let Ok(mut state) = backoff().lock() {
-        if report.error.is_none() {
+        if report.error.is_none() || local_claude_expired {
             state.succeed(provider);
         } else {
             state.fail(provider);
@@ -766,6 +772,33 @@ fn short_claude_tag(slot: &str, active: bool, identity: Option<&str>) -> String 
     }
 }
 
+fn cached_claude_slot_windows(
+    cached_windows: &[QuotaWindow],
+    slot: &str,
+    tag: &str,
+    now: DateTime<Utc>,
+) -> Vec<QuotaWindow> {
+    let prefix = format!("claude-{slot}-");
+    cached_windows
+        .iter()
+        .filter(|w| w.id.starts_with(&prefix))
+        .map(|w| {
+            let mut cloned = w.clone();
+            let suffix = w
+                .label
+                .split_once(" · ")
+                .map(|(_, rest)| rest)
+                .unwrap_or(w.label.as_str());
+            cloned.label = format!("{tag} · {suffix}");
+            if cloned.reset_at.is_some_and(|reset| reset <= now) {
+                cloned.used_fraction = 0.0;
+                cloned.reset_at = None;
+            }
+            cloned
+        })
+        .collect()
+}
+
 async fn fetch_claude(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
     let identity = cred.identity.clone();
     if let Err(err) = verify_claude_us_egress(client).await {
@@ -775,32 +808,60 @@ async fn fetch_claude(client: &reqwest::Client, cred: StoredCred) -> ProviderRep
         let profiles = credentials::load_claude_code_profiles(None);
         if profiles.len() >= 2 {
             let total = profiles.len();
-            let mut results = Vec::with_capacity(total);
-            for p in &profiles {
-                results.push(fetch_single_claude(client, p.cred.clone()).await);
-            }
+            let has_explicit_active = profiles.iter().any(|p| p.active);
+            let cached = crate::cache::Cache::load();
+            let cached_report = cached.get(ProviderId::Claude);
+            let cached_windows = cached_report
+                .map(|r| r.windows.as_slice())
+                .unwrap_or_default();
+            let now = Utc::now();
+            let now_ms = now.timestamp_millis();
+
             let mut windows = Vec::new();
             let mut active_identity = None;
-            let mut first_plan = None;
-            let mut last_err = None;
-            for (p, rep) in profiles.iter().zip(results.into_iter()) {
-                if p.active {
+            let mut first_plan = cached_report.and_then(|r| r.plan.clone());
+            let mut active_err = None;
+            let mut any_live = false;
+
+            for (idx, p) in profiles.iter().enumerate() {
+                let is_active = p.active || (!has_explicit_active && idx == 0);
+                if is_active {
                     if let Some(id) = p.cred.identity.as_deref() {
                         active_identity = Some(format!("★{}: {id} (共{total}号)", p.slot));
                     }
                 }
-                if first_plan.is_none() && rep.plan.is_some() {
+                if first_plan.is_none() && p.cred.plan.is_some() {
+                    first_plan = p.cred.plan.clone();
+                }
+                let tag = short_claude_tag(&p.slot, is_active, p.cred.identity.as_deref());
+                let slot_cached = cached_claude_slot_windows(cached_windows, &p.slot, &tag, now);
+
+                // 防封原则：常规轮询只对当前激活槽位发起网络请求，不在同一连接/同一秒并发轮询多个账号；
+                // 非激活槽位优先直接复用本地缓存额度，仅当尚无缓存且本地令牌未过期时才冷启动查一次。
+                let should_query = is_active
+                    || (slot_cached.is_empty()
+                        && p.cred.expires_ms.map_or(true, |exp| exp > now_ms));
+                if !should_query {
+                    windows.extend(slot_cached);
+                    continue;
+                }
+
+                let rep = fetch_single_claude(client, p.cred.clone()).await;
+                if rep.plan.is_some() {
                     first_plan = rep.plan.clone();
                 }
-                let tag = short_claude_tag(&p.slot, p.active, p.cred.identity.as_deref());
                 if !rep.windows.is_empty() {
+                    any_live = true;
                     for mut w in rep.windows {
                         w.id = format!("claude-{}-{}", p.slot, w.id);
                         w.label = format!("{tag} · {}", w.label);
                         windows.push(w);
                     }
-                } else if let Some(err) = rep.error {
-                    last_err = Some(format!("{tag}: {err}"));
+                } else {
+                    if is_active {
+                        active_err = rep.error.map(|err| format!("{tag}: {err}"));
+                    }
+                    windows.extend(slot_cached);
                 }
             }
             let header_identity = active_identity.or_else(|| {
@@ -811,21 +872,19 @@ async fn fetch_claude(client: &reqwest::Client, cred: StoredCred) -> ProviderRep
                         .map(|id| format!("{id} (共{total}号)"))
                 })
             });
-            if !windows.is_empty() {
-                let mut out = ProviderReport::ok(
+            if any_live && active_err.is_none() {
+                return ProviderReport::ok(
                     ProviderId::Claude,
                     "Claude",
                     header_identity,
                     first_plan,
                     windows,
                 );
-                out.error = last_err;
-                return out;
             }
             return ProviderReport::err(
                 ProviderId::Claude,
                 header_identity,
-                last_err.unwrap_or_else(|| "no quota windows".into()),
+                active_err.unwrap_or_else(|| "HTTP 401 登录令牌已过期".into()),
             );
         }
     }
@@ -3601,5 +3660,37 @@ mod tests {
             headers.get("anthropic-beta").and_then(|v| v.to_str().ok()),
             Some("oauth-2025-04-20")
         );
+    }
+
+    #[test]
+    fn cached_claude_slot_windows_updates_active_tag_and_resets_elapsed_window() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 26, 10, 0, 0).unwrap();
+        let past = Some(now - chrono::Duration::minutes(5));
+        let future = Some(now + chrono::Duration::days(5));
+        let cached = vec![
+            QuotaWindow::from_used_percent(
+                "claude-1-claude-5h",
+                "★1·ht9989 · 5h window",
+                40.0,
+                past,
+            ),
+            QuotaWindow::from_used_percent(
+                "claude-1-claude-week",
+                "★1·ht9989 · Weekly",
+                12.0,
+                future,
+            ),
+        ];
+        let reused = cached_claude_slot_windows(&cached, "1", "1·ht9989", now);
+        assert_eq!(reused.len(), 2);
+        assert_eq!(reused[0].label, "1·ht9989 · 5h window");
+        assert_eq!(
+            reused[0].used_fraction, 0.0,
+            "已过重置时刻的缓存窗口应归零（剩余 100%）"
+        );
+        assert_eq!(reused[0].reset_at, None);
+        assert_eq!(reused[1].label, "1·ht9989 · Weekly");
+        assert!((reused[1].used_fraction - 0.12).abs() < 1e-9);
+        assert_eq!(reused[1].reset_at, future);
     }
 }

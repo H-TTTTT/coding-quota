@@ -24,6 +24,7 @@ All notable changes to this project are documented in this file.
 - 重置卡显示到期时间：智谱重置卡库存接口的每条记录带 `expireTime`，Codex 新增只读查询 `wham/rate-limit-reset-credits` 明细端点拿每张卡的 `expires_at`（数量仍以 usage 端点为准，明细失败只是无日期）。「重置卡：剩余 X 次」行追加可用卡中最早一张的到期日（北京时间 MM-DD，如「重置卡：剩余 5 次 · 最早 10-18 到期」）；GUI、TUI、快照与 `--json`（`resets_expire` 字段）一致。不可用卡、已兑换卡与解析失败的日期不参与计算，`expires_at: null`（永不过期）的卡也不参与。绝不调用消耗重置卡的 consume 接口。
 
 ### Fixed
+- 修复 Claude 多账号槽位模式下非激活槽位令牌过期导致整张卡片进入指数退避并回退为灰态旧数据（严格遵守防封规则）：常规轮询仅对当前激活槽位（`★`）发起网络请求，不在同一连接/同一秒并发轮询多个 Claude 账号，也绝不从第三方二进制代刷 `.credentials.json`；非激活槽位直接只读复用 `last_good.json` 缓存额度（重置时刻已过的窗口自动归零回满），不因备用槽位令牌过期污染激活槽位的实时额度或触发指数退避；同时 `cache.backfill` 不再拿旧缓存覆盖本轮已算出的实时本地 Token 用量。
 - 修复 MiniMax 积分和重置卡因本机 MiniMax Code 访问令牌过期或被服务端提前吊销（401 / `status_code=1004`）而消失：只读取最新 `generation` 的凭据记录（不回退旧代记录），当本地已过期或接口返回未授权时按官方 `oauth2/token` 协议自动续期并重试一次，原子写回 `auth.json` / `auth-state.json` 并保留轮换后的 refresh token；续期失败时不删除凭据、不伪造额度。
 - 精简 HTTP 报错与旧数据回填提示：401/403/408/5xx 统一收敛为简短中文短语（如 `HTTP 401 登录令牌已过期`、`HTTP 5xx 服务端暂不可用`），不再拼接服务端返回的原始 JSON 撑宽挂件窗口；有缓存额度回填时简化为单行柔和暖色提示（如 `16小时前数据 · 登录令牌已过期`），并对本地已知过期的 Claude Code 令牌跳过网络请求与指数退避，WSL 刷新令牌后下一轮即恢复。
 

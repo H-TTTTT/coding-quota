@@ -30,9 +30,6 @@ pub struct StoredCred {
     pub expires_ms: Option<i64>,
     pub account_id: Option<String>,
     pub plan: Option<String>,
-    /// Antigravity 的 Google Cloud 项目 ID（data 里的 `projectId` / `project_id`），
-    /// 查询共享 Claude/GPT 桶时要用；其他平台没有这个概念。
-    pub project_id: Option<String>,
     /// omp 凭据类型（"oauth" / "api_key"）：Devin 的 token 进 protobuf metadata
     /// 时 OAuth 需要加 devin-session-token$ 前缀，API key 不加。
     pub kind: Option<String>,
@@ -57,7 +54,6 @@ pub struct CredentialSet {
     pub kimi: Option<StoredCred>,
     pub cursor: Option<StoredCred>,
     pub devin: Option<StoredCred>,
-    pub antigravity: Option<StoredCred>,
     pub deepseek: Option<StoredCred>,
     pub minimax: Option<StoredCred>,
 }
@@ -235,6 +231,28 @@ fn candidate_homes(omp_db: Option<&Path>) -> Vec<PathBuf> {
     homes
 }
 
+/// Antigravity Hub 的本地 RPC 发现文件；只读，不接触系统凭据库或 refresh token。
+pub fn antigravity_daemon_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for home in candidate_homes(None) {
+        let dir = home.join(".gemini/antigravity/daemon");
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("hub_") && name.ends_with(".json") && path.is_file() {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    files.sort_by_cached_key(|path| {
+        std::cmp::Reverse(path.metadata().and_then(|meta| meta.modified()).ok())
+    });
+    files
+}
+
 pub fn load_claude_code_profiles(omp_db: Option<&Path>) -> Vec<ClaudeProfile> {
     for home in candidate_homes(omp_db) {
         let profiles = load_claude_code_profiles_from_home(&home);
@@ -301,7 +319,6 @@ fn load_claude_code_cred_from_files(cred_path: &Path, state_path: &Path) -> Opti
         expires_ms,
         account_id: None,
         plan,
-        project_id: None,
         kind: Some("claude_code_oauth".into()),
         oauth_account: None,
     })
@@ -608,8 +625,6 @@ fn load_from_sqlite(path: &Path, set: &mut CredentialSet) -> Result<()> {
             }
             "cursor" => set.cursor = Some(cred),
             "devin" => set.devin = Some(cred),
-            // 订阅额度只对 OAuth 登录有意义；API key 行不授权（同 Claude 的理由）。
-            "google-antigravity" if credential_type == "oauth" => set.antigravity = Some(cred),
             // 余额查询走 api.deepseek.com 的 API key，与订阅登录无关。
             "deepseek" if credential_type == "api_key" => set.deepseek = Some(cred),
             "minimax-code-cn" if credential_type == "api_key" => set.minimax = Some(cred),
@@ -630,7 +645,6 @@ fn parse_cred(provider: &str, credential_type: &str, identity_key: &str, data: &
     let account_id = first_string(&value, &["accountId", "account_id"]);
     let email = first_string(&value, &["email"]);
     let plan = first_string(&value, &["orgName", "plan"]);
-    let project_id = first_string(&value, &["projectId", "project_id"]);
     let identity = if !identity_key.is_empty() {
         Some(pretty_identity(identity_key, email.as_deref()))
     } else {
@@ -643,7 +657,6 @@ fn parse_cred(provider: &str, credential_type: &str, identity_key: &str, data: &
         expires_ms,
         account_id,
         plan,
-        project_id,
         kind: Some(credential_type.trim().to_string()),
         oauth_account: None,
     }
@@ -710,7 +723,6 @@ fn api_key_cred(key: &str) -> StoredCred {
         expires_ms: None,
         account_id: None,
         plan: None,
-        project_id: None,
         kind: Some("api_key".into()),
         oauth_account: None,
     }
@@ -923,7 +935,6 @@ mod tests {
                 ("kimi-code", "oauth"),
                 ("cursor", "oauth"),
                 ("devin", "oauth"),
-                ("google-antigravity", "oauth"),
                 ("deepseek", "api_key"),
                 ("minimax-code-cn", "api_key"),
             ] {
@@ -942,7 +953,6 @@ mod tests {
                 (ProviderId::Kimi, set.kimi.is_none()),
                 (ProviderId::Cursor, set.cursor.is_none()),
                 (ProviderId::Devin, set.devin.is_none()),
-                (ProviderId::Antigravity, set.antigravity.is_none()),
                 (ProviderId::Deepseek, set.deepseek.is_none()),
                 (ProviderId::Minimax, set.minimax.is_none()),
             ]
@@ -1060,76 +1070,6 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_extracts_project_and_only_oauth_authorizes() -> Result<()> {
-        let path = std::env::temp_dir().join(format!(
-            "coding-quota-antigravity-{}-{}.db",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
-        ));
-        let result = (|| -> Result<()> {
-            let db = rusqlite::Connection::open(&path)?;
-            db.execute_batch(
-                "CREATE TABLE auth_credentials (
-                    provider TEXT, credential_type TEXT, identity_key TEXT,
-                    data TEXT, disabled_cause TEXT
-                 );
-                 INSERT INTO auth_credentials VALUES
-                    ('google-antigravity', 'oauth', 'email:ag-user@example.com',
-                     '{\"access\":\"ag-oauth-token\",\"projectId\":\"ag-proj-42\",\"expires\":1893456000000}', NULL),
-                    ('google-antigravity', 'api_key', '', '{\"key\":\"ag-api-key\"}', NULL),
-                    ('kimi-code', 'oauth', '', '{}', NULL);",
-            )?;
-            let mut before = CredentialSet::default();
-            load_from_sqlite(&path, &mut before)?;
-            let cred = before
-                .antigravity
-                .as_ref()
-                .expect("active OAuth row must authorize Antigravity");
-            assert_eq!(cred.access.as_deref(), Some("ag-oauth-token"));
-            assert_eq!(
-                cred.project_id.as_deref(),
-                Some("ag-proj-42"),
-                "projectId 必须提取到 StoredCred.project_id"
-            );
-            assert_eq!(cred.kind.as_deref(), Some("oauth"));
-            assert!(before.kimi.is_some());
-
-            // 软登出 OAuth 行：剩下的 api_key 行仍处于启用状态，但不得授权。
-            db.execute(
-                "UPDATE auth_credentials SET disabled_cause = 'deleted by user'
-                 WHERE provider = 'google-antigravity' AND credential_type = 'oauth'",
-                [],
-            )?;
-            let mut logged_out = CredentialSet::default();
-            load_from_sqlite(&path, &mut logged_out)?;
-            assert!(
-                logged_out.antigravity.is_none(),
-                "软删除 OAuth 行后，仍在启用的 api_key 行也不得授权 Antigravity"
-            );
-            assert!(
-                logged_out.kimi.is_some(),
-                "other active providers must remain available"
-            );
-
-            db.execute(
-                "UPDATE auth_credentials SET disabled_cause = NULL
-                 WHERE provider = 'google-antigravity' AND credential_type = 'oauth'",
-                [],
-            )?;
-            let mut logged_in = CredentialSet::default();
-            load_from_sqlite(&path, &mut logged_in)?;
-            let cred = logged_in
-                .antigravity
-                .as_ref()
-                .expect("login must restore the provider");
-            assert_eq!(cred.project_id.as_deref(), Some("ag-proj-42"));
-            Ok(())
-        })();
-        let _ = std::fs::remove_file(&path);
-        result
-    }
-
-    #[test]
     fn multiple_oauth_accounts_preserve_1_based_account_index_for_refresh() -> Result<()> {
         let path = std::env::temp_dir().join(format!(
             "coding-quota-multi-oauth-{}-{}.db",
@@ -1139,22 +1079,22 @@ mod tests {
         let result = (|| -> Result<()> {
             let db = rusqlite::Connection::open(&path)?;
             db.execute_batch(
-                "CREATE TABLE auth_credentials (
+                r#"CREATE TABLE auth_credentials (
                     provider TEXT, credential_type TEXT, identity_key TEXT,
                     data TEXT, disabled_cause TEXT
                  );
                  INSERT INTO auth_credentials VALUES
-                    ('google-antigravity', 'oauth', 'email:first@example.com',
-                     '{\"access\":\"tok-1\",\"email\":\"first@example.com\",\"projectId\":\"proj-shared\"}', NULL),
-                    ('google-antigravity', 'api_key', '', '{\"key\":\"ignored-key\"}', NULL),
-                    ('google-antigravity', 'oauth', 'email:disabled@example.com',
-                     '{\"access\":\"tok-disabled\",\"email\":\"disabled@example.com\",\"projectId\":\"proj-shared\"}', 'deleted'),
-                    ('google-antigravity', 'oauth', 'email:second@example.com',
-                     '{\"access\":\"tok-2\",\"email\":\"second@example.com\",\"projectId\":\"proj-shared\"}', NULL);",
+                    ('cursor', 'oauth', 'email:first@example.com',
+                     '{"access":"tok-1","email":"first@example.com"}', NULL),
+                    ('cursor', 'api_key', '', '{"key":"ignored-key"}', NULL),
+                    ('cursor', 'oauth', 'email:disabled@example.com',
+                     '{"access":"tok-disabled","email":"disabled@example.com"}', 'deleted'),
+                    ('cursor', 'oauth', 'email:second@example.com',
+                     '{"access":"tok-2","email":"second@example.com"}', NULL);"#,
             )?;
             let mut set = CredentialSet::default();
             load_from_sqlite(&path, &mut set)?;
-            let cred = set.antigravity.expect("second active OAuth row selected");
+            let cred = set.cursor.expect("second active OAuth row selected");
             assert_eq!(cred.identity.as_deref(), Some("second@example.com"));
             assert_eq!(cred.access.as_deref(), Some("tok-2"));
             assert_eq!(

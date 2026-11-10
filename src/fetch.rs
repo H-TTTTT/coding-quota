@@ -9,7 +9,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
 use serde_json::Value;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 const UA: &str = "coding-quota/0.1";
@@ -92,13 +92,16 @@ pub async fn fetch_all_streaming(
         (ProviderId::Glm, creds.glm.clone()),
         (ProviderId::Kimi, creds.kimi.clone()),
         (ProviderId::Cursor, creds.cursor.clone()),
-        (ProviderId::Antigravity, creds.antigravity.clone()),
         (ProviderId::Deepseek, creds.deepseek.clone()),
         (ProviderId::Minimax, creds.minimax.clone()),
     ] {
         let client = client.clone();
         let skip = skip.clone();
         tasks.spawn(async move { maybe_fetch(&client, provider, cred, only, &skip).await });
+    }
+    {
+        let skip = skip.clone();
+        tasks.spawn(async move { maybe_antigravity(only, &skip).await });
     }
     {
         // Devin 首选 seat-management 接口（日/周都实时）；无凭据或失败时退回
@@ -187,7 +190,8 @@ async fn maybe_fetch(
         ProviderId::Glm => fetch_glm(client, cred).await,
         ProviderId::Kimi => fetch_kimi(client, cred).await,
         ProviderId::Cursor => fetch_cursor(client, cred).await,
-        ProviderId::Antigravity => fetch_antigravity(client, cred).await,
+        // Antigravity 由自己的客户端本地接口取数，不进入 OMP 凭据分支。
+        ProviderId::Antigravity => return None,
         ProviderId::Deepseek => fetch_deepseek(client, cred).await,
         ProviderId::Minimax => fetch_minimax(client, cred).await,
         // Devin 走 CLI 横幅，不使用 CredentialSet 里的凭据
@@ -254,52 +258,203 @@ fn resolve_secret(cred: &StoredCred, omp_provider: &str) -> Option<String> {
         .or_else(|| credentials::secret_from_omp(omp_provider, cred.oauth_account, false))
 }
 
-const ANTIGRAVITY_QUOTA_URL: &str =
-    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
-// 与 omp 的 Antigravity Hub 客户端标识一致；普通 coding-quota UA 会被此接口拒绝。
-const ANTIGRAVITY_UA: &str =
-    "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)";
-
-#[derive(serde::Serialize)]
-struct AntigravityProject<'a> {
-    project: &'a str,
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AntigravityDaemon {
+    pid: u32,
+    http_port: u16,
+    csrf_token: String,
 }
 
-async fn fetch_antigravity(client: &reqwest::Client, cred: StoredCred) -> ProviderReport {
-    let Some(project) = cred
-        .project_id
-        .as_deref()
-        .filter(|id| !id.trim().is_empty())
-    else {
-        return ProviderReport::err(
-            ProviderId::Antigravity,
-            cred.identity,
-            "missing Antigravity project id",
-        );
-    };
-    let result = fetch_with_refresh(client, &cred, "google-antigravity", |client, token| {
-        let mut headers = bearer(token);
-        headers.insert(USER_AGENT, HeaderValue::from_static(ANTIGRAVITY_UA));
-        // 序列化在创建 future 前完成，future 只拥有 RequestBuilder，不复制 project。
-        let request = client
-            .post(ANTIGRAVITY_QUOTA_URL)
-            .headers(headers)
-            .json(&AntigravityProject { project });
-        Box::pin(async move {
-            let response = request.send().await.map_err(|err| brief(&err))?;
-            let status = response.status();
-            let text = response.text().await.map_err(|err| brief(&err))?;
-            if !status.is_success() {
-                return Err(http_error(status, &text));
-            }
-            serde_json::from_str(&text).map_err(|_| "invalid JSON".to_string())
-        })
-    })
-    .await;
-    match result {
-        Ok((_, body)) => parse_antigravity(cred.identity, body),
-        Err(err) => ProviderReport::err(ProviderId::Antigravity, cred.identity, err),
+/// 本地 CSRF 绝不经过系统代理，也不跟随重定向离开 loopback。
+static ANTIGRAVITY_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(TIMEOUT)
+        .build()
+        .map_err(|err| brief(&err))
+});
+
+async fn maybe_antigravity(
+    only: Option<ProviderId>,
+    skip: &[ProviderId],
+) -> Option<ProviderReport> {
+    let provider = ProviderId::Antigravity;
+    if only.is_some_and(|wanted| wanted != provider) || skip.contains(&provider) {
+        crate::antigravity::stop().await;
+        return None;
     }
+    let client = match &*ANTIGRAVITY_CLIENT {
+        Ok(client) => client,
+        Err(err) => return Some(ProviderReport::err(provider, None, err)),
+    };
+    let owned_pid = crate::antigravity::owned_pid();
+    let mut owned = None;
+    // Prefer a normal client even if our newer background discovery file exists.
+    // This lets opening/signing into the client select its current account.
+    for daemon in antigravity_daemons() {
+        if Some(daemon.pid) == owned_pid {
+            owned = Some(daemon);
+        } else if let Some(report) = antigravity_report(client, &daemon).await {
+            crate::antigravity::stop().await;
+            return Some(report);
+        }
+    }
+    if let Some(daemon) = owned {
+        if let Some(report) = antigravity_report(client, &daemon).await {
+            return Some(report);
+        }
+    }
+    if crate::antigravity::executable().is_none() {
+        return Some(ProviderReport::missing(provider));
+    }
+    let pid = match crate::antigravity::start() {
+        Ok(pid) => pid,
+        Err(err) => return Some(ProviderReport::err(provider, None, err)),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        for daemon in antigravity_daemons()
+            .into_iter()
+            .filter(|daemon| daemon.pid == pid)
+        {
+            if let Some(report) = antigravity_report(client, &daemon).await {
+                return Some(report);
+            }
+        }
+        if crate::antigravity::owned_pid() != Some(pid) {
+            return Some(ProviderReport::err(
+                provider,
+                None,
+                "Antigravity 官方后台已退出，请检查客户端登录状态",
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            crate::antigravity::stop().await;
+            return Some(ProviderReport::err(
+                provider,
+                None,
+                "Antigravity 官方后台启动超时",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn antigravity_daemons() -> Vec<AntigravityDaemon> {
+    credentials::antigravity_daemon_files()
+        .into_iter()
+        .filter_map(|file| {
+            let bytes = std::fs::read(file).ok()?;
+            let daemon: AntigravityDaemon = serde_json::from_slice(&bytes).ok()?;
+            (daemon.pid != 0 && daemon.http_port != 0 && !daemon.csrf_token.is_empty())
+                .then_some(daemon)
+        })
+        .collect()
+}
+
+/// None means a stale/unreachable discovery file, not a quota failure.
+async fn antigravity_report(
+    client: &reqwest::Client,
+    daemon: &AntigravityDaemon,
+) -> Option<ProviderReport> {
+    let provider = ProviderId::Antigravity;
+    let base = format!(
+        "http://127.0.0.1:{}/exa.language_server_pb.LanguageServerService",
+        daemon.http_port
+    );
+    let auth = antigravity_rpc(
+        client,
+        &base,
+        daemon,
+        "GetAuthStatus",
+        &serde_json::json!({}),
+    )
+    .await
+    .ok()?;
+    if auth
+        .pointer("/authResult/hasValidAuth")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Some(ProviderReport::err(
+            provider,
+            None,
+            "请先在 Antigravity 客户端登录",
+        ));
+    }
+    let identity = antigravity_rpc(
+        client,
+        &base,
+        daemon,
+        "GetUserStatus",
+        &serde_json::json!({"metadata": {}}),
+    )
+    .await
+    .ok()
+    .and_then(|status| {
+        status
+            .pointer("/userStatus/email")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    if let Some(report) = deferred_report(provider, identity.clone()) {
+        return Some(report);
+    }
+    // Only the official server uses/renews OAuth credentials; quota reads don't force refresh.
+    let result = antigravity_rpc(
+        client,
+        &base,
+        daemon,
+        "RetrieveUserQuotaSummary",
+        &serde_json::json!({"request": {}, "forceRefresh": false}),
+    )
+    .await;
+    let report = match result {
+        Ok(mut body) => parse_antigravity(
+            identity,
+            body.get_mut("response")
+                .map(Value::take)
+                .unwrap_or(Value::Null),
+        ),
+        Err(err) => ProviderReport::err(provider, identity, err),
+    };
+    if let Ok(mut state) = backoff().lock() {
+        if report.error.is_none() {
+            state.succeed(provider);
+        } else {
+            state.fail(provider);
+        }
+    }
+    Some(report)
+}
+
+async fn antigravity_rpc(
+    client: &reqwest::Client,
+    base: &str,
+    daemon: &AntigravityDaemon,
+    method: &str,
+    body: &Value,
+) -> Result<Value, String> {
+    let response = client
+        .post(format!("{base}/{method}"))
+        .header("X-Codeium-Csrf-Token", &daemon.csrf_token)
+        .header("Connect-Protocol-Version", "1")
+        .json(body)
+        .send()
+        .await
+        .map_err(|err| brief(&err))?;
+    let status = response.status();
+    if !status.is_success() {
+        // 本地服务错误正文可能含登录细节，不透传到界面或日志。
+        return Err(format!("Antigravity 本地接口 HTTP {status}"));
+    }
+    response
+        .json()
+        .await
+        .map_err(|_| "Antigravity 本地接口返回无效 JSON".into())
 }
 
 fn parse_antigravity(identity: Option<String>, body: Value) -> ProviderReport {

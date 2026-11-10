@@ -15,11 +15,12 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- Antigravity 额度改为只读复用官方 Hub 本地 RPC，不再依赖 OMP 的 Google OAuth 凭据、项目 ID 或刷新能力。无需打开客户端窗口：已安装并登录后，挂件会按需启动官方 `language_server.exe` 无窗口后台；正常客户端运行时优先复用它，并回收挂件自己的后台。隐藏 Antigravity、退出挂件或 CLI 单次查询结束后释放自有后台，不结束用户客户端。插件不提取 Google Token、不强制刷新额度；loopback 请求禁用代理与重定向，过期发现文件会跳过。
 - 本机 OMP token 用量的「1天」档改为按北京时间每日 00:00:00 清零（不再按滚动过去 24 小时统计）；「7天」「30天」与「累计」统计范围不变。
 - TUI 不再向 Windows Terminal 的 `settings.json` 或 `Fragments` 注入 `Coding Quota TUI` 配置文件，并在启动时自动清理早期版本遗留的同名配置项，避免在 PowerShell / Windows Terminal 配置文件列表中残留该条目。
 - 挂件加了单实例锁：重复启动 `coding-quota-gui.exe`（双击、开机自启 + 手动启动）不再出现第二个托盘图标和第二路后台刷新，只会弹一句「已经在运行」的提示后退出。锁按登录会话隔离，远程桌面会话里各开一个仍然允许。
 - `--watch` 每轮重新读取凭据库：登录、登出、token 轮换、换 `CODING_QUOTA_DB` 都不必重启进程；watch 期间凭据库临时读不到只跳过本轮并打印一行原因，不再让整个 watch 退出（单发 `--snapshot` 仍按原语义直接失败）。
-- 新增 Google Antigravity 额度卡片：读取 omp 的有效 `google-antigravity` OAuth 登录及 projectId，按 Antigravity Hub 请求规范查询实时额度；显示 Gemini 与平台内 Claude/GPT 共享额度的 5 小时、周窗口、剩余百分比及重置时间，共享 bucket 去重。这是 Antigravity 内的模型额度，不是独立 Claude/Codex 订阅额度。GUI、TUI、托盘开关、`--snapshot` / `--json` 和 `--provider antigravity` / `google-antigravity` 均已接入；登出后隐藏，失败沿用已有缓存及退避规则，401 沿用 omp token 刷新。
+- 新增 Google Antigravity 额度卡片：显示 Gemini 与平台内 Claude/GPT 共享额度的 5 小时、周窗口、剩余百分比及重置时间，共享 bucket 去重。这是 Antigravity 内的模型额度，不是独立 Claude/Codex 订阅额度。GUI、TUI、托盘开关、`--snapshot` / `--json` 和 `--provider antigravity` / `google-antigravity` 均已接入；当前取数来源为官方 Hub 客户端本地接口（见上）。
 - 额度告警与 Windows 原生通知：剩余百分比跌破 10%、归零、或重置回满（<10% 回到 ≥50%）时从托盘弹系统气泡，一轮多条合并为一条；只在真实跨越时触发，重启用缓存播种不回放历史。托盘菜单新增「额度告警」开关（默认开启，状态存 `%APPDATA%\coding-quota\alerts_enabled.txt`）与「测试通知」入口。
 - 重置卡显示到期时间：智谱重置卡库存接口的每条记录带 `expireTime`，Codex 新增只读查询 `wham/rate-limit-reset-credits` 明细端点拿每张卡的 `expires_at`（数量仍以 usage 端点为准，明细失败只是无日期）。「重置卡：剩余 X 次」行追加可用卡中最早一张的到期日（北京时间 MM-DD，如「重置卡：剩余 5 次 · 最早 10-18 到期」）；GUI、TUI、快照与 `--json`（`resets_expire` 字段）一致。不可用卡、已兑换卡与解析失败的日期不参与计算，`expires_at: null`（永不过期）的卡也不参与。绝不调用消耗重置卡的 consume 接口。
 

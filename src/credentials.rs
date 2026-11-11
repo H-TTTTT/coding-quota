@@ -182,6 +182,15 @@ pub fn claude_projects_roots() -> Vec<PathBuf> {
     out
 }
 
+/// 与 Windows agy 配额查询相同用户的原生会话目录；不读取桌面 App 的数据。
+pub fn antigravity_cli_conversations_root() -> Option<PathBuf> {
+    ["USERPROFILE", "HOME"].into_iter().find_map(|key| {
+        let root =
+            PathBuf::from(std::env::var_os(key)?).join(".gemini/antigravity-cli/conversations");
+        root.is_dir().then_some(root)
+    })
+}
+
 fn candidate_homes(omp_db: Option<&Path>) -> Vec<PathBuf> {
     let mut homes = Vec::new();
     let mut push_unique = |path: PathBuf| {
@@ -229,28 +238,6 @@ fn candidate_homes(omp_db: Option<&Path>) -> Vec<PathBuf> {
         }
     }
     homes
-}
-
-/// Antigravity Hub 的本地 RPC 发现文件；只读，不接触系统凭据库或 refresh token。
-pub fn antigravity_daemon_files() -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for home in candidate_homes(None) {
-        let dir = home.join(".gemini/antigravity/daemon");
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with("hub_") && name.ends_with(".json") && path.is_file() {
-                    files.push(path);
-                }
-            }
-        }
-    }
-    files.sort_by_cached_key(|path| {
-        std::cmp::Reverse(path.metadata().and_then(|meta| meta.modified()).ok())
-    });
-    files
 }
 
 pub fn load_claude_code_profiles(omp_db: Option<&Path>) -> Vec<ClaudeProfile> {

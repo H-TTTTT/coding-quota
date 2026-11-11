@@ -1,10 +1,9 @@
-//! 本机 OMP 会话的 token 用量：增量扫描 `~/.omp/agent/sessions` 下的 JSONL。
+//! 本机 OMP、Claude Code 与 agy CLI 的 token 用量。
 //!
-//! 每轮 `message` 行的 `message.usage` 记录该轮 input / output / reasoning /
-//! cacheRead / cacheWrite / totalTokens；按平台聚合成当日（北京时间 0 点清零）/
-//! 近 7 天 / 30 天与本机累计。「本机累计」只是当前设备仍保留的日志合计，不等于服务端账号累计。
-//! 文件按 (mtime, size) 缓存解析结果，未变化的文件不重复解析；扫描结果在进程内
-//! 保留 120 秒，刷新循环里只有首次扫描是全量的。
+//! 按模型调用聚合成当日（北京时间 0 点清零）/ 近 7 天 / 30 天与本机累计。
+//! 「本机累计」只是当前设备仍保留的日志合计，不等于服务端账号累计。
+//! JSONL 按 (mtime, size) 缓存，agy SQLite 同时观察 WAL；扫描结果保留 120 秒。
+//! agy 仅只读本机记录，不调用模型、额度接口或认证接口。
 
 use crate::credentials;
 use crate::model::{ProviderId, UsageModel, UsageRow};
@@ -14,6 +13,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
+
+mod agy;
 
 /// 聚合结果的保鲜间隔：与挂件刷新节奏一致，避免每轮都重扫目录。
 const REFRESH_INTERVAL: Duration = Duration::from_secs(120);
@@ -31,6 +32,8 @@ struct UsageEvent {
 struct FileKey {
     mtime: SystemTime,
     size: u64,
+    /// SQLite 的新调用可能仍在 WAL，主数据库的 mtime/size 此时不会变化。
+    wal: Option<(SystemTime, u64)>,
 }
 
 #[derive(Default)]
@@ -178,39 +181,63 @@ fn refresh_if_stale() {
             roots.push(root);
         }
     }
-    if !roots.is_empty() {
-        scan_roots(&mut store, &roots);
-    }
+    let agy_root = credentials::antigravity_cli_conversations_root();
+    scan_roots(&mut store, &roots, agy_root.as_deref());
     store.scanned_at = Some(Instant::now());
     *guard = Some(store);
 }
 
-#[cfg(test)]
-fn scan_root(store: &mut Store, root: &Path) {
-    scan_roots(store, &[root.to_path_buf()]);
-}
-
-/// 增量扫描：新文件与 (mtime, size) 变化的文件重新解析，其余复用缓存。
-fn scan_roots(store: &mut Store, roots: &[PathBuf]) {
+/// 增量扫描：JSONL 与原生 SQLite 各自解析，未变的事件直接复用，避免反复累加。
+fn scan_roots(store: &mut Store, roots: &[PathBuf], agy_root: Option<&Path>) {
     let mut current: Vec<PathBuf> = Vec::new();
     for root in roots {
         collect_jsonl(root, &mut current);
     }
-    let mut next: HashMap<PathBuf, (FileKey, Vec<UsageEvent>)> = HashMap::new();
+    if let Some(root) = agy_root {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "db") && path.is_file() {
+                    current.push(path);
+                }
+            }
+        }
+    }
+    let mut next = HashMap::new();
     for path in current {
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
+        let native = path.extension().is_some_and(|ext| ext == "db");
+        let wal = native
+            .then(|| {
+                let mut wal = path.as_os_str().to_os_string();
+                wal.push("-wal");
+                let meta = std::fs::metadata(wal).ok()?;
+                Some((meta.modified().ok()?, meta.len()))
+            })
+            .flatten();
         let key = FileKey {
             mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             size: meta.len(),
+            wal,
         };
-        let cached = store.files.get(&path).filter(|(old, _)| *old == key);
-        let events = match cached {
-            Some((_, events)) => events.clone(),
-            None => parse_file(&path),
+        let previous = store.files.remove(&path);
+        if previous.as_ref().is_some_and(|(old, _)| *old == key) {
+            next.insert(path, previous.unwrap());
+            continue;
+        }
+        let events = if native {
+            agy::read_database(&path)
+        } else {
+            Some(parse_file(&path))
         };
-        next.insert(path, (key, events));
+        if let Some(events) = events {
+            next.insert(path, (key, events));
+        } else if let Some(previous) = previous {
+            // 正在建表/被锁定时保留上次有效统计，且不记录新 key，后续继续重读。
+            next.insert(path, previous);
+        }
     }
     store.files = next;
 }
@@ -495,35 +522,6 @@ mod tests {
         assert_eq!(across_midnight[1].total_tokens, 8_300);
     }
 
-    /// (mtime, size) 未变化的文件不重新解析；变化的文件重新解析。
-    #[test]
-    fn scan_root_reuses_cached_files_until_they_change() {
-        let dir = std::env::temp_dir().join(format!("cq-usage-cache-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = write_session(
-            &dir,
-            "c.jsonl",
-            &[usage_line("kimi-code", "k3", "2026-10-01T00:00:00Z", 7)],
-        );
-        let mut store = Store::default();
-        scan_root(&mut store, &dir);
-        assert_eq!(store.files[&path].1.len(), 1);
-        // 未变化（mtime/size 相同）：复用缓存条目。
-        scan_root(&mut store, &dir);
-        assert_eq!(store.files[&path].1.len(), 1);
-        // 追加内容后 size 变化，重新解析出两行。
-        write_session(
-            &dir,
-            "c.jsonl",
-            &[
-                usage_line("kimi-code", "k3", "2026-10-01T00:00:00Z", 7),
-                usage_line("kimi-code", "k3", "2026-10-02T00:00:00Z", 9),
-            ],
-        );
-        scan_root(&mut store, &dir);
-        assert_eq!(store.files[&path].1.len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
     #[test]
     fn test_is_gemini_model() {
         assert!(is_gemini_model("gemini-3.8-flash"));

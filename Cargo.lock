@@ -466,7 +466,6 @@ dependencies = [
  "clap",
  "crossterm",
  "eframe",
- "getrandom 0.3.4",
  "ratatui",
  "raw-window-handle",
  "reqwest",

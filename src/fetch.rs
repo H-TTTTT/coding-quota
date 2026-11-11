@@ -9,7 +9,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
 use serde_json::Value;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 const UA: &str = "coding-quota/0.1";
@@ -190,7 +190,7 @@ async fn maybe_fetch(
         ProviderId::Glm => fetch_glm(client, cred).await,
         ProviderId::Kimi => fetch_kimi(client, cred).await,
         ProviderId::Cursor => fetch_cursor(client, cred).await,
-        // Antigravity 由自己的客户端本地接口取数，不进入 OMP 凭据分支。
+        // Antigravity 直接调用官方 CLI /usage，不进入 OMP 凭据分支。
         ProviderId::Antigravity => return None,
         ProviderId::Deepseek => fetch_deepseek(client, cred).await,
         ProviderId::Minimax => fetch_minimax(client, cred).await,
@@ -258,168 +258,23 @@ fn resolve_secret(cred: &StoredCred, omp_provider: &str) -> Option<String> {
         .or_else(|| credentials::secret_from_omp(omp_provider, cred.oauth_account, false))
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AntigravityDaemon {
-    pid: u32,
-    http_port: u16,
-    csrf_token: String,
-}
-
-/// 本地 CSRF 绝不经过系统代理，也不跟随重定向离开 loopback。
-static ANTIGRAVITY_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(1))
-        .timeout(TIMEOUT)
-        .build()
-        .map_err(|err| brief(&err))
-});
-
 async fn maybe_antigravity(
     only: Option<ProviderId>,
     skip: &[ProviderId],
 ) -> Option<ProviderReport> {
     let provider = ProviderId::Antigravity;
     if only.is_some_and(|wanted| wanted != provider) || skip.contains(&provider) {
-        crate::antigravity::stop().await;
         return None;
     }
-    let client = match &*ANTIGRAVITY_CLIENT {
-        Ok(client) => client,
-        Err(err) => return Some(ProviderReport::err(provider, None, err)),
-    };
-    let owned_pid = crate::antigravity::owned_pid();
-    let mut owned = None;
-    // Prefer a normal client even if our newer background discovery file exists.
-    // This lets opening/signing into the client select its current account.
-    for daemon in antigravity_daemons() {
-        if Some(daemon.pid) == owned_pid {
-            owned = Some(daemon);
-        } else if let Some(report) = antigravity_report(client, &daemon).await {
-            crate::antigravity::stop().await;
-            return Some(report);
-        }
-    }
-    if let Some(daemon) = owned {
-        if let Some(report) = antigravity_report(client, &daemon).await {
-            return Some(report);
-        }
-    }
-    if crate::antigravity::executable().is_none() {
+    let Some(binary) = crate::antigravity::executable() else {
         return Some(ProviderReport::missing(provider));
-    }
-    let pid = match crate::antigravity::start() {
-        Ok(pid) => pid,
-        Err(err) => return Some(ProviderReport::err(provider, None, err)),
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        for daemon in antigravity_daemons()
-            .into_iter()
-            .filter(|daemon| daemon.pid == pid)
-        {
-            if let Some(report) = antigravity_report(client, &daemon).await {
-                return Some(report);
-            }
-        }
-        if crate::antigravity::owned_pid() != Some(pid) {
-            return Some(ProviderReport::err(
-                provider,
-                None,
-                "Antigravity 官方后台已退出，请检查客户端登录状态",
-            ));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            crate::antigravity::stop().await;
-            return Some(ProviderReport::err(
-                provider,
-                None,
-                "Antigravity 官方后台启动超时",
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
-fn antigravity_daemons() -> Vec<AntigravityDaemon> {
-    credentials::antigravity_daemon_files()
-        .into_iter()
-        .filter_map(|file| {
-            let bytes = std::fs::read(file).ok()?;
-            let daemon: AntigravityDaemon = serde_json::from_slice(&bytes).ok()?;
-            (daemon.pid != 0 && daemon.http_port != 0 && !daemon.csrf_token.is_empty())
-                .then_some(daemon)
-        })
-        .collect()
-}
-
-/// None means a stale/unreachable discovery file, not a quota failure.
-async fn antigravity_report(
-    client: &reqwest::Client,
-    daemon: &AntigravityDaemon,
-) -> Option<ProviderReport> {
-    let provider = ProviderId::Antigravity;
-    let base = format!(
-        "http://127.0.0.1:{}/exa.language_server_pb.LanguageServerService",
-        daemon.http_port
-    );
-    let auth = antigravity_rpc(
-        client,
-        &base,
-        daemon,
-        "GetAuthStatus",
-        &serde_json::json!({}),
-    )
-    .await
-    .ok()?;
-    if auth
-        .pointer("/authResult/hasValidAuth")
-        .and_then(Value::as_bool)
-        != Some(true)
-    {
-        return Some(ProviderReport::err(
-            provider,
-            None,
-            "请先在 Antigravity 客户端登录",
-        ));
-    }
-    let identity = antigravity_rpc(
-        client,
-        &base,
-        daemon,
-        "GetUserStatus",
-        &serde_json::json!({"metadata": {}}),
-    )
-    .await
-    .ok()
-    .and_then(|status| {
-        status
-            .pointer("/userStatus/email")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    });
-    if let Some(report) = deferred_report(provider, identity.clone()) {
+    if let Some(report) = deferred_report(provider, None) {
         return Some(report);
     }
-    // Only the official server uses/renews OAuth credentials; quota reads don't force refresh.
-    let result = antigravity_rpc(
-        client,
-        &base,
-        daemon,
-        "RetrieveUserQuotaSummary",
-        &serde_json::json!({"request": {}, "forceRefresh": false}),
-    )
-    .await;
-    let report = match result {
-        Ok(mut body) => parse_antigravity(
-            identity,
-            body.get_mut("response")
-                .map(Value::take)
-                .unwrap_or(Value::Null),
-        ),
-        Err(err) => ProviderReport::err(provider, identity, err),
+    let report = match crate::antigravity::query(&binary).await {
+        Ok(body) => parse_antigravity(None, body),
+        Err(err) => ProviderReport::err(provider, None, err),
     };
     if let Ok(mut state) = backoff().lock() {
         if report.error.is_none() {
@@ -431,61 +286,22 @@ async fn antigravity_report(
     Some(report)
 }
 
-async fn antigravity_rpc(
-    client: &reqwest::Client,
-    base: &str,
-    daemon: &AntigravityDaemon,
-    method: &str,
-    body: &Value,
-) -> Result<Value, String> {
-    let response = client
-        .post(format!("{base}/{method}"))
-        .header("X-Codeium-Csrf-Token", &daemon.csrf_token)
-        .header("Connect-Protocol-Version", "1")
-        .json(body)
-        .send()
-        .await
-        .map_err(|err| brief(&err))?;
-    let status = response.status();
-    if !status.is_success() {
-        // 本地服务错误正文可能含登录细节，不透传到界面或日志。
-        return Err(format!("Antigravity 本地接口 HTTP {status}"));
-    }
-    response
-        .json()
-        .await
-        .map_err(|_| "Antigravity 本地接口返回无效 JSON".into())
-}
-
 fn parse_antigravity(identity: Option<String>, body: Value) -> ProviderReport {
     let mut windows = Vec::new();
-    let groups = body.get("groups").and_then(Value::as_array);
-    let grouped = groups.is_some_and(|groups| {
-        groups.iter().any(|group| {
-            group
-                .get("buckets")
-                .and_then(Value::as_array)
-                .is_some_and(|buckets| !buckets.is_empty())
-        })
-    });
-    if grouped {
-        for group in groups.into_iter().flatten() {
-            let name = group.get("displayName").and_then(Value::as_str);
+    if let Some(groups) = body.get("groups").and_then(Value::as_array) {
+        for group in groups {
+            let name = group.get("name").and_then(Value::as_str);
             if let Some(buckets) = group.get("buckets").and_then(Value::as_array) {
                 for bucket in buckets {
                     push_antigravity_bucket(&mut windows, bucket, name);
                 }
             }
         }
-    } else if let Some(buckets) = body.get("buckets").and_then(Value::as_array) {
-        for bucket in buckets {
-            push_antigravity_bucket(&mut windows, bucket, None);
-        }
     }
     if windows.is_empty() {
         return ProviderReport::err(ProviderId::Antigravity, identity, "no quota windows");
     }
-    // API 的周额度排在 5h 前；界面按模型组、短窗口→长窗口稳定展示。
+    // CLI 的周额度排在 5h 前；界面按模型组、短窗口→长窗口稳定展示。
     windows.sort_by_key(|window| match window.id.as_str() {
         "antigravity-gemini-5h" => 0,
         "antigravity-gemini-weekly" => 1,
@@ -508,7 +324,7 @@ fn push_antigravity_bucket(
     group_name: Option<&str>,
 ) {
     let Some(bucket_id) = bucket
-        .get("bucketId")
+        .get("id")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
     else {
@@ -517,7 +333,7 @@ fn push_antigravity_bucket(
     // disabled 仅表示暂不可用，不能丢掉仍带有额度和恢复时间的窗口。
     // 只显示接口确实返回的有限数值；缺失或无效时不臆造 0% 或 100%。
     let Some(remaining) =
-        number(bucket.get("remainingFraction")).filter(|fraction| fraction.is_finite())
+        number(bucket.get("remaining_fraction")).filter(|fraction| fraction.is_finite())
     else {
         return;
     };
@@ -534,12 +350,12 @@ fn push_antigravity_bucket(
         Some("daily") => "Daily",
         Some(other) if !other.is_empty() => other,
         _ => bucket
-            .get("displayName")
+            .get("name")
             .and_then(Value::as_str)
             .unwrap_or("Quota"),
     };
     let id = format!("antigravity-{bucket_id}");
-    let reset = parse_iso(bucket.get("resetTime"));
+    let reset = parse_iso(bucket.get("reset_time"));
     let used_percent = (1.0 - remaining) * 100.0;
     if let Some(existing) = windows.iter_mut().find(|window| window.id == id) {
         // 同一 bucket 重复出现时只画一份，Claude/GPT 共用额度不能重复计数。
@@ -2920,17 +2736,17 @@ mod tests {
         let report = parse_antigravity(
             None,
             serde_json::json!({"groups": [
-                {"displayName": "Gemini Models", "buckets": [
-                    {"bucketId": "gemini-weekly", "window": "weekly",
-                     "remainingFraction": 0.95, "resetTime": "2026-10-08T04:41:19Z"},
-                    {"bucketId": "gemini-5h", "window": "5h",
-                     "remainingFraction": 0.7, "resetTime": "2026-10-01T09:41:19Z"}
+                {"name": "Gemini Models", "buckets": [
+                    {"id": "gemini-weekly", "window": "weekly",
+                     "remaining_fraction": 0.95, "reset_time": "2026-10-08T04:41:19Z"},
+                    {"id": "gemini-5h", "window": "5h",
+                     "remaining_fraction": 0.7, "reset_time": "2026-10-01T09:41:19Z"}
                 ]},
-                {"displayName": "Claude and GPT models", "buckets": [
-                    {"bucketId": "3p-weekly", "window": "weekly",
-                     "remainingFraction": 0.8, "resetTime": "2026-10-08T04:49:48Z"},
-                    {"bucketId": "3p-5h", "window": "5h",
-                     "remainingFraction": 0.5, "resetTime": "2026-10-01T09:49:48Z"}
+                {"name": "Claude and GPT models", "buckets": [
+                    {"id": "3p-weekly", "window": "weekly",
+                     "remaining_fraction": 0.8, "reset_time": "2026-10-08T04:49:48Z"},
+                    {"id": "3p-5h", "window": "5h",
+                     "remaining_fraction": 0.5, "reset_time": "2026-10-01T09:49:48Z"}
                 ]}
             ]}),
         );
@@ -2982,12 +2798,12 @@ mod tests {
         let report = parse_antigravity(
             None,
             serde_json::json!({"groups": [
-                {"displayName": "Claude", "buckets": [
-                    {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.8}
+                {"name": "Claude", "buckets": [
+                    {"id": "3p-5h", "window": "5h", "remaining_fraction": 0.8}
                 ]},
-                {"displayName": "GPT", "buckets": [
-                    {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.4,
-                     "resetTime": "2026-10-01T09:49:48Z"}
+                {"name": "GPT", "buckets": [
+                    {"id": "3p-5h", "window": "5h", "remaining_fraction": 0.4,
+                     "reset_time": "2026-10-01T09:49:48Z"}
                 ]}
             ]}),
         );
@@ -3008,12 +2824,12 @@ mod tests {
             let report = parse_antigravity(
                 None,
                 serde_json::json!({"groups": [{
-                    "displayName": "Claude and GPT models",
+                    "name": "Claude and GPT models",
                     "buckets": [
-                        {"bucketId": "3p-weekly", "window": "weekly",
-                         "remainingFraction": 0, "resetTime": "2026-10-24T15:10:58Z"},
-                        {"bucketId": "3p-5h", "window": "5h", "disabled": true,
-                         "remainingFraction": remaining, "resetTime": "2026-10-20T14:30:50Z"}
+                        {"id": "3p-weekly", "window": "weekly",
+                         "remaining_fraction": 0, "reset_time": "2026-10-24T15:10:58Z"},
+                        {"id": "3p-5h", "window": "5h", "disabled": true,
+                         "remaining_fraction": remaining, "reset_time": "2026-10-20T14:30:50Z"}
                     ]
                 }]}),
             );
@@ -3037,16 +2853,16 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_flat_buckets_distinguish_zero_from_unknown() {
+    fn antigravity_cli_buckets_distinguish_zero_from_unknown() {
         let report = parse_antigravity(
             None,
-            serde_json::json!({"buckets": [
-                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0},
-                {"bucketId": "gemini-weekly", "window": "weekly"},
-                {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.9,
+            serde_json::json!({"groups": [{"buckets": [
+                {"id": "gemini-5h", "window": "5h", "remaining_fraction": 0},
+                {"id": "gemini-weekly", "window": "weekly"},
+                {"id": "3p-5h", "window": "5h", "remaining_fraction": 0.9,
                  "disabled": true},
-                {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": "NaN"}
-            ]}),
+                {"id": "3p-weekly", "window": "weekly", "remaining_fraction": "NaN"}
+            ]}]}),
         );
         assert!(report.error.is_none(), "{:?}", report.error);
         assert_eq!(report.windows.len(), 2);
@@ -3061,7 +2877,7 @@ mod tests {
         let report = parse_antigravity(
             None,
             serde_json::json!({"groups": [{"buckets": [{
-                "bucketId": "gemini-5h", "window": "5h", "remainingAmount": "120"
+                "id": "gemini-5h", "window": "5h", "remaining_amount": "120"
             }]}]}),
         );
         assert_eq!(report.error.as_deref(), Some("no quota windows"));

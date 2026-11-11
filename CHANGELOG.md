@@ -15,12 +15,13 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
-- Antigravity 额度改为只读复用官方 Hub 本地 RPC，不再依赖 OMP 的 Google OAuth 凭据、项目 ID 或刷新能力。无需打开客户端窗口：已安装并登录后，挂件会按需启动官方 `language_server.exe` 无窗口后台；正常客户端运行时优先复用它，并回收挂件自己的后台。隐藏 Antigravity、退出挂件或 CLI 单次查询结束后释放自有后台，不结束用户客户端。插件不提取 Google Token、不强制刷新额度；loopback 请求禁用代理与重定向，过期发现文件会跳过。
+- Antigravity 额度切换为官方 Windows CLI：直接运行 `%LOCALAPPDATA%/agy/bin/agy.exe --print /usage --output-format json --disable-slash-commands=false`，解析 `command.data.groups[].buckets[]` 的原始剩余比例与重置时间，不解析四舍五入的文本。只执行 CLI 内置额度命令，不发起模型对话；显式启用斜杠命令，避免 CLI 用户设置将 `/usage` 当作模型提示词。移除桌面 App 的 `language_server.exe` 启动、Hub 发现文件、本地 RPC 和后台进程管理，以及不再使用的随机数依赖。登录续期完全交给 CLI，不读取或修改 OAuth Token，不改 CLI 配置；CLI 结果未返回邮箱时不再借用桌面账号标识。保留四窗口、共享桶去重、耗尽/disabled 窗口、失败缓存与退避。
+- Google Antigravity 卡片补充 agy CLI 本机 Token 用量：只读 `~/.gemini/antigravity-cli/conversations/*.db` 的逐调用生成元数据，以真实模型与调用/步骤时间合并到原有 Gemini / Claude&GPT 的当日、7 天、30 天与累计统计；原 OMP 历史保留。总量按 input + cache-read + output，思考与文本已包含在 output 中，不再重复加；同一次调用即使关联多个步骤也只计一次。读取已提交 WAL，数据库与 WAL 任一变化都会使缓存失效；跳过刚创建不足 3 秒的数据库以避开 CLI 建表，暂不可读时保留旧有效统计。仅统计本机保留的 SQLite/日志，不恢复已删除记录或解析密文 PB，不调用模型、网络接口或登录凭据。
 - 本机 OMP token 用量的「1天」档改为按北京时间每日 00:00:00 清零（不再按滚动过去 24 小时统计）；「7天」「30天」与「累计」统计范围不变。
 - TUI 不再向 Windows Terminal 的 `settings.json` 或 `Fragments` 注入 `Coding Quota TUI` 配置文件，并在启动时自动清理早期版本遗留的同名配置项，避免在 PowerShell / Windows Terminal 配置文件列表中残留该条目。
 - 挂件加了单实例锁：重复启动 `coding-quota-gui.exe`（双击、开机自启 + 手动启动）不再出现第二个托盘图标和第二路后台刷新，只会弹一句「已经在运行」的提示后退出。锁按登录会话隔离，远程桌面会话里各开一个仍然允许。
 - `--watch` 每轮重新读取凭据库：登录、登出、token 轮换、换 `CODING_QUOTA_DB` 都不必重启进程；watch 期间凭据库临时读不到只跳过本轮并打印一行原因，不再让整个 watch 退出（单发 `--snapshot` 仍按原语义直接失败）。
-- 新增 Google Antigravity 额度卡片：显示 Gemini 与平台内 Claude/GPT 共享额度的 5 小时、周窗口、剩余百分比及重置时间，共享 bucket 去重。这是 Antigravity 内的模型额度，不是独立 Claude/Codex 订阅额度。GUI、TUI、托盘开关、`--snapshot` / `--json` 和 `--provider antigravity` / `google-antigravity` 均已接入；当前取数来源为官方 Hub 客户端本地接口（见上）。
+- 新增 Google Antigravity 额度卡片：显示 Gemini 与平台内 Claude/GPT 共享额度的 5 小时、周窗口、剩余百分比及重置时间，共享 bucket 去重。这是 Antigravity 内的模型额度，不是独立 Claude/Codex 订阅额度。GUI、TUI、托盘开关、`--snapshot` / `--json` 和 `--provider antigravity` / `google-antigravity` 均已接入；当前取数来源为官方 CLI `/usage`（见上）。
 - 额度告警与 Windows 原生通知：剩余百分比跌破 10%、归零、或重置回满（<10% 回到 ≥50%）时从托盘弹系统气泡，一轮多条合并为一条；只在真实跨越时触发，重启用缓存播种不回放历史。托盘菜单新增「额度告警」开关（默认开启，状态存 `%APPDATA%\coding-quota\alerts_enabled.txt`）与「测试通知」入口。
 - 重置卡显示到期时间：智谱重置卡库存接口的每条记录带 `expireTime`，Codex 新增只读查询 `wham/rate-limit-reset-credits` 明细端点拿每张卡的 `expires_at`（数量仍以 usage 端点为准，明细失败只是无日期）。「重置卡：剩余 X 次」行追加可用卡中最早一张的到期日（北京时间 MM-DD，如「重置卡：剩余 5 次 · 最早 10-18 到期」）；GUI、TUI、快照与 `--json`（`resets_expire` 字段）一致。不可用卡、已兑换卡与解析失败的日期不参与计算，`expires_at: null`（永不过期）的卡也不参与。绝不调用消耗重置卡的 consume 接口。
 

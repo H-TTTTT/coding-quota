@@ -329,12 +329,15 @@ async fn main() -> Result<()> {
     if cli.json {
         let creds = credentials::load()?;
         let snapshot = fetch::fetch_all(&creds, only, &[]).await;
+        fetch::stop_background().await;
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
 
     if want_tui {
-        return tui::run(credentials::load()?, only).await;
+        let result = tui::run(credentials::load()?, only).await;
+        fetch::stop_background().await;
+        return result;
     }
 
     loop {
@@ -347,7 +350,10 @@ async fn main() -> Result<()> {
                 eprintln!("凭据读取失败，本轮跳过：{err:#}");
                 None
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                fetch::stop_background().await;
+                return Err(err);
+            }
         };
         if let Some(snapshot) = snapshot {
             if cli.watch.is_some() {
@@ -362,5 +368,6 @@ async fn main() -> Result<()> {
             _ => break,
         }
     }
+    fetch::stop_background().await;
     Ok(())
 }

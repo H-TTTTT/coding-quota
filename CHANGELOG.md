@@ -15,18 +15,18 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
-- Antigravity CLI 改为装在 WSL：通过 `\\wsl.localhost\<发行版>\home\*` 定位 `~/.local/bin/agy`（只读文件属性，不为探测拉起 `wsl.exe`），额度经 `wsl.exe -d <发行版> -e ~/.local/bin/agy --print /usage ...` 查询；`%LOCALAPPDATA%\agy\bin\agy.exe` 只作兜底。WSL 里的会话库不再从 Windows 跨系统直接打开（WAL 库的文件锁与共享内存索引不跨系统，可能损坏 agy 的库），改为在 WSL 内用 `sqlite3 -readonly -json` 单条语句读出 `steps` 与 `gen_metadata`（十六进制），交给原有解析逻辑，结果与原生读取逐条一致；仍跳过不足 3 秒的新库，查询 20 秒超时只结束自己拉起的 `wsl.exe`。登录失败提示注明在 WSL 或 PowerShell 运行 agy。
-- Antigravity 额度切换为官方 Windows CLI：直接运行 `%LOCALAPPDATA%/agy/bin/agy.exe --print /usage --output-format json --disable-slash-commands=false`，解析 `command.data.groups[].buckets[]` 的原始剩余比例与重置时间，不解析四舍五入的文本。只执行 CLI 内置额度命令，不发起模型对话；显式启用斜杠命令，避免 CLI 用户设置将 `/usage` 当作模型提示词。移除桌面 App 的 `language_server.exe` 启动、Hub 发现文件、本地 RPC 和后台进程管理，以及不再使用的随机数依赖。登录续期完全交给 CLI，不读取或修改 OAuth Token，不改 CLI 配置；CLI 结果未返回邮箱时不再借用桌面账号标识。保留四窗口、共享桶去重、耗尽/disabled 窗口、失败缓存与退避。
-- Google Antigravity 卡片补充 agy CLI 本机 Token 用量：只读 `~/.gemini/antigravity-cli/conversations/*.db` 的逐调用生成元数据，以真实模型与调用/步骤时间合并到原有 Gemini / Claude&GPT 的当日、7 天、30 天与累计统计；原 OMP 历史保留。总量按 input + cache-read + output，思考与文本已包含在 output 中，不再重复加；同一次调用即使关联多个步骤也只计一次。读取已提交 WAL，数据库与 WAL 任一变化都会使缓存失效；跳过刚创建不足 3 秒的数据库以避开 CLI 建表，暂不可读时保留旧有效统计。仅统计本机保留的 SQLite/日志，不恢复已删除记录或解析密文 PB，不调用模型、网络接口或登录凭据。
+- Antigravity 额度与本机 Token 用量全部切回 Windows 桌面版 Antigravity App（移除 `agy` CLI 与 WSL `sqlite3` 子进程调用）：额度只读复用官方桌面 Hub 本地 RPC（`~/.gemini/antigravity/daemon/hub_*.json`），桌面客户端打开时零子进程毫秒级读取额度与登录邮箱；客户端窗口关闭时按需无窗口启动 `%LOCALAPPDATA%\Programs\antigravity\resources\bin\language_server.exe`（显式关闭 sidecars 与 LSP），客户端重新打开、隐藏卡片或进程退出时自动释放自有后台且绝不结束用户客户端。
+- Google Antigravity 卡片本机 Token 用量改为纯 Rust 进程内只读扫描桌面 App 的 `%USERPROFILE%\.gemini\antigravity\conversations\*.db`（仅限本机用户目录，不触碰 `\\wsl.localhost`）：按逐次模型生成统计 input + cache-read + output，保留真实模型分组（Gemini / Claude&GPT）与调用/步骤时间，合并原有 OMP 历史，跟踪已提交 WAL 并跳过创建不足 3 秒的新库。
 - 本机 OMP token 用量的「1天」档改为按北京时间每日 00:00:00 清零（不再按滚动过去 24 小时统计）；「7天」「30天」与「累计」统计范围不变。
 - TUI 不再向 Windows Terminal 的 `settings.json` 或 `Fragments` 注入 `Coding Quota TUI` 配置文件，并在启动时自动清理早期版本遗留的同名配置项，避免在 PowerShell / Windows Terminal 配置文件列表中残留该条目。
 - 挂件加了单实例锁：重复启动 `coding-quota-gui.exe`（双击、开机自启 + 手动启动）不再出现第二个托盘图标和第二路后台刷新，只会弹一句「已经在运行」的提示后退出。锁按登录会话隔离，远程桌面会话里各开一个仍然允许。
 - `--watch` 每轮重新读取凭据库：登录、登出、token 轮换、换 `CODING_QUOTA_DB` 都不必重启进程；watch 期间凭据库临时读不到只跳过本轮并打印一行原因，不再让整个 watch 退出（单发 `--snapshot` 仍按原语义直接失败）。
-- 新增 Google Antigravity 额度卡片：显示 Gemini 与平台内 Claude/GPT 共享额度的 5 小时、周窗口、剩余百分比及重置时间，共享 bucket 去重。这是 Antigravity 内的模型额度，不是独立 Claude/Codex 订阅额度。GUI、TUI、托盘开关、`--snapshot` / `--json` 和 `--provider antigravity` / `google-antigravity` 均已接入；当前取数来源为官方 CLI `/usage`（见上）。
+- 新增 Google Antigravity 额度卡片：显示 Gemini 与平台内 Claude/GPT 共享额度的 5 小时、周窗口、剩余百分比及重置时间，共享 bucket 去重。这是 Antigravity 内的模型额度，不是独立 Claude/Codex 订阅额度。GUI、TUI、托盘开关、`--snapshot` / `--json` 和 `--provider antigravity` / `google-antigravity` 均已接入；当前取数来源为官方桌面 Hub 客户端本地接口（见上）。
 - 额度告警与 Windows 原生通知：剩余百分比跌破 10%、归零、或重置回满（<10% 回到 ≥50%）时从托盘弹系统气泡，一轮多条合并为一条；只在真实跨越时触发，重启用缓存播种不回放历史。托盘菜单新增「额度告警」开关（默认开启，状态存 `%APPDATA%\coding-quota\alerts_enabled.txt`）与「测试通知」入口。
 - 重置卡显示到期时间：智谱重置卡库存接口的每条记录带 `expireTime`，Codex 新增只读查询 `wham/rate-limit-reset-credits` 明细端点拿每张卡的 `expires_at`（数量仍以 usage 端点为准，明细失败只是无日期）。「重置卡：剩余 X 次」行追加可用卡中最早一张的到期日（北京时间 MM-DD，如「重置卡：剩余 5 次 · 最早 10-18 到期」）；GUI、TUI、快照与 `--json`（`resets_expire` 字段）一致。不可用卡、已兑换卡与解析失败的日期不参与计算，`expires_at: null`（永不过期）的卡也不参与。绝不调用消耗重置卡的 consume 接口。
 
 ### Fixed
+- 修复桌面挂件周期性刷新时闪出黑色控制台窗口：此前调用 `agy.exe` CLI 查额度时，其内置后台自动更新器每 15 分钟以 `DETACHED_PROCESS` 拉起脱离无窗口控制台的子孙进程并触发控制台窗口闪现；切回桌面版 Antigravity 本地 Hub RPC 与进程内 SQLite 用量统计后彻底消除 CLI 子进程。同时 Windows 下改为从注册表 `HKCU\...\Lxss` 读取实际已安装的 WSL 发行版并在 `\\wsl.localhost` 命中后停止重复探测 `\\wsl$`，保留 WSL Claude Code 凭据读取的同时消除对未安装发行版的 WebDAV 回退探测。
 - 修复 Claude 多账号槽位模式下非激活槽位令牌过期导致整张卡片进入指数退避并回退为灰态旧数据（严格遵守防封规则）：常规轮询仅对当前激活槽位（`★`）发起网络请求，不在同一连接/同一秒并发轮询多个 Claude 账号，也绝不从第三方二进制代刷 `.credentials.json`；非激活槽位直接只读复用 `last_good.json` 缓存额度（重置时刻已过的窗口自动归零回满），不因备用槽位令牌过期污染激活槽位的实时额度或触发指数退避；同时 `cache.backfill` 不再拿旧缓存覆盖本轮已算出的实时本地 Token 用量。
 - 修复 MiniMax 积分和重置卡因本机 MiniMax Code 访问令牌过期或被服务端提前吊销（401 / `status_code=1004`）而消失：只读取最新 `generation` 的凭据记录（不回退旧代记录），当本地已过期或接口返回未授权时按官方 `oauth2/token` 协议自动续期并重试一次，原子写回 `auth.json` / `auth-state.json` 并保留轮换后的 refresh token；续期失败时不删除凭据、不伪造额度。
 - 精简 HTTP 报错与旧数据回填提示：401/403/408/5xx 统一收敛为简短中文短语（如 `HTTP 401 登录令牌已过期`、`HTTP 5xx 服务端暂不可用`），不再拼接服务端返回的原始 JSON 撑宽挂件窗口；有缓存额度回填时简化为单行柔和暖色提示（如 `16小时前数据 · 登录令牌已过期`），并对本地已知过期的 Claude Code 令牌跳过网络请求与指数退避，WSL 刷新令牌后下一轮即恢复。

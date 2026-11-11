@@ -1,9 +1,9 @@
-//! 本机 OMP、Claude Code 与 agy CLI 的 token 用量。
+//! 本机 OMP、Claude Code 与 Antigravity 桌面客户端的 token 用量。
 //!
 //! 按模型调用聚合成当日（北京时间 0 点清零）/ 近 7 天 / 30 天与本机累计。
 //! 「本机累计」只是当前设备仍保留的日志合计，不等于服务端账号累计。
-//! JSONL 按 (mtime, size) 缓存，agy SQLite 同时观察 WAL；扫描结果保留 120 秒。
-//! agy 仅只读本机记录，不调用模型、额度接口或认证接口。
+//! JSONL 按 (mtime, size) 缓存，Antigravity SQLite 同时观察 WAL；扫描结果保留 120 秒。
+//! Antigravity 仅只读本机记录，不调用模型、额度接口或认证接口。
 
 use crate::credentials;
 use crate::model::{ProviderId, UsageModel, UsageRow};
@@ -181,7 +181,7 @@ fn refresh_if_stale() {
             roots.push(root);
         }
     }
-    let agy_root = credentials::antigravity_cli_conversations_root();
+    let agy_root = credentials::antigravity_conversations_root();
     scan_roots(&mut store, &roots, agy_root.as_deref());
     store.scanned_at = Some(Instant::now());
     *guard = Some(store);

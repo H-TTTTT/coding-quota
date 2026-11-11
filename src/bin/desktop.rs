@@ -483,10 +483,12 @@ impl DesktopApp {
                     }
                 }
                 if !alive {
+                    rt.block_on(fetch::stop_background());
                     return;
                 }
                 // 本轮取完：全部平台都退避/隐藏时不会有增量回调，界面靠这条停转刷新图标
                 if snap_tx.send((merged(&latest), true)).is_err() {
+                    rt.block_on(fetch::stop_background());
                     return;
                 }
                 // 跨阈值告警合并成一条气泡（Shell_NotifyIcon 同图标连发只显示最后一条）
@@ -504,7 +506,10 @@ impl DesktopApp {
                     Ok(Cmd::Refresh) | Ok(Cmd::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {
                         continue
                     }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        rt.block_on(fetch::stop_background());
+                        return;
+                    }
                 }
             }
         });

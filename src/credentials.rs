@@ -182,65 +182,263 @@ pub fn claude_projects_roots() -> Vec<PathBuf> {
     out
 }
 
-/// agy 的原生会话目录，不读取桌面 App 的数据。agy 现装在 WSL 里，优先找 WSL 用户目录，
-/// 其次才是 Windows 用户目录。WSL 里的库只在这里列目录、取文件属性，内容由
-/// `usage::agy` 在 WSL 内部读取：跨系统直接打开 WAL 库会破坏 agy 的共享内存索引。
-pub fn antigravity_cli_conversations_root() -> Option<PathBuf> {
-    wsl_homes()
-        .into_iter()
-        .map(|home| home.unc.join(r".gemini\antigravity-cli\conversations"))
-        .chain(["USERPROFILE", "HOME"].into_iter().filter_map(|key| {
-            Some(
-                PathBuf::from(std::env::var_os(key)?).join(".gemini/antigravity-cli/conversations"),
-            )
-        }))
+fn is_wsl_unc_path(path: &Path) -> bool {
+    let raw = path.to_string_lossy();
+    raw.get(..r"\\wsl.localhost".len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(r"\\wsl.localhost"))
+        || raw
+            .get(..r"\\wsl$".len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(r"\\wsl$"))
+}
+
+/// 本机（非 WSL UNC）用户主目录列表：供 Windows 桌面端专属目录（如 Antigravity 桌面 App）
+/// 只读发现文件，避免探测 `\\wsl.localhost` 唤醒休眠中的 WSL，同时在 Linux 单测下保留 `HOME`。
+fn local_homes() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    let mut push_unique = |path: PathBuf| {
+        if !path.as_os_str().is_empty() && !is_wsl_unc_path(&path) && !homes.contains(&path) {
+            homes.push(path);
+        }
+    };
+    for key in ["USERPROFILE", "HOME"] {
+        if let Some(root) = std::env::var_os(key) {
+            push_unique(PathBuf::from(root));
+        }
+    }
+    if let (Some(drive), Some(home_path)) =
+        (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+    {
+        let mut combined = drive;
+        combined.push(home_path);
+        push_unique(PathBuf::from(combined));
+    }
+    homes
+}
+
+/// Antigravity Hub 桌面客户端的本地 RPC 发现文件；只读，不接触系统凭据库或 refresh token。
+pub fn antigravity_daemon_files() -> Vec<PathBuf> {
+    antigravity_daemon_files_in(&local_homes())
+}
+
+fn antigravity_daemon_files_in(homes: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for home in homes {
+        let dir = home.join(".gemini/antigravity/daemon");
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("hub_") && name.ends_with(".json") && path.is_file() {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    files.sort_by_cached_key(|path| {
+        std::cmp::Reverse(path.metadata().and_then(|meta| meta.modified()).ok())
+    });
+    files
+}
+
+/// Antigravity 桌面客户端的本机会话数据库目录（`~/.gemini/antigravity/conversations`），只读扫描。
+pub fn antigravity_conversations_root() -> Option<PathBuf> {
+    antigravity_conversations_root_in(&local_homes())
+}
+
+fn antigravity_conversations_root_in(homes: &[PathBuf]) -> Option<PathBuf> {
+    homes
+        .iter()
+        .map(|home| home.join(".gemini/antigravity/conversations"))
         .find(|root| root.is_dir())
 }
 
-/// 一个 WSL 用户目录：发行版名、Windows 侧 UNC 路径和 Linux 侧路径。
-pub(crate) struct WslHome {
-    pub distro: String,
-    pub unc: PathBuf,
-    pub linux: String,
+#[cfg(windows)]
+fn wsl_lxss_distros() -> Option<Vec<String>> {
+    use core::ffi::c_void;
+
+    const HKEY_CURRENT_USER: *mut c_void = 0x8000_0001_usize as *mut c_void;
+    const KEY_QUERY_VALUE: u32 = 0x0001;
+    const KEY_ENUMERATE_SUB_KEYS: u32 = 0x0008;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_PATH_NOT_FOUND: i32 = 3;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            key: *mut c_void,
+            subkey: *const u16,
+            options: u32,
+            desired: u32,
+            result: *mut *mut c_void,
+        ) -> i32;
+        fn RegCloseKey(key: *mut c_void) -> i32;
+        fn RegEnumKeyExW(
+            key: *mut c_void,
+            index: u32,
+            name: *mut u16,
+            name_len: *mut u32,
+            reserved: *mut u32,
+            class: *mut u16,
+            class_len: *mut u32,
+            last_write: *mut c_void,
+        ) -> i32;
+        fn RegQueryValueExW(
+            key: *mut c_void,
+            name: *const u16,
+            reserved: *mut u32,
+            kind: *mut u32,
+            data: *mut u8,
+            size: *mut u32,
+        ) -> i32;
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    unsafe fn read_reg_string(key: *mut c_void, name: &str) -> Option<String> {
+        let name = wide(name);
+        let mut buffer = [0_u16; 256];
+        let mut size = (buffer.len() * 2) as u32;
+        if RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr() as *mut u8,
+            &mut size,
+        ) != 0
+        {
+            return None;
+        }
+        let chars = (size as usize / 2).min(buffer.len());
+        let units: Vec<u16> = buffer[..chars]
+            .iter()
+            .copied()
+            .take_while(|unit| *unit != 0)
+            .collect();
+        let value = String::from_utf16_lossy(&units).trim().to_string();
+        (!value.is_empty()).then_some(value)
+    }
+
+    unsafe {
+        let subkey = wide(r"Software\Microsoft\Windows\CurrentVersion\Lxss");
+        let mut parent: *mut c_void = std::ptr::null_mut();
+        let status = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE,
+            &mut parent,
+        );
+        if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+            return Some(Vec::new());
+        }
+        if status != 0 {
+            return None;
+        }
+        let default_guid = read_reg_string(parent, "DefaultDistribution");
+        let mut default_distro = None;
+        let mut others = Vec::new();
+        let mut index = 0_u32;
+        loop {
+            let mut name = [0_u16; 256];
+            let mut len = name.len() as u32;
+            if RegEnumKeyExW(
+                parent,
+                index,
+                name.as_mut_ptr(),
+                &mut len,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) != 0
+            {
+                break;
+            }
+            index += 1;
+            let guid = String::from_utf16_lossy(&name[..len as usize]);
+            let mut sub_name = name[..len as usize].to_vec();
+            sub_name.push(0);
+            let mut sub: *mut c_void = std::ptr::null_mut();
+            if RegOpenKeyExW(parent, sub_name.as_ptr(), 0, KEY_QUERY_VALUE, &mut sub) != 0 {
+                continue;
+            }
+            if let Some(distro) = read_reg_string(sub, "DistributionName") {
+                if default_guid
+                    .as_deref()
+                    .is_some_and(|want| want.eq_ignore_ascii_case(&guid))
+                {
+                    default_distro = Some(distro);
+                } else {
+                    others.push(distro);
+                }
+            }
+            RegCloseKey(sub);
+        }
+        RegCloseKey(parent);
+        let mut out = Vec::new();
+        if let Some(distro) = default_distro {
+            out.push(distro);
+        }
+        out.extend(others);
+        Some(out)
+    }
 }
 
-/// 枚举 `\\wsl.localhost\<distro>\home\*`。只读目录，不拉起 wsl.exe；
-/// 非 Windows 系统上这些路径不存在，返回空列表。
-pub(crate) fn wsl_homes() -> Vec<WslHome> {
-    let mut distros: Vec<String> = Vec::new();
-    for name in [
-        std::env::var("WSL_DISTRO_NAME").ok(),
-        Some("Ubuntu".into()),
-        Some("Ubuntu-24.04".into()),
-        Some("Ubuntu-22.04".into()),
-        Some("Debian".into()),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !distros.contains(&name) {
-            distros.push(name);
+/// 返回本机实际已安装的 WSL 发行版名称，避免探测不存在的发行版触发 Windows WebDAV 回退。
+fn installed_wsl_distros() -> Vec<String> {
+    let mut distros = Vec::new();
+    let mut push = |raw: String| {
+        let name = raw.trim().to_string();
+        if name.is_empty()
+            || name.eq_ignore_ascii_case("docker-desktop")
+            || name.eq_ignore_ascii_case("docker-desktop-data")
+            || distros.contains(&name)
+        {
+            return;
+        }
+        distros.push(name);
+    };
+    if let Ok(env_distro) = std::env::var("WSL_DISTRO_NAME") {
+        push(env_distro);
+    }
+    #[cfg(windows)]
+    match wsl_lxss_distros() {
+        Some(installed) => {
+            for name in installed {
+                push(name);
+            }
+        }
+        None => {
+            for name in ["Ubuntu-24.04", "Ubuntu", "Ubuntu-22.04", "Debian"] {
+                push(name.into());
+            }
         }
     }
-    let mut homes = Vec::new();
-    for distro in distros {
-        // 两种前缀指向同一个发行版，读到一个即可。
+    distros
+}
+
+fn wsl_home_dirs() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for distro in installed_wsl_distros() {
+        // 两种前缀指向同一个发行版，\\wsl.localhost 命中后立即跳出，不再重复探测 \\wsl$。
         for prefix in [r"\\wsl.localhost", r"\\wsl$"] {
             let Ok(entries) = std::fs::read_dir(format!(r"{prefix}\{distro}\home")) else {
                 continue;
             };
             for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                homes.push(WslHome {
-                    distro: distro.clone(),
-                    unc: entry.path(),
-                    linux: format!("/home/{name}"),
-                });
+                let path = entry.path();
+                if !out.contains(&path) {
+                    out.push(path);
+                }
             }
             break;
         }
     }
-    homes
+    out
 }
 
 fn candidate_homes(omp_db: Option<&Path>) -> Vec<PathBuf> {
@@ -269,24 +467,10 @@ fn candidate_homes(omp_db: Option<&Path>) -> Vec<PathBuf> {
     }
     // omp 的 agent.db 可能在 Windows 用户目录下（如 C:\Users\<user>\.omp\agent\agent.db），
     // 而 Claude Code 登录在 WSL（\\wsl.localhost\<distro>\home\<user>\.claude），
-    // 因此除非显式指定了 CODING_QUOTA_DB，否则始终枚举 WSL home 目录。
+    // 因此除非显式指定了 CODING_QUOTA_DB，否则枚举已安装 WSL 发行版的 home 目录。
     if std::env::var_os("CODING_QUOTA_DB").is_none() {
-        let distros = [
-            std::env::var("WSL_DISTRO_NAME").ok(),
-            Some("Ubuntu-24.04".into()),
-            Some("Ubuntu".into()),
-            Some("Ubuntu-22.04".into()),
-            Some("Debian".into()),
-        ];
-        for distro in distros.iter().flatten() {
-            for prefix in [r"\\wsl.localhost", r"\\wsl$"] {
-                let home_root = PathBuf::from(format!(r"{prefix}\{distro}\home"));
-                if let Ok(entries) = std::fs::read_dir(home_root) {
-                    for entry in entries.flatten() {
-                        push_unique(entry.path());
-                    }
-                }
-            }
+        for home in wsl_home_dirs() {
+            push_unique(home);
         }
     }
     homes
@@ -453,43 +637,52 @@ fn wsl_unc_candidates() -> Vec<PathBuf> {
         }
     }
 
-    let distros = [
-        std::env::var("WSL_DISTRO_NAME").ok(),
-        Some("Ubuntu".into()),
-        Some("Debian".into()),
-        Some("Ubuntu-22.04".into()),
-        Some("Ubuntu-24.04".into()),
-    ];
+    let distros = installed_wsl_distros();
     let mut out = Vec::new();
-    for home in homes {
-        let linux_home = if let Some(idx) = home.find(r"\home\") {
-            format!("/home/{}", home[idx + 6..].replace('\\', "/"))
-        } else if home.starts_with('/') {
-            home.replace('\\', "/")
-        } else {
-            continue;
-        };
-        let suffix = format!("{}/.omp/agent/agent.db", linux_home.trim_end_matches('/'));
-        for distro in distros.iter().flatten() {
-            out.push(PathBuf::from(format!(
-                r"\\wsl.localhost\{distro}{}",
-                suffix.replace('/', "\\")
-            )));
-            out.push(PathBuf::from(format!(
-                r"\\wsl$\{distro}{}",
-                suffix.replace('/', "\\")
-            )));
-        }
-    }
-    // Windows 用户名与 WSL 用户名不同（如 Windows 为 xuhaitao、WSL 为 x06579）时，
-    // 直接枚举 \\wsl.localhost\<distro>\home 下的目录即可定位凭据库，无需拉起 wsl.exe。
-    for distro in distros.iter().flatten() {
+    for distro in &distros {
+        let mut found_share = false;
+        // Windows 用户名与 WSL 用户名不同（如 Windows 为 xuhaitao、WSL 为 x06579）时，
+        // 直接枚举已安装发行版 \\wsl.localhost\<distro>\home 下的目录即可定位凭据库，
+        // 命中后立即跳出，不再重复探测 \\wsl$，也不触碰未安装的发行版名称。
         for prefix in [r"\\wsl.localhost", r"\\wsl$"] {
             let home_root = PathBuf::from(format!(r"{prefix}\{distro}\home"));
             if let Ok(entries) = std::fs::read_dir(home_root) {
+                found_share = true;
+                for home in &homes {
+                    let linux_home = if let Some(idx) = home.find(r"\home\") {
+                        format!("/home/{}", home[idx + 6..].replace('\\', "/"))
+                    } else if home.starts_with('/') {
+                        home.replace('\\', "/")
+                    } else {
+                        continue;
+                    };
+                    let suffix =
+                        format!("{}/.omp/agent/agent.db", linux_home.trim_end_matches('/'));
+                    out.push(PathBuf::from(format!(
+                        r"{prefix}\{distro}{}",
+                        suffix.replace('/', "\\")
+                    )));
+                }
                 for entry in entries.flatten() {
                     out.push(entry.path().join(r".omp\agent\agent.db"));
                 }
+                break;
+            }
+        }
+        if !found_share {
+            for home in &homes {
+                let linux_home = if let Some(idx) = home.find(r"\home\") {
+                    format!("/home/{}", home[idx + 6..].replace('\\', "/"))
+                } else if home.starts_with('/') {
+                    home.replace('\\', "/")
+                } else {
+                    continue;
+                };
+                let suffix = format!("{}/.omp/agent/agent.db", linux_home.trim_end_matches('/'));
+                out.push(PathBuf::from(format!(
+                    r"\\wsl.localhost\{distro}{}",
+                    suffix.replace('/', "\\")
+                )));
             }
         }
     }
@@ -504,6 +697,7 @@ fn wsl_db_via_wsl_exe() -> Option<PathBuf> {
             "-c",
             "wslpath -w \"$HOME/.omp/agent/agent.db\" 2>/dev/null || true",
         ])
+        .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
     if !output.status.success() {
@@ -773,6 +967,7 @@ pub fn secret_from_omp(
     force_refresh: bool,
 ) -> Option<String> {
     let mut cmd = hidden_command("omp");
+    cmd.stdin(std::process::Stdio::null());
     cmd.arg("token").arg(provider);
     if let Some(account) = oauth_account {
         cmd.arg("--account").arg(account.to_string());
@@ -794,6 +989,7 @@ pub fn secret_from_omp(
     token_from_output(
         hidden_command("wsl.exe")
             .args(["-e", "sh", "-c", &shell])
+            .stdin(std::process::Stdio::null())
             .output(),
     )
 }
@@ -1179,6 +1375,53 @@ mod tests {
         assert_eq!(cred.identity.as_deref(), Some("ht9989@gmail.com"));
         assert_eq!(cred.kind.as_deref(), Some("claude_code_oauth"));
         assert_eq!(cred.oauth_account, None);
+        Ok(())
+    }
+
+    #[test]
+    fn antigravity_desktop_paths_exclude_wsl_shares_and_sort_hub_files_newest_first() -> Result<()>
+    {
+        assert!(is_wsl_unc_path(Path::new(
+            r"\\wsl.localhost\Ubuntu-24.04\home\x06579"
+        )));
+        assert!(is_wsl_unc_path(Path::new(r"\\WSL$\Ubuntu\home\x06579")));
+        assert!(!is_wsl_unc_path(Path::new(r"C:\Users\haita")));
+        assert!(!is_wsl_unc_path(Path::new("/home/x06579")));
+
+        let home = std::env::temp_dir().join(format!(
+            "cq-ag-desktop-home-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let daemon_dir = home.join(".gemini/antigravity/daemon");
+        let conv_dir = home.join(".gemini/antigravity/conversations");
+        std::fs::create_dir_all(&daemon_dir)?;
+        std::fs::create_dir_all(&conv_dir)?;
+
+        let older = daemon_dir.join("hub_6800.json");
+        let newer = daemon_dir.join("hub_6811.json");
+        let ignored = daemon_dir.join("other.json");
+        std::fs::write(&older, b"{}")?;
+        std::fs::write(&newer, b"{}")?;
+        std::fs::write(&ignored, b"{}")?;
+
+        let now = SystemTime::now();
+        std::fs::File::options()
+            .write(true)
+            .open(&older)?
+            .set_modified(now - std::time::Duration::from_secs(60))?;
+        std::fs::File::options()
+            .write(true)
+            .open(&newer)?
+            .set_modified(now)?;
+
+        let homes = vec![home.clone()];
+        let files = antigravity_daemon_files_in(&homes);
+        let found_conv = antigravity_conversations_root_in(&homes);
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(files, vec![newer, older]);
+        assert_eq!(found_conv, Some(conv_dir));
         Ok(())
     }
 }

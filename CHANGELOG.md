@@ -15,6 +15,7 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- Antigravity CLI 改为装在 WSL：通过 `\\wsl.localhost\<发行版>\home\*` 定位 `~/.local/bin/agy`（只读文件属性，不为探测拉起 `wsl.exe`），额度经 `wsl.exe -d <发行版> -e ~/.local/bin/agy --print /usage ...` 查询；`%LOCALAPPDATA%\agy\bin\agy.exe` 只作兜底。WSL 里的会话库不再从 Windows 跨系统直接打开（WAL 库的文件锁与共享内存索引不跨系统，可能损坏 agy 的库），改为在 WSL 内用 `sqlite3 -readonly -json` 单条语句读出 `steps` 与 `gen_metadata`（十六进制），交给原有解析逻辑，结果与原生读取逐条一致；仍跳过不足 3 秒的新库，查询 20 秒超时只结束自己拉起的 `wsl.exe`。登录失败提示注明在 WSL 或 PowerShell 运行 agy。
 - Antigravity 额度切换为官方 Windows CLI：直接运行 `%LOCALAPPDATA%/agy/bin/agy.exe --print /usage --output-format json --disable-slash-commands=false`，解析 `command.data.groups[].buckets[]` 的原始剩余比例与重置时间，不解析四舍五入的文本。只执行 CLI 内置额度命令，不发起模型对话；显式启用斜杠命令，避免 CLI 用户设置将 `/usage` 当作模型提示词。移除桌面 App 的 `language_server.exe` 启动、Hub 发现文件、本地 RPC 和后台进程管理，以及不再使用的随机数依赖。登录续期完全交给 CLI，不读取或修改 OAuth Token，不改 CLI 配置；CLI 结果未返回邮箱时不再借用桌面账号标识。保留四窗口、共享桶去重、耗尽/disabled 窗口、失败缓存与退避。
 - Google Antigravity 卡片补充 agy CLI 本机 Token 用量：只读 `~/.gemini/antigravity-cli/conversations/*.db` 的逐调用生成元数据，以真实模型与调用/步骤时间合并到原有 Gemini / Claude&GPT 的当日、7 天、30 天与累计统计；原 OMP 历史保留。总量按 input + cache-read + output，思考与文本已包含在 output 中，不再重复加；同一次调用即使关联多个步骤也只计一次。读取已提交 WAL，数据库与 WAL 任一变化都会使缓存失效；跳过刚创建不足 3 秒的数据库以避开 CLI 建表，暂不可读时保留旧有效统计。仅统计本机保留的 SQLite/日志，不恢复已删除记录或解析密文 PB，不调用模型、网络接口或登录凭据。
 - 本机 OMP token 用量的「1天」档改为按北京时间每日 00:00:00 清零（不再按滚动过去 24 小时统计）；「7天」「30天」与「累计」统计范围不变。

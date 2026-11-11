@@ -266,13 +266,13 @@ async fn maybe_antigravity(
     if only.is_some_and(|wanted| wanted != provider) || skip.contains(&provider) {
         return None;
     }
-    let Some(binary) = crate::antigravity::executable() else {
+    let Some(cli) = crate::antigravity::executable() else {
         return Some(ProviderReport::missing(provider));
     };
     if let Some(report) = deferred_report(provider, None) {
         return Some(report);
     }
-    let report = match crate::antigravity::query(&binary).await {
+    let report = match crate::antigravity::query(&cli).await {
         Ok(body) => parse_antigravity(None, body),
         Err(err) => ProviderReport::err(provider, None, err),
     };

@@ -11,16 +11,31 @@ use super::UsageEvent;
 use crate::model::ProviderId;
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::process::Stdio;
+use std::time::{Duration, Instant, SystemTime};
 
 const DATABASE_SETTLE_TIME: Duration = Duration::from_secs(3);
+const WSL_QUERY_TIMEOUT: Duration = Duration::from_secs(20);
+/// One statement, so sqlite3 reads both tables from a single snapshot. NULL blobs hex to ''.
+const WSL_QUERY: &str = "SELECT 's' AS t, idx AS i, hex(metadata) AS h FROM steps \
+     UNION ALL SELECT 'g', idx, hex(data) FROM gen_metadata;";
 
 pub(super) fn read_database(path: &Path) -> Option<Vec<UsageEvent>> {
-    read_database_at(path, SystemTime::now())
+    match wsl_target(&path.to_string_lossy()) {
+        // A WAL database must not be opened from Windows across the \\wsl.localhost share:
+        // locks and the shared-memory index are not shared with agy inside WSL.
+        Some((distro, linux_path)) => {
+            settled(path, SystemTime::now())?;
+            parse_wsl_rows(&query_in_wsl(&distro, &linux_path)?)
+        }
+        None => read_database_at(path, SystemTime::now()),
+    }
 }
 
-fn read_database_at(path: &Path, now: SystemTime) -> Option<Vec<UsageEvent>> {
+/// agy creates a database and initialises its schema right away; leave young files alone.
+fn settled(path: &Path, now: SystemTime) -> Option<()> {
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() {
         return None;
@@ -28,9 +43,99 @@ fn read_database_at(path: &Path, now: SystemTime) -> Option<Vec<UsageEvent>> {
     // On filesystems without birth time, modification time is only a conservative
     // readiness gate. It never becomes an event's timestamp.
     let created = metadata.created().or_else(|_| metadata.modified()).ok()?;
-    if now.duration_since(created).ok()? < DATABASE_SETTLE_TIME {
+    (now.duration_since(created).ok()? >= DATABASE_SETTLE_TIME).then_some(())
+}
+
+/// `\\wsl.localhost\<distro>\...` or `\\wsl$\<distro>\...` → (distro, Linux path).
+fn wsl_target(raw: &str) -> Option<(String, String)> {
+    let rest = [r"\\wsl.localhost\", r"\\wsl$\"]
+        .iter()
+        .find_map(|prefix| {
+            raw.get(..prefix.len())
+                .filter(|head| head.eq_ignore_ascii_case(prefix))
+                .map(|_| &raw[prefix.len()..])
+        })?;
+    let (distro, path) = rest.split_once('\\')?;
+    (!distro.is_empty() && !path.is_empty())
+        .then(|| (distro.to_string(), format!("/{}", path.replace('\\', "/"))))
+}
+
+/// Runs the read-only query with sqlite3 inside WSL, where agy's locks are honoured.
+fn query_in_wsl(distro: &str, linux_path: &str) -> Option<Vec<u8>> {
+    let mut child = crate::credentials::hidden_command("wsl.exe")
+        .args(["-d", distro, "-e", "sqlite3", "-readonly", "-json"])
+        .args(["-cmd", ".timeout 200", linux_path, WSL_QUERY])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        stdout.read_to_end(&mut buffer).ok().map(|_| buffer)
+    });
+    let deadline = Instant::now() + WSL_QUERY_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = reader.join().ok()??;
+                return status.success().then_some(output);
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            // Only the wsl.exe this function spawned is ever terminated.
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Parses `sqlite3 -json` output of `WSL_QUERY` with the same decoding as the native reader.
+fn parse_wsl_rows(stdout: &[u8]) -> Option<Vec<UsageEvent>> {
+    // sqlite3 -json prints nothing at all for an empty result.
+    if stdout.iter().all(u8::is_ascii_whitespace) {
+        return Some(Vec::new());
+    }
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(stdout).ok()?;
+    let mut step_times = HashMap::new();
+    let mut calls = Vec::new();
+    for row in &rows {
+        let index = row.get("i")?.as_i64()?;
+        let data = decode_hex(row.get("h")?.as_str()?)?;
+        match row.get("t")?.as_str()? {
+            "s" => {
+                if let Some(timestamp) = step_created_at(&data) {
+                    step_times.insert(index, timestamp);
+                }
+            }
+            "g" => calls.push((index, data)),
+            _ => return None,
+        }
+    }
+    calls.sort_by_key(|(index, _)| *index);
+    Some(
+        calls
+            .iter()
+            .filter_map(|(_, data)| read_call(data, &step_times))
+            .collect(),
+    )
+}
+
+fn decode_hex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
+    (0..hex.len())
+        .step_by(2)
+        .map(|start| u8::from_str_radix(hex.get(start..start + 2)?, 16).ok())
+        .collect()
+}
+
+fn read_database_at(path: &Path, now: SystemTime) -> Option<Vec<UsageEvent>> {
+    settled(path, now)?;
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -393,6 +498,62 @@ mod tests {
         let chat = [bytes(4, &usage), bytes(19, model.as_bytes())].concat();
         let packed: Vec<u8> = indices.iter().flat_map(|index| varint(*index)).collect();
         [bytes(1, &chat), bytes(2, &packed)].concat()
+    }
+
+    #[test]
+    fn wsl_query_rows_decode_exactly_like_the_native_reader() {
+        let database = Database::new();
+        database.step(1, 1_794_273_599);
+        database.step(2, 1_794_359_360);
+        database
+            .connection()
+            .execute("INSERT INTO steps VALUES (9, NULL)", [])
+            .unwrap();
+        database.call(0, &call(&[1], "claude-sonnet-4-5", 10, 100, 20));
+        database.call(1, &call(&[2], "gemini-4-carbon", 2_486, 100_558, 991));
+        let native = database.read().unwrap();
+        assert_eq!(native.len(), 2);
+        // Same JSON shape `sqlite3 -json` prints for WSL_QUERY.
+        let mut statement = database.connection().prepare(WSL_QUERY).unwrap();
+        let rows: Vec<serde_json::Value> = statement
+            .query_map([], |row| {
+                Ok(serde_json::json!({
+                    "t": row.get::<_, String>(0)?,
+                    "i": row.get::<_, i64>(1)?,
+                    "h": row.get::<_, String>(2)?,
+                }))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let from_wsl = parse_wsl_rows(&serde_json::to_vec(&rows).unwrap()).unwrap();
+        assert_eq!(format!("{native:?}"), format!("{from_wsl:?}"));
+        assert!(parse_wsl_rows(b"\n").unwrap().is_empty());
+        assert!(parse_wsl_rows(b"not json").is_none());
+        assert!(parse_wsl_rows(br#"[{"t":"g","i":0,"h":"ABC"}]"#).is_none());
+    }
+
+    #[test]
+    fn wsl_unc_paths_map_to_distro_and_linux_path() {
+        assert_eq!(
+            wsl_target(
+                r"\\wsl.localhost\Ubuntu\home\x06579\.gemini\antigravity-cli\conversations\a.db"
+            ),
+            Some((
+                "Ubuntu".into(),
+                "/home/x06579/.gemini/antigravity-cli/conversations/a.db".into()
+            ))
+        );
+        assert_eq!(
+            wsl_target(r"\\WSL$\Ubuntu-24.04\home\u\x.db"),
+            Some(("Ubuntu-24.04".into(), "/home/u/x.db".into()))
+        );
+        assert_eq!(
+            wsl_target(r"C:\Users\x\.gemini\antigravity-cli\conversations\a.db"),
+            None
+        );
+        assert_eq!(wsl_target("/home/x06579/a.db"), None);
+        assert_eq!(wsl_target(r"\\wsl.localhost\Ubuntu"), None);
     }
 
     #[test]

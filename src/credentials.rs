@@ -182,13 +182,65 @@ pub fn claude_projects_roots() -> Vec<PathBuf> {
     out
 }
 
-/// 与 Windows agy 配额查询相同用户的原生会话目录；不读取桌面 App 的数据。
+/// agy 的原生会话目录，不读取桌面 App 的数据。agy 现装在 WSL 里，优先找 WSL 用户目录，
+/// 其次才是 Windows 用户目录。WSL 里的库只在这里列目录、取文件属性，内容由
+/// `usage::agy` 在 WSL 内部读取：跨系统直接打开 WAL 库会破坏 agy 的共享内存索引。
 pub fn antigravity_cli_conversations_root() -> Option<PathBuf> {
-    ["USERPROFILE", "HOME"].into_iter().find_map(|key| {
-        let root =
-            PathBuf::from(std::env::var_os(key)?).join(".gemini/antigravity-cli/conversations");
-        root.is_dir().then_some(root)
-    })
+    wsl_homes()
+        .into_iter()
+        .map(|home| home.unc.join(r".gemini\antigravity-cli\conversations"))
+        .chain(["USERPROFILE", "HOME"].into_iter().filter_map(|key| {
+            Some(
+                PathBuf::from(std::env::var_os(key)?).join(".gemini/antigravity-cli/conversations"),
+            )
+        }))
+        .find(|root| root.is_dir())
+}
+
+/// 一个 WSL 用户目录：发行版名、Windows 侧 UNC 路径和 Linux 侧路径。
+pub(crate) struct WslHome {
+    pub distro: String,
+    pub unc: PathBuf,
+    pub linux: String,
+}
+
+/// 枚举 `\\wsl.localhost\<distro>\home\*`。只读目录，不拉起 wsl.exe；
+/// 非 Windows 系统上这些路径不存在，返回空列表。
+pub(crate) fn wsl_homes() -> Vec<WslHome> {
+    let mut distros: Vec<String> = Vec::new();
+    for name in [
+        std::env::var("WSL_DISTRO_NAME").ok(),
+        Some("Ubuntu".into()),
+        Some("Ubuntu-24.04".into()),
+        Some("Ubuntu-22.04".into()),
+        Some("Debian".into()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !distros.contains(&name) {
+            distros.push(name);
+        }
+    }
+    let mut homes = Vec::new();
+    for distro in distros {
+        // 两种前缀指向同一个发行版，读到一个即可。
+        for prefix in [r"\\wsl.localhost", r"\\wsl$"] {
+            let Ok(entries) = std::fs::read_dir(format!(r"{prefix}\{distro}\home")) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                homes.push(WslHome {
+                    distro: distro.clone(),
+                    unc: entry.path(),
+                    linux: format!("/home/{name}"),
+                });
+            }
+            break;
+        }
+    }
+    homes
 }
 
 fn candidate_homes(omp_db: Option<&Path>) -> Vec<PathBuf> {
